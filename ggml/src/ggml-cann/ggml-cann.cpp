@@ -1995,8 +1995,6 @@ static bool ggml_backend_cann_cpy_tensor_async(ggml_backend_t      backend_src,
                                                ggml_tensor *       dst) {
     GGML_ASSERT(ggml_backend_is_cann(backend_src) || ggml_backend_is_cann(backend_dst));
 
-    GGML_ASSERT(!is_matmul_weight((const ggml_tensor *) src));
-
     if (!ggml_backend_buft_is_cann(src->buffer->buft) || !ggml_backend_buft_is_cann(dst->buffer->buft)) {
         return false;
     }
@@ -2008,6 +2006,17 @@ static bool ggml_backend_cann_cpy_tensor_async(ggml_backend_t      backend_src,
     ggml_backend_cann_context * cann_ctx_dst = (ggml_backend_cann_context *) backend_dst->context;
 
     size_t copy_size = ggml_nbytes(dst);
+    static bool weight_to_nz = parse_bool(get_env_as_lowercase("GGML_CANN_WEIGHT_NZ").value_or("on"));
+    if (weight_to_nz && is_matmul_weight(src)) {
+        GGML_ASSERT(src->ne[2] == 1);
+        GGML_ASSERT(src->ne[3] == 1);
+        int64_t shape[] = { src->ne[1], src->ne[0] };
+        const aclIntArray * acl_shape = aclCreateIntArray(shape, 2);
+        size_t nz_size;
+        ACL_CHECK(aclnnCalculateMatmulWeightSizeV2(acl_shape, ggml_cann_type_mapping(src->type), &nz_size));
+        ACL_CHECK(aclDestroyIntArray(acl_shape));
+        copy_size = std::max(copy_size, nz_size);
+    }
     if (copy_size == 0) {
         return true;
     }
