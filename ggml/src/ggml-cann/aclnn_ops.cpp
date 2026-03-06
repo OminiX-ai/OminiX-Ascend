@@ -25,6 +25,8 @@
 #include "ggml-impl.h"
 #include "ggml.h"
 
+#include <algorithm>
+
 #include <aclnnop/aclnn_add.h>
 #include <aclnnop/aclnn_add_rms_norm.h>
 #include <aclnnop/aclnn_addcdiv.h>
@@ -67,6 +69,7 @@
 #include <aclnnop/aclnn_repeat.h>
 #include <aclnnop/aclnn_repeat_interleave.h>
 #include <aclnnop/aclnn_rms_norm.h>
+#include <aclnnop/aclnn_rsqrt.h>
 #include <aclnnop/aclnn_roll.h>
 #include <aclnnop/aclnn_softmax.h>
 #include <aclnnop/aclnn_sub.h>
@@ -211,17 +214,51 @@ void ggml_cann_repeat(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     // on certain tensor shapes: use InplaceCopy with views instead.
     // Only apply when repeating along a single dimension.
     if (n_repeat_dims == 1) {
-        int64_t R = repeats[repeat_dim];
+        int64_t R          = repeats[repeat_dim];
+        size_t  slot_bytes = src->ne[repeat_dim] * dst->nb[repeat_dim];
 
-        // If not inplace (src != dst), we build dst by copying src R times
-        acl_tensor_ptr acl_src = ggml_cann_create_tensor(src);
+        // Step 1: Copy src into slot 0 of dst
+        acl_tensor_ptr acl_src       = ggml_cann_create_tensor(src);
+        acl_tensor_ptr acl_dst_slot0 = ggml_cann_create_tensor(
+            dst, src->ne, dst->nb, GGML_MAX_DIMS, ACL_FORMAT_ND, 0);
+        GGML_CANN_CALL_ACLNN_OP(ctx, InplaceCopy, acl_dst_slot0.get(), acl_src.get());
 
-        for (int64_t r = 0; r < R; r++) {
-            size_t offset = r * src->ne[repeat_dim] * dst->nb[repeat_dim];
-            acl_tensor_ptr acl_dst_view = ggml_cann_create_tensor(
-                dst, src->ne, dst->nb, GGML_MAX_DIMS, ACL_FORMAT_ND, offset);
+        if (slot_bytes == ggml_nbytes(src)) {
+            // Slots are contiguous — O(log₂R) doubling with D2D memcpy
+            int64_t filled = 1;
+            while (filled < R) {
+                int64_t chunk = std::min(filled, R - filled);
+                ACL_CHECK(aclrtMemcpyAsync(
+                    (char *)dst->data + filled * slot_bytes,
+                    chunk * slot_bytes,
+                    dst->data,
+                    chunk * slot_bytes,
+                    ACL_MEMCPY_DEVICE_TO_DEVICE,
+                    ctx.stream()));
+                filled += chunk;
+            }
+        } else {
+            // Slots are non-contiguous — O(log₂R) doubling with InplaceCopy views
+            int64_t view_ne[GGML_MAX_DIMS];
+            memcpy(view_ne, src->ne, sizeof(view_ne));
 
-            GGML_CANN_CALL_ACLNN_OP(ctx, InplaceCopy, acl_dst_view.get(), acl_src.get());
+            int64_t filled = 1;
+            while (filled < R) {
+                int64_t chunk = std::min(filled, R - filled);
+
+                // src view: slots [0, filled) — already filled
+                view_ne[repeat_dim] = chunk * src->ne[repeat_dim];
+                acl_tensor_ptr acl_src_view = ggml_cann_create_tensor(
+                    dst, view_ne, dst->nb, GGML_MAX_DIMS, ACL_FORMAT_ND, 0);
+
+                // dst view: slots [filled, filled+chunk)
+                size_t dst_offset = filled * slot_bytes;
+                acl_tensor_ptr acl_dst_view = ggml_cann_create_tensor(
+                    dst, view_ne, dst->nb, GGML_MAX_DIMS, ACL_FORMAT_ND, dst_offset);
+
+                GGML_CANN_CALL_ACLNN_OP(ctx, InplaceCopy, acl_dst_view.get(), acl_src_view.get());
+                filled += chunk;
+            }
         }
     } else if (n_repeat_dims == 0) {
         // Identity repeat, just copy
@@ -1095,11 +1132,66 @@ static acl_tensor_ptr get_cache_acl_tensor(ggml_backend_cann_context & ctx,
 void ggml_cann_rms_norm(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     ggml_tensor * src = dst->src[0];
 
-    acl_tensor_ptr acl_src = ggml_cann_create_tensor(src);
-    acl_tensor_ptr acl_dst = ggml_cann_create_tensor(dst);
-
     float eps;
     memcpy(&eps, dst->op_params, sizeof(float));
+
+    if (src->ne[1] > 1) {
+        // Manual decomposition for prefill: aclnnRmsNorm is catastrophically slow
+        // for multi-row input on Ascend 910B. Use 5 fast primitives instead.
+        // RMS_NORM: output = x * rsqrt(mean(x^2, dim=0) + eps)
+        GGML_ASSERT(src->type == GGML_TYPE_F32);
+
+        // Allocate workspace for x*x (same shape as src)
+        ggml_cann_pool_alloc x_sq_alloc(ctx.pool(), ggml_nbytes(src));
+        void * x_sq_buf = x_sq_alloc.get();
+
+        // Allocate workspace for mean result (reduced along dim 0 / ACL dim 3)
+        int64_t mean_ne[] = {1, src->ne[1], src->ne[2], src->ne[3]};
+        size_t  mean_nb[GGML_MAX_DIMS];
+        mean_nb[0] = sizeof(float);
+        for (int i = 1; i < GGML_MAX_DIMS; i++) {
+            mean_nb[i] = mean_nb[i-1] * mean_ne[i-1];
+        }
+        size_t mean_bytes = mean_nb[GGML_MAX_DIMS-1] * mean_ne[GGML_MAX_DIMS-1];
+        ggml_cann_pool_alloc mean_alloc(ctx.pool(), mean_bytes);
+        void * mean_buf = mean_alloc.get();
+
+        // Create ACL tensors
+        acl_tensor_ptr acl_src = ggml_cann_create_tensor(src);
+        acl_tensor_ptr acl_dst = ggml_cann_create_tensor(dst);
+        acl_tensor_ptr acl_x_sq = ggml_cann_create_tensor(
+            x_sq_buf, ggml_cann_type_mapping(src->type),
+            ggml_type_size(src->type), src->ne, src->nb, GGML_MAX_DIMS);
+        acl_tensor_ptr acl_mean = ggml_cann_create_tensor(
+            mean_buf, ACL_FLOAT, sizeof(float), mean_ne, mean_nb, GGML_MAX_DIMS);
+
+        // 1. x_sq = x * x
+        GGML_CANN_CALL_ACLNN_OP(ctx, Mul, acl_src.get(), acl_src.get(), acl_x_sq.get());
+
+        // 2. mean_sq = Mean(x_sq, dim={3}, keepdim=true)
+        //    ACL dim 3 = ggml dim 0 (feature dim) due to reversal
+        int64_t           reduceDimVal[] = {3};
+        acl_int_array_ptr reduceDim      = ggml_cann_create_int_array(reduceDimVal, 1);
+        GGML_CANN_CALL_ACLNN_OP(ctx, Mean, acl_x_sq.get(), reduceDim.get(),
+                                 true, ACL_FLOAT, acl_mean.get());
+
+        // 3. mean_sq += eps
+        float          alpha_val = 1.0f;
+        acl_scalar_ptr alpha     = ggml_cann_create_scalar(&alpha_val, ACL_FLOAT);
+        acl_scalar_ptr eps_sc    = ggml_cann_create_scalar(&eps, ACL_FLOAT);
+        GGML_CANN_CALL_ACLNN_OP(ctx, InplaceAdds, acl_mean.get(), eps_sc.get(), alpha.get());
+
+        // 4. mean_sq = rsqrt(mean_sq)
+        GGML_CANN_CALL_ACLNN_OP(ctx, InplaceRsqrt, acl_mean.get());
+
+        // 5. dst = x * rsqrt_result (broadcasts dim 0)
+        GGML_CANN_CALL_ACLNN_OP(ctx, Mul, acl_src.get(), acl_mean.get(), acl_dst.get());
+        return;
+    }
+
+    // Single-row decode: use native aclnnRmsNorm (fast for this case)
+    acl_tensor_ptr acl_src = ggml_cann_create_tensor(src);
+    acl_tensor_ptr acl_dst = ggml_cann_create_tensor(dst);
 
     // build gamma.
     size_t acl_gamma_nb[GGML_MAX_DIMS];
