@@ -1135,9 +1135,11 @@ void ggml_cann_rms_norm(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     float eps;
     memcpy(&eps, dst->op_params, sizeof(float));
 
-    if (src->ne[1] > 1) {
-        // Manual decomposition for prefill: aclnnRmsNorm is catastrophically slow
-        // for multi-row input on Ascend 910B. Use 5 fast primitives instead.
+    // Manual decomposition for large multi-row tensors where aclnnRmsNorm is
+    // catastrophically slow on Ascend 910B.  For small multi-row tensors
+    // (QK_NORM: [128,8], [128,32] etc.) the 5-kernel launch overhead exceeds
+    // native aclnnRmsNorm, so use native for those.
+    if (ggml_nelements(src) > 32768) {
         // RMS_NORM: output = x * rsqrt(mean(x^2, dim=0) + eps)
         GGML_ASSERT(src->type == GGML_TYPE_F32);
 
