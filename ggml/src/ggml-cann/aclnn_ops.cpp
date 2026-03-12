@@ -2026,9 +2026,86 @@ void ggml_cann_get_rows(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     }
 }
 
+/**
+ * @brief Optimized V cache SET_ROWS for transposed layout.
+ *
+ * When the V cache uses transposed layout (v_trans=true, no Flash Attention),
+ * SET_ROWS receives flattened tensors with ne[0]=1. This results in element-level
+ * ScatterUpdate on shape [N,1] which only uses 1 NPU core.
+ *
+ * This function restructures the operation to column-level InplaceIndexCopy:
+ * 1. Reshape src from [1, n_tokens*n_embd] -> [n_tokens, n_embd] -> transpose to [n_embd, n_tokens]
+ * 2. Extract position indices (stride n_embd through the full index)
+ * 3. InplaceIndexCopy along dim=1 into V cache [n_embd, kv_size]
+ *
+ * This allows ScatterUpdate to operate on [n_embd, kv_size] with n_tokens column indices,
+ * enabling full multi-core parallelism.
+ */
+static void ggml_cann_set_rows_v_cache_optimized(ggml_backend_cann_context & ctx,
+                                                   ggml_tensor *              dst,
+                                                   void *                     src_f16_buffer,
+                                                   int64_t                    n_embd,
+                                                   int64_t                    kv_size) {
+    ggml_tensor * src1 = dst->src[1];
+
+    int64_t n_total   = src1->ne[0];        // total index count = n_tokens * n_embd
+    int64_t n_tokens  = n_total / n_embd;
+    size_t  elem_size = ggml_type_size(dst->type);
+
+    // src_f16_buffer layout: [tok0_f0, tok0_f1, ..., tok0_fN, tok1_f0, ...]
+    // Create transposed view so ACL sees [n_embd, n_tokens]
+    // ggml ne/nb before reversal: ne=[n_tokens, n_embd], nb=[n_embd*es, es]
+    // After ACL reversal: shape=[n_embd, n_tokens], stride=[1, n_embd]
+    int64_t src_ne[] = { n_tokens, n_embd };
+    size_t  src_nb[] = { n_embd * elem_size, elem_size };
+    acl_tensor_ptr acl_src = ggml_cann_create_tensor(
+        src_f16_buffer, ggml_cann_type_mapping(dst->type), elem_size, src_ne, src_nb, 2);
+
+    // Extract position indices: every n_embd-th element from the full index
+    // index[i*n_embd + 0] = positions[i]
+    int64_t idx_ne[] = { n_tokens };
+    size_t  idx_nb[] = { (size_t)(n_embd * ggml_element_size(src1)) };
+    acl_tensor_ptr acl_idx = ggml_cann_create_tensor(
+        src1->data, ggml_cann_type_mapping(src1->type), ggml_element_size(src1), idx_ne, idx_nb, 1);
+
+    // V cache as ACL [n_embd, kv_size]:
+    // ggml ne=[kv_size, n_embd], nb=[es, kv_size*es]
+    // After ACL reversal: shape=[n_embd, kv_size], stride=[kv_size, 1]
+    int64_t dst_ne[] = { kv_size, n_embd };
+    size_t  dst_nb[] = { elem_size, kv_size * elem_size };
+    acl_tensor_ptr acl_dst = ggml_cann_create_tensor(
+        dst->data, ggml_cann_type_mapping(dst->type), elem_size, dst_ne, dst_nb, 2);
+
+    // InplaceIndexCopy: scatter along ACL dim=1 (kv_size/position dimension)
+    // src ACL [n_embd, n_tokens] + index [n_tokens] → dst ACL [n_embd, kv_size]
+    GGML_CANN_CALL_ACLNN_OP(ctx, InplaceIndexCopy, acl_dst.get(), 1, acl_idx.get(), acl_src.get());
+}
+
 void ggml_cann_set_rows(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     ggml_tensor * src0 = dst->src[0];  // src
     ggml_tensor * src1 = dst->src[1];  // index
+
+    // Detect V cache transposed layout: ne[0]==1 with large ne[1]
+    // Recover original shape from view_src chain (dst -> v_view -> v_cache)
+    bool use_v_cache_opt = false;
+    int64_t v_n_embd = 0, v_kv_size = 0;
+    if (dst->ne[0] == 1 && dst->ne[1] > 1 && dst->type == GGML_TYPE_F16) {
+        // Traverse view_src chain to find original V cache tensor shape
+        ggml_tensor * orig = dst;
+        while (orig->view_src != nullptr) {
+            orig = orig->view_src;
+        }
+        // Original V cache: ne=[n_embd_v_gqa, kv_size, n_stream]
+        if (orig->ne[0] > 1 && orig->ne[1] > 1 && orig->ne[2] == 1) {
+            // Only optimize for single-stream (n_stream=1) V cache
+            v_n_embd = orig->ne[0];
+            v_kv_size = orig->ne[1];
+            if (v_n_embd * v_kv_size == dst->ne[1] &&
+                src1->ne[0] % v_n_embd == 0) {
+                use_v_cache_opt = true;
+            }
+        }
+    }
 
     switch (dst->type) {
         case GGML_TYPE_F32:
@@ -2038,6 +2115,7 @@ void ggml_cann_set_rows(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
             }
         case GGML_TYPE_F16:
             {
+                // Cast F32 src to F16
                 acl_tensor_ptr       acl_src0 = ggml_cann_create_tensor(src0);
                 ggml_cann_pool_alloc src_buffer_allocator(ctx.pool(), ggml_nelements(src0) * sizeof(uint16_t));
                 void *               src_trans_buffer = src_buffer_allocator.get();
@@ -2049,8 +2127,13 @@ void ggml_cann_set_rows(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
                 acl_tensor_ptr src_trans_tensor = ggml_cann_create_tensor(
                     src_trans_buffer, ACL_FLOAT16, ggml_type_size(dst->type), src0->ne, src_trans_nb, GGML_MAX_DIMS);
                 aclnn_cast(ctx, acl_src0.get(), src_trans_tensor.get(), ggml_cann_type_mapping(dst->type));
-                aclnn_index_copy_4d(ctx, src_trans_buffer, src0->ne, src_trans_nb, dst->data, dst->ne, dst->nb, src1,
-                                    dst->type);
+
+                if (use_v_cache_opt) {
+                    ggml_cann_set_rows_v_cache_optimized(ctx, dst, src_trans_buffer, v_n_embd, v_kv_size);
+                } else {
+                    aclnn_index_copy_4d(ctx, src_trans_buffer, src0->ne, src_trans_nb, dst->data, dst->ne, dst->nb,
+                                        src1, dst->type);
+                }
                 break;
             }
         default:

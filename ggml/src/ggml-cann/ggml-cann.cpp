@@ -2150,57 +2150,83 @@ static bool ggml_cann_can_fuse(const struct ggml_cgraph *          cgraph,
  * @param use_cann_graph               Whether to use CANN graph execution.
  * @param cann_graph_capture_required  Whether graph capture is needed due to graph changes.
  */
+/**
+ * @brief Execute graph nodes with optional operator fusion.
+ *
+ * Helper to run all nodes in the computation graph, applying operator fusion
+ * when enabled.
+ */
+static void execute_graph_nodes(ggml_backend_cann_context * cann_ctx,
+                                ggml_cgraph *               cgraph,
+                                bool                        opt_fusion) {
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        ggml_tensor * node = cgraph->nodes[i];
+        if (opt_fusion) {
+            if (ggml_cann_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_RMS_NORM })) {
+                ggml_cann_op_add_rms_norm_fused(*cann_ctx, node, cgraph->nodes[i + 1]);
+                i++;
+                continue;
+            }
+        }
+
+        // REPEAT+binary_op fusion: skip REPEAT, let binary op broadcast
+        for (enum ggml_op bop : {GGML_OP_MUL, GGML_OP_ADD, GGML_OP_SUB, GGML_OP_DIV}) {
+            if (ggml_cann_can_fuse(cgraph, i, { GGML_OP_REPEAT, bop })) {
+                ggml_cann_op_repeat_binary_fused(*cann_ctx, node, cgraph->nodes[i + 1]);
+                i++;
+                goto next_node;
+            }
+        }
+
+        if (ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE ||
+            node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE) {
+            continue;
+        }
+
+        if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+
+        {
+            bool ok = ggml_cann_compute_forward(*cann_ctx, node);
+            if (!ok) {
+                GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
+            }
+            GGML_ASSERT(ok);
+        }
+        next_node:;
+    }
+}
+
 static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx,
                                             ggml_cgraph *               cgraph,
                                             bool                        use_cann_graph,
                                             bool                        cann_graph_capture_required) {
+    static bool opt_fusion = parse_bool(get_env_as_lowercase("GGML_CANN_OPERATOR_FUSION").value_or(""));
+
 #ifdef USE_ACL_GRAPH
-    if (use_cann_graph && cann_graph_capture_required) {  // Begin CANN graph capture
+    if (use_cann_graph && cann_graph_capture_required) {
+        // Pre-warm: execute the graph once without capture to initialize all
+        // memory pools and caches (e.g. RoPE cache, pool buffers). This avoids
+        // aclrtMalloc calls during graph capture which are not allowed.
+        execute_graph_nodes(cann_ctx, cgraph, opt_fusion);
+        ACL_CHECK(aclrtSynchronizeStream(cann_ctx->stream()));
+
+        // Reset rope cache so the capture run re-records all kernel operations
+        // (sin/cos computation etc.) that depend on position data.
+        // Memory is already allocated from pre-warm, so no aclrtMalloc needed.
+        cann_ctx->rope_cache.cached = false;
+
+        // Now capture the graph — all pools/caches are warm so no allocations
+        // will occur during recording.
         ACL_CHECK(aclmdlRICaptureBegin(cann_ctx->stream(), ACL_MODEL_RI_CAPTURE_MODE_GLOBAL));
     }
 #endif  // USE_ACL_GRAPH
+
     // Only perform the graph execution if CANN graphs are not enabled, or we are capturing the graph.
     // With the use of CANN graphs, the execution will be performed by the graph launch.
-    static bool opt_fusion = parse_bool(get_env_as_lowercase("GGML_CANN_OPERATOR_FUSION").value_or(""));
-
     if (!use_cann_graph || cann_graph_capture_required) {
-        for (int i = 0; i < cgraph->n_nodes; i++) {
-            ggml_tensor * node = cgraph->nodes[i];
-            if (opt_fusion) {
-                if (ggml_cann_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_RMS_NORM })) {
-                    ggml_cann_op_add_rms_norm_fused(*cann_ctx, node, cgraph->nodes[i + 1]);
-                    i++;
-                    continue;
-                }
-            }
-
-            // REPEAT+binary_op fusion: skip REPEAT, let binary op broadcast
-            for (enum ggml_op bop : {GGML_OP_MUL, GGML_OP_ADD, GGML_OP_SUB, GGML_OP_DIV}) {
-                if (ggml_cann_can_fuse(cgraph, i, { GGML_OP_REPEAT, bop })) {
-                    ggml_cann_op_repeat_binary_fused(*cann_ctx, node, cgraph->nodes[i + 1]);
-                    i++;
-                    goto next_node;
-                }
-            }
-
-            if (ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE ||
-                node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE) {
-                continue;
-            }
-
-            if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
-                continue;
-            }
-
-            {
-                bool ok = ggml_cann_compute_forward(*cann_ctx, node);
-                if (!ok) {
-                    GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
-                }
-                GGML_ASSERT(ok);
-            }
-            next_node:;
-        }
+        execute_graph_nodes(cann_ctx, cgraph, opt_fusion);
     }
 
 #ifdef USE_ACL_GRAPH
