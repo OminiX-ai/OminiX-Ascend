@@ -997,6 +997,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "ROPE_BACK",
     "CLAMP",
     "CONV_TRANSPOSE_1D",
+    "CONV_1D",
     "IM2COL",
     "IM2COL_BACK",
     "IM2COL_3D",
@@ -1011,6 +1012,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "PAD",
     "PAD_REFLECT_1D",
     "ROLL",
+    "FLIP",
     "ARANGE",
     "TIMESTEP_EMBEDDING",
     "ARGSORT",
@@ -1048,7 +1050,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 95, "GGML_OP_COUNT != 95");
+static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 95");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1120,6 +1122,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "pad(x)",
     "pad_reflect_1d(x)",
     "roll(x)",
+    "flip(x, dims)",
     "arange(start, stop, step)",
     "timestep_embedding(timesteps, dim, max_period)",
     "argsort(x)",
@@ -1157,7 +1160,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 95, "GGML_OP_COUNT != 95");
+static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 95");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -2566,6 +2569,27 @@ struct ggml_tensor * ggml_concat(
     result->op     = GGML_OP_CONCAT;
     result->src[0] = a;
     result->src[1] = b;
+
+    return result;
+}
+
+
+// ggml_flip
+
+struct ggml_tensor * ggml_flip(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int                   dims) {
+    GGML_ASSERT(a->nb[0] == ggml_type_size(a->type));
+    GGML_ASSERT(ggml_n_dims(a) <= 4);
+    GGML_ASSERT(dims >= 0 && dims < 4);
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, a);
+
+    ggml_set_op_params_i32(result, 0, dims);
+
+    result->op     = GGML_OP_FLIP;
+    result->src[0] = a;
 
     return result;
 }
@@ -4490,6 +4514,40 @@ struct ggml_tensor * ggml_conv_1d_dw_ph(
         int                   s0,
         int                   d0) {
     return ggml_conv_1d_dw(ctx, a, b, s0, a->ne[0] / 2, d0);
+}
+
+
+// ggml_conv_1d_direct - direct convolution without im2col decomposition
+// a: [K, IC, OC] - kernel weights (kernel_size, in_channels, out_channels)
+// b: [L, IC, N] - input data (length, in_channels, batch)
+// output: [OL, OC, N] - output (output_length, out_channels, batch)
+
+struct ggml_tensor * ggml_conv_1d_direct(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        int                   s0,
+        int                   p0,
+        int                   d0) {
+    GGML_ASSERT(a->ne[1] == b->ne[1]); // in_channels must match
+
+    int64_t ne[4];
+    ne[0] = ggml_calc_conv_output_size(b->ne[0], a->ne[0], s0, p0, d0);
+    ne[1] = a->ne[2]; // out_channels
+    ne[2] = b->ne[2]; // batch
+    ne[3] = 1;
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    ggml_set_op_params_i32(result, 0, s0);
+    ggml_set_op_params_i32(result, 1, p0);
+    ggml_set_op_params_i32(result, 2, d0);
+
+    result->op     = GGML_OP_CONV_1D;
+    result->src[0] = a;
+    result->src[1] = b;
+
+    return result;
 }
 
 // ggml_conv_transpose_1d

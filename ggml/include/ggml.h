@@ -522,6 +522,7 @@ extern "C" {
         GGML_OP_ROPE_BACK,
         GGML_OP_CLAMP,
         GGML_OP_CONV_TRANSPOSE_1D,
+        GGML_OP_CONV_1D,
         GGML_OP_IM2COL,
         GGML_OP_IM2COL_BACK,
         GGML_OP_IM2COL_3D,
@@ -536,6 +537,7 @@ extern "C" {
         GGML_OP_PAD,
         GGML_OP_PAD_REFLECT_1D,
         GGML_OP_ROLL,
+        GGML_OP_FLIP,
         GGML_OP_ARANGE,
         GGML_OP_TIMESTEP_EMBEDDING,
         GGML_OP_ARGSORT,
@@ -1068,6 +1070,12 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             struct ggml_tensor  * b,
+            int                   dim);
+
+
+    GGML_API struct ggml_tensor * ggml_flip(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
             int                   dim);
 
     GGML_API struct ggml_tensor * ggml_abs(
@@ -1947,6 +1955,19 @@ extern "C" {
             struct ggml_tensor  * b,  // data
             int                   s,  // stride
             int                   d); // dilation
+
+
+    // Direct conv_1d without im2col decomposition (uses dedicated CUDA kernel)
+    // a: [K, IC, OC] - kernel weights (kernel_size, in_channels, out_channels)
+    // b: [L, IC, N] - input data (length, in_channels, batch)
+    // output: [OL, OC, N] - output (output_length, out_channels, batch)
+    GGML_API struct ggml_tensor * ggml_conv_1d_direct(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            int                   s0,
+            int                   p0,
+            int                   d0);
 
     // depthwise
     // TODO: this is very likely wrong for some cases! - needs more testing

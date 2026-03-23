@@ -6105,6 +6105,90 @@ void ggml_compute_forward_conv_transpose_1d(
     }
 }
 
+
+// ggml_compute_forward_conv_1d
+// Direct convolution implementation (CPU fallback)
+// src0 (kernel): [K, IC, OC]
+// src1 (input):  [L, IC, N]
+// dst (output):  [OL, OC, N]
+static void ggml_compute_forward_conv_1d_f32(
+        const ggml_compute_params * params,
+              ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];  // kernel
+    const ggml_tensor * src1 = dst->src[1];  // input
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+
+    const int32_t * opts = (const int32_t *)dst->op_params;
+    const int stride = opts[0];
+    const int padding = opts[1];
+    const int dilation = opts[2];
+
+    const int kernel_size = src0->ne[0];
+    const int in_channels = src0->ne[1];
+    const int out_channels = src0->ne[2];
+    const int input_length = src1->ne[0];
+    const int batch_size = src1->ne[2];
+    const int output_length = dst->ne[0];
+
+    const float * kernel_data = (const float *)src0->data;
+    const float * input_data = (const float *)src1->data;
+    float * output_data = (float *)dst->data;
+
+    const int64_t total_output = output_length * out_channels * batch_size;
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+    const int64_t work_per_thread = (total_output + nth - 1) / nth;
+    const int64_t start = ith * work_per_thread;
+    const int64_t end = MIN(start + work_per_thread, total_output);
+
+    for (int64_t idx = start; idx < end; idx++) {
+        const int out_pos = idx % output_length;
+        const int out_ch = (idx / output_length) % out_channels;
+        const int batch = idx / (output_length * out_channels);
+
+        float acc = 0.0f;
+
+        for (int k = 0; k < kernel_size; k++) {
+            const int in_pos = out_pos * stride + k * dilation - padding;
+
+            if (in_pos < 0 || in_pos >= input_length) {
+                continue;
+            }
+
+            for (int ic = 0; ic < in_channels; ic++) {
+                const float kernel_val = kernel_data[k + ic * kernel_size + out_ch * (kernel_size * in_channels)];
+                const float input_val = input_data[in_pos + ic * input_length + batch * (input_length * in_channels)];
+                acc += kernel_val * input_val;
+            }
+        }
+
+        output_data[out_pos + out_ch * output_length + batch * (output_length * out_channels)] = acc;
+    }
+}
+
+void ggml_compute_forward_conv_1d(
+        const ggml_compute_params * params,
+              ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_conv_1d_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("conv_1d: unsupported type");
+            }
+    }
+}
+
 // ggml_compute_forward_im2col_f32
 // src0: kernel [OC, IC, KH, KW]
 // src1: image [N, IC, IH, IW]
@@ -7868,6 +7952,67 @@ void ggml_compute_forward_roll(
         case GGML_TYPE_F32:
             {
                 ggml_compute_forward_roll_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
+
+// ggml_compute_forward_flip
+
+static void ggml_compute_forward_flip_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+    const float * src_data = (const float *) src0->data;
+    float * dst_data = (float *) dst->data;
+
+    GGML_TENSOR_UNARY_OP_LOCALS
+
+    const int dims = ggml_get_op_params_i32(dst, 0);
+    GGML_ASSERT(dims >= 0 && dims < 4);
+    const bool flip_dim0 = dims == 0;
+    const bool flip_dim1 = dims == 1;
+    const bool flip_dim2 = dims == 2;
+    const bool flip_dim3 = dims == 3;
+
+    const int64_t total = ne00 * ne01 * ne02 * ne03;
+    const int64_t per_thread = (total + params->nth) / params->nth;
+    const int64_t start = params->ith * per_thread;
+    const int64_t end   = std::min(start + per_thread, total);
+
+    for (int64_t idx = start; idx < end; ++idx) {
+        const int64_t i0 = idx % ne00;
+        const int64_t i1 = (idx / ne00) % ne01;
+        const int64_t i2 = (idx / (ne00 * ne01)) % ne02;
+        const int64_t i3 = idx / (ne00 * ne01 * ne02);
+
+        const int64_t src_i0 = flip_dim0 ? (ne00 - 1 - i0) : i0;
+        const int64_t src_i1 = flip_dim1 ? (ne01 - 1 - i1) : i1;
+        const int64_t src_i2 = flip_dim2 ? (ne02 - 1 - i2) : i2;
+        const int64_t src_i3 = flip_dim3 ? (ne03 - 1 - i3) : i3;
+
+        const int64_t dst_offset = i3 * nb3 + i2 * nb2 + i1 * nb1 + i0 * nb0;
+        const int64_t src_offset = src_i3 * nb03 + src_i2 * nb02 + src_i1 * nb01 + src_i0 * nb00;
+
+        dst_data[dst_offset / sizeof(float)] = src_data[src_offset / sizeof(float)];
+    }
+}
+
+void ggml_compute_forward_flip(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_flip_f32(params, dst);
             } break;
         default:
             {

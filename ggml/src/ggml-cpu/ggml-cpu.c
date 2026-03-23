@@ -1878,6 +1878,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_conv_transpose_1d(params, tensor);
             } break;
+        case GGML_OP_CONV_1D:
+            {
+                ggml_compute_forward_conv_1d(params, tensor);
+            } break;
         case GGML_OP_IM2COL:
             {
                 ggml_compute_forward_im2col(params, tensor);
@@ -1933,6 +1937,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_ROLL:
             {
                 ggml_compute_forward_roll(params, tensor);
+            } break;
+        case GGML_OP_FLIP:
+            {
+                ggml_compute_forward_flip(params, tensor);
             } break;
         case GGML_OP_ARANGE:
             {
@@ -2399,6 +2407,10 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 n_tasks = n_threads;
             } break;
         case GGML_OP_NONE:
+            {
+                n_tasks = 1;
+            } break;
+        case GGML_OP_FLIP:
             {
                 n_tasks = 1;
             } break;
