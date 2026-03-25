@@ -281,25 +281,17 @@ bool QwenTTS::generate(const QwenTTSParams& params, std::vector<float>& audio_ou
            std::chrono::duration<double>(t1 - t0).count(),
            full_audio.size() / 24000.0 / std::chrono::duration<double>(t1 - t0).count());
 
-    // Step 7: Remove reference audio AND generated ref-text speech
-    // The ICL model generates both [ref_text speech | target_text speech].
-    // full_audio = decoder([ref_codes || gen_codes]) =
-    //   [ref audio] + [gen ref-text] + [gen target-text]
-    // cut1: remove decoded ref audio   = n_ref_frames * upsample_rate
-    // cut2: remove generated ref-text  = n_ref_frames * upsample_rate (same size)
-    // Since upsample_rate is constant, cut1 == cut2, so total_cut = 2 * cut1.
-    // This also eliminates the head transition artifact: at the new start position,
-    // the decoder's causal window no longer contains original ref audio frames.
+    // Step 7: Remove reference audio portion
+    // full_audio = decoder([ref_codes || gen_codes])
+    // Only ref_codes correspond to the original ref audio; gen_codes are target-text only.
+    // Cut proportionally: cut = n_ref_frames / total_frames * audio_length
+    // (matches Python: cut = int(ref_len / total_len * wav.shape[0]))
     int total_frames = n_ref_frames + n_gen_frames;
-    int cut1 = (int)((long long)n_ref_frames * full_audio.size() / std::max(total_frames, 1));
-    int total_cut = 2 * cut1;
-    printf("  cut1 (ref audio):    %d samples (%.2f sec)\n", cut1, cut1 / 24000.0f);
-    printf("  cut2 (gen ref-text): %d samples (%.2f sec)\n", cut1, cut1 / 24000.0f);
-    if (total_cut > 0 && total_cut < (int)full_audio.size()) {
-        audio_out.assign(full_audio.begin() + total_cut, full_audio.end());
-    } else if (cut1 > 0 && cut1 < (int)full_audio.size()) {
-        // Fallback: at least remove the ref audio portion
-        audio_out.assign(full_audio.begin() + cut1, full_audio.end());
+    int cut = (int)((long long)n_ref_frames * (long long)full_audio.size() / std::max(total_frames, 1));
+    printf("  Cutting first %d samples (%.2f sec) -- ref audio portion\n",
+           cut, cut / 24000.0f);
+    if (cut > 0 && cut < (int)full_audio.size()) {
+        audio_out.assign(full_audio.begin() + cut, full_audio.end());
     } else {
         audio_out = std::move(full_audio);
     }
