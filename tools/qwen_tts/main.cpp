@@ -108,6 +108,17 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // Warmup run (same input, discard output) to trigger lazy kernel compilation
+    {
+        printf("\n=== Warmup run ===\n");
+        QwenTTSParams warmup_params = params;
+        warmup_params.max_new_tokens = 5;  // minimal generation
+        warmup_params.profiling = false;
+        std::vector<float> warmup_audio;
+        tts.generate(warmup_params, warmup_audio);
+        printf("=== Warmup complete ===\n\n");
+    }
+
     std::vector<float> audio_out;
     if (!tts.generate(params, audio_out)) {
         fprintf(stderr, "Failed to generate audio\n");
