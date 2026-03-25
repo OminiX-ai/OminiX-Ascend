@@ -180,6 +180,20 @@ bool QwenTTS::generate(const QwenTTSParams& params, std::vector<float>& audio_ou
     printf("  Loaded %zu samples (%.2f sec at 24kHz)\n",
            ref_audio.size(), ref_audio.size() / 24000.0f);
 
+    if (params.profiling) {
+        FILE *f = fopen("logs/cpp_ref_audio_input.bin", "wb");
+        if (f) {
+            int n = (int)ref_audio.size();
+            fwrite(&n, 4, 1, f);
+            fwrite(ref_audio.data(), sizeof(float), n, f);
+            fclose(f);
+            printf("  [debug] dumped ref_audio input (%d samples)\n", n);
+            printf("  [debug] first 10: ");
+            for (int i = 0; i < 10 && i < n; i++) printf("%.6f ", ref_audio[i]);
+            printf("\n");
+        }
+    }
+
     // Step 2: Extract speaker embedding
     printf("\n--- Step 2: Extract speaker embedding ---\n");
     auto t0 = std::chrono::high_resolution_clock::now();
@@ -208,7 +222,8 @@ bool QwenTTS::generate(const QwenTTSParams& params, std::vector<float>& audio_ou
     printf("\n--- Step 3: Encode reference audio ---\n");
     t0 = std::chrono::high_resolution_clock::now();
     std::vector<std::vector<int>> ref_codes;
-    if (!tokenizer_encoder_.encode(ref_audio, ref_codes)) {
+    std::vector<float> encoder_hidden;
+    if (!tokenizer_encoder_.encode(ref_audio, ref_codes, &encoder_hidden)) {
         printf("FAIL: audio encoding failed\n");
         return false;
     }
@@ -234,6 +249,18 @@ bool QwenTTS::generate(const QwenTTSParams& params, std::vector<float>& audio_ou
             printf("  [debug] dumped ref_codes to logs/cpp_ref_codes.bin\n");
         }
     }  // profiling
+
+    if (params.profiling && !encoder_hidden.empty()) {
+        FILE *f = fopen("logs/cpp_encoder_hidden.bin", "wb");
+        if (f) {
+            int n = (int)encoder_hidden.size();
+            fwrite(&n, 4, 1, f);
+            fwrite(encoder_hidden.data(), sizeof(float), n, f);
+            fclose(f);
+            printf("  [debug] dumped encoder_hidden (%d floats, hidden=%d, T=%d)\n",
+                   n, 512, n / 512);
+        }
+    }
 
     // Step 4: Tokenize text
     printf("\n--- Step 4: Tokenize text ---\n");
