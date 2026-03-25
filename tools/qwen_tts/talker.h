@@ -228,6 +228,10 @@ private:
     std::vector<float> tts_pad_embed_;   // [dim]
     std::vector<float> tts_bos_embed_;   // [dim]
     std::vector<float> tts_eos_embed_;   // [dim]
+
+    // Trailing text hidden for streaming ICL generation
+    std::vector<float> trailing_text_;   // [trailing_text_len_ * dim] or [dim] if just tts_pad
+    int trailing_text_len_ = 0;          // 0 = use tts_pad for all steps
     bool tts_embeds_cached_ = false;
     void cache_tts_embeddings();
 

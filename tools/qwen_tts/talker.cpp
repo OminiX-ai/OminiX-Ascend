@@ -691,16 +691,20 @@ void TalkerLLM::compute_ref_frame_embedding(
 }
 
 // ============================================================================
-// TalkerLLM: build_input_embeddings (non-streaming ICL mode)
+// TalkerLLM: build_input_embeddings (streaming ICL mode)
 //
-// Python reference (modeling_qwen3_tts.py):
+// Python reference (modeling_qwen3_tts.py, generate_icl_prompt, non_streaming_mode=False):
 //   Every position = text_component + codec_component (element-wise add)
 //
 // Sequence layout:
 //   Section 1: Role prefix (3 pos) — text_proj(text_emb(im_start, assistant, \n))
 //   Section 2: Mixed prefix (N-1 pos) — [tts_pad×(N-2), tts_bos] + codec_prefix[:-1]
-//   Section 3: ICL text (M pos) — text_proj(text_emb(ref+target+eos)) + codec_pad
-//   Section 4: ICL codec (1+R pos) — [codec_bos, ref_frame_sum×R] + tts_pad
+//   Section 3: ICL interleaved (max(text_lens, codec_lens) pos)
+//     - text_embed = text_proj(ref_text ++ target_text) + tts_eos  [text_lens]
+//     - codec_embed = codec_bos + sum_of_groups(ref_code)          [codec_lens]
+//     - if text < codec: pad text with tts_pad, add element-wise
+//     - if text >= codec: use first codec_lens, rest go to trailing
+//   trailing_text_hidden: remaining text tokens (or tts_pad if text <= codec)
 // ============================================================================
 
 bool TalkerLLM::build_input_embeddings(
@@ -720,53 +724,82 @@ bool TalkerLLM::build_input_embeddings(
 
     // --- Build codec prefix token list ---
     std::vector<int> codec_prefix_ids;
-    // Thinking mode: think_id when language specified, nothink_id for auto
     auto lang_it = cfg.language_ids.find(language);
     int language_id = -1;
     if (lang_it != cfg.language_ids.end()) {
         language_id = lang_it->second;
-        // Language specified → thinking mode
         codec_prefix_ids.push_back(cfg.codec_think_id);      // 2154
         codec_prefix_ids.push_back(cfg.codec_think_bos_id);  // 2156
         codec_prefix_ids.push_back(language_id);
         codec_prefix_ids.push_back(cfg.codec_think_eos_id);  // 2157
     } else {
-        // Auto → no-thinking mode
         codec_prefix_ids.push_back(cfg.codec_nothink_id);    // 2155
         codec_prefix_ids.push_back(cfg.codec_think_bos_id);  // 2156
         codec_prefix_ids.push_back(cfg.codec_think_eos_id);  // 2157
     }
-    // Speaker embedding position (codec side = speaker vector)
     int spk_idx = spk_embedding.empty() ? -1 : (int)codec_prefix_ids.size();
-    if (!spk_embedding.empty()) codec_prefix_ids.push_back(-1);  // placeholder
-    // Pad + BOS
+    if (!spk_embedding.empty()) codec_prefix_ids.push_back(-1);
     codec_prefix_ids.push_back(cfg.codec_pad_id);   // 2148
     codec_prefix_ids.push_back(cfg.codec_bos_id);   // 2149
 
     int N = (int)codec_prefix_ids.size();
 
-    // --- Role prefix: <|im_start|>assistant\n (3 tokens) ---
-    // Token IDs: [151644, <assistant>, <\n>]
-    // For simplicity, use well-known Qwen token IDs
-    int role_ids[] = {151644, 77091, 198};  // <|im_start|> assistant \n
+    // --- Role prefix ---
+    int role_ids[] = {151644, 77091, 198};
     int role_len = 3;
 
-    // --- ICL section ---
+    // --- Build ICL text embeddings: text_proj(ref_text ++ target_text) + tts_eos ---
     int ref_text_len = (int)ref_text_tokens.size();
     int target_text_len = (int)target_text_tokens.size();
-    int text_total = ref_text_len + target_text_len + 1;  // +1 for tts_eos
+    int text_lens = ref_text_len + target_text_len + 1;  // +1 for tts_eos
+
+    std::vector<float> text_embeds(text_lens * dim);
+    for (int i = 0; i < ref_text_len; i++)
+        lookup_text_projected(ref_text_tokens[i], text_embeds.data() + (size_t)i * dim);
+    for (int i = 0; i < target_text_len; i++)
+        lookup_text_projected(target_text_tokens[i],
+                               text_embeds.data() + (size_t)(ref_text_len + i) * dim);
+    memcpy(text_embeds.data() + (size_t)(text_lens - 1) * dim,
+           tts_eos_embed_.data(), dim * sizeof(float));
+
+    // --- Build ICL codec embeddings: codec_bos + sum_of_groups(ref_code) ---
     int ref_frames = ref_codes.empty() ? 0 : (int)ref_codes[0].size();
-    int codec_icl_len = 1 + ref_frames;  // codec_bos + ref frames
+    int codec_lens = 1 + ref_frames;  // codec_bos + ref frames
+
+    std::vector<float> codec_embeds(codec_lens * dim);
+    lookup_codec_embedding(cfg.codec_bos_id, codec_embeds.data());
+    for (int f = 0; f < ref_frames; f++)
+        compute_ref_frame_embedding(ref_codes, f,
+                                     codec_embeds.data() + (size_t)(1 + f) * dim);
+
+    // --- Streaming interleave (matches Python generate_icl_prompt) ---
+    int icl_len = std::max(text_lens, codec_lens);
+
+    // Build trailing_text_hidden for generation loop
+    trailing_text_.clear();
+    if (text_lens > codec_lens) {
+        // text longer: first codec_lens positions interleaved, rest → trailing
+        trailing_text_.assign(text_embeds.begin() + (size_t)codec_lens * dim,
+                               text_embeds.end());
+        // Truncate text_embeds to codec_lens
+        text_lens = codec_lens;
+        icl_len = codec_lens;
+    } else {
+        // text shorter or equal: trailing = tts_pad (single embed, repeated each step)
+        trailing_text_ = tts_pad_embed_;  // dim floats
+    }
+    trailing_text_len_ = (text_lens <= codec_lens)
+                             ? 0  // flag: use tts_pad for all steps
+                             : (int)(trailing_text_.size() / dim);
 
     // --- Total sequence length ---
-    seq_len = role_len + (N - 1) + text_total + codec_icl_len;
+    seq_len = role_len + (N - 1) + icl_len;
     embeddings.resize((size_t)seq_len * dim, 0.0f);
 
     int pos = 0;
-    std::vector<float> tmp_text(dim);
     std::vector<float> tmp_codec(dim);
 
-    // Section 1: Role prefix (text only, no codec add)
+    // Section 1: Role prefix (text only)
     for (int i = 0; i < role_len; i++) {
         lookup_text_projected(role_ids[i],
                                embeddings.data() + (size_t)pos * dim);
@@ -774,19 +807,13 @@ bool TalkerLLM::build_input_embeddings(
     }
 
     // Section 2: Mixed prefix (N-1 positions)
-    // text side: [tts_pad × (N-2), tts_bos]
-    // codec side: codec_prefix[0:N-1]
     for (int i = 0; i < N - 1; i++) {
         float *dst = embeddings.data() + (size_t)pos * dim;
-
-        // Text component
         const float *text_src = (i < N - 2) ? tts_pad_embed_.data()
                                              : tts_bos_embed_.data();
         memcpy(dst, text_src, dim * sizeof(float));
 
-        // Codec component (add)
         if (i == spk_idx) {
-            // Speaker embedding position
             for (int j = 0; j < dim; j++) dst[j] += spk_embedding[j];
         } else {
             lookup_codec_embedding(codec_prefix_ids[i], tmp_codec.data());
@@ -795,50 +822,43 @@ bool TalkerLLM::build_input_embeddings(
         pos++;
     }
 
-    // Section 3: ICL text + codec_pad (text_total positions)
-    // text = text_proj(text_emb(ref_text ++ target_text)) + tts_eos
-    // codec = codec_pad repeated
-    lookup_codec_embedding(cfg.codec_pad_id, tmp_codec.data());
+    // Section 3: ICL interleaved (icl_len positions)
+    // text_embed[i] + codec_embed[i], padding shorter side
+    lookup_codec_embedding(cfg.codec_pad_id, tmp_codec.data());  // for text-side padding
 
-    for (int i = 0; i < ref_text_len; i++) {
+    for (int i = 0; i < icl_len; i++) {
         float *dst = embeddings.data() + (size_t)pos * dim;
-        lookup_text_projected(ref_text_tokens[i], dst);
-        for (int j = 0; j < dim; j++) dst[j] += tmp_codec[j];
-        pos++;
-    }
-    for (int i = 0; i < target_text_len; i++) {
-        float *dst = embeddings.data() + (size_t)pos * dim;
-        lookup_text_projected(target_text_tokens[i], dst);
-        for (int j = 0; j < dim; j++) dst[j] += tmp_codec[j];
-        pos++;
-    }
-    // tts_eos + codec_pad
-    {
-        float *dst = embeddings.data() + (size_t)pos * dim;
-        memcpy(dst, tts_eos_embed_.data(), dim * sizeof(float));
-        for (int j = 0; j < dim; j++) dst[j] += tmp_codec[j];
-        pos++;
-    }
 
-    // Section 4: ICL codec + tts_pad (1 + ref_frames positions)
-    // codec_bos + tts_pad
-    {
-        float *dst = embeddings.data() + (size_t)pos * dim;
-        lookup_codec_embedding(cfg.codec_bos_id, dst);
-        for (int j = 0; j < dim; j++) dst[j] += tts_pad_embed_[j];
-        pos++;
-    }
-    // ref frame embeddings (sum of all 16 groups) + tts_pad
-    for (int f = 0; f < ref_frames; f++) {
-        float *dst = embeddings.data() + (size_t)pos * dim;
-        compute_ref_frame_embedding(ref_codes, f, dst);
-        for (int j = 0; j < dim; j++) dst[j] += tts_pad_embed_[j];
+        // Text component
+        if (i < text_lens) {
+            memcpy(dst, text_embeds.data() + (size_t)i * dim, dim * sizeof(float));
+        } else {
+            // Pad text side with tts_pad
+            memcpy(dst, tts_pad_embed_.data(), dim * sizeof(float));
+        }
+
+        // Codec component (add)
+        if (i < codec_lens) {
+            const float *codec_src = codec_embeds.data() + (size_t)i * dim;
+            for (int j = 0; j < dim; j++) dst[j] += codec_src[j];
+        } else {
+            // Pad codec side with codec_pad
+            for (int j = 0; j < dim; j++) dst[j] += tmp_codec[j];
+        }
+
+        // Add tts_pad to codec positions (Python: codec_embed + tts_pad for all)
+        // Wait — in Python streaming mode, the ICL section is:
+        //   return text_embed + codec_embed   (no extra tts_pad addition)
+        // The tts_pad addition only happens in Section 2 and during generation.
+        // So we should NOT add tts_pad here. The above text+codec sum is correct.
+
         pos++;
     }
 
-    printf("[talker] built input embeddings: seq_len=%d "
-           "(role=%d mixed_prefix=%d icl_text=%d icl_codec=%d)\n",
-           seq_len, role_len, N - 1, text_total, codec_icl_len);
+    printf("[talker] built input embeddings (streaming): seq_len=%d "
+           "(role=%d mixed_prefix=%d icl=%d, text=%d codec=%d trailing=%d)\n",
+           seq_len, role_len, N - 1, icl_len, text_lens, codec_lens,
+           trailing_text_len_);
 
     return true;
 }
@@ -1442,9 +1462,22 @@ bool TalkerLLM::generate(
             auto emb_t1 = std::chrono::high_resolution_clock::now();
             total_emb_ms += std::chrono::duration<double, std::milli>(emb_t1 - emb_t0).count();
         } else {
-            // Special token (≥2048): skip Code Predictor, use Talker codec emb + tts_pad
+            // Special token (≥2048): skip Code Predictor, use Talker codec emb
             lookup_codec_embedding(group0_token, next_emb.data());
-            for (int j = 0; j < dim; j++) next_emb[j] += tts_pad_embed_[j];
+        }
+
+        // Add trailing_text_hidden (Python: inputs_embeds += trailing_text_hidden[:, step])
+        // This injects text context during autoregressive generation.
+        {
+            int gen_step = (int)codec_tokens[0].size();  // current generation step
+            if (trailing_text_len_ > 0 && gen_step < trailing_text_len_) {
+                // Remaining text tokens from ICL (text > codec case)
+                const float *txt = trailing_text_.data() + (size_t)gen_step * dim;
+                for (int j = 0; j < dim; j++) next_emb[j] += txt[j];
+            } else {
+                // Default: add tts_pad (text <= codec, or past trailing range)
+                for (int j = 0; j < dim; j++) next_emb[j] += tts_pad_embed_[j];
+            }
         }
 
         // 4e. Feed to llama.cpp
