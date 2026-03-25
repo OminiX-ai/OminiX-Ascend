@@ -351,7 +351,7 @@ def load_speech_tokenizer(model_path: str):
     tokenizer_path = os.path.join(model_path, "speech_tokenizer")
     print(f"Loading speech tokenizer from {tokenizer_path}...")
     tokenizer_model = AutoModel.from_pretrained(
-        tokenizer_path, device_map="cpu", dtype=torch.float16,
+        tokenizer_path, device_map="cpu", dtype=torch.float32,
         trust_remote_code=True,
     )
     print("Speech tokenizer loaded.")

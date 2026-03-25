@@ -19,6 +19,7 @@ bool load_wav(const std::string &path, AudioData &audio) {
   }
 
   audio.sample_rate = decoder.outputSampleRate;
+  printf("[audio_io] loaded %s: sr=%d, channels=%d\n", path.c_str(), audio.sample_rate, audio.channels);
   audio.channels = decoder.outputChannels;
 
   // Get total frame count
@@ -76,6 +77,8 @@ bool load_wav(const std::string &path, AudioData &audio) {
 
 bool resample(const AudioData &input, int target_sr,
               std::vector<float> &output) {
+  printf("[audio_io] resample: input_sr=%d, target_sr=%d, input_samples=%zu\n",
+         input.sample_rate, target_sr, input.samples.size());
   if (input.sample_rate == target_sr) {
     output = input.samples;
     return true;
