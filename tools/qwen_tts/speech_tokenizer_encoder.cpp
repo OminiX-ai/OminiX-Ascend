@@ -471,6 +471,35 @@ void SpeechTokenizerEncoder::prepare_codebooks() {
     }
 
     printf("[encoder] prepared %d codebooks (%dx%d)\n", n_q, cb_size, cb_dim);
+
+    // Debug: dump first codebook for alignment verification
+    {
+        FILE *f = fopen("logs/cpp_sem_codebook.bin", "wb");
+        if (f) {
+            fwrite(&cb_size, 4, 1, f);
+            fwrite(&cb_dim, 4, 1, f);
+            fwrite(codebooks_[0].data(), sizeof(float), cb_size * cb_dim, f);
+            fclose(f);
+            printf("[encoder] dumped semantic codebook: %dx%d\n", cb_size, cb_dim);
+            printf("[encoder] cb[0][:5]: %.6f %.6f %.6f %.6f %.6f\n",
+                   codebooks_[0][0], codebooks_[0][1], codebooks_[0][2],
+                   codebooks_[0][3], codebooks_[0][4]);
+            printf("[encoder] cb[2047][:5]: %.6f %.6f %.6f %.6f %.6f\n",
+                   codebooks_[0][2047*cb_dim+0], codebooks_[0][2047*cb_dim+1],
+                   codebooks_[0][2047*cb_dim+2], codebooks_[0][2047*cb_dim+3],
+                   codebooks_[0][2047*cb_dim+4]);
+        }
+        // Also dump input projection
+        f = fopen("logs/cpp_sem_input_proj.bin", "wb");
+        if (f) {
+            int in_ch = config_.hidden_size, out_ch = cb_dim;
+            fwrite(&in_ch, 4, 1, f);
+            fwrite(&out_ch, 4, 1, f);
+            fwrite(sem_input_proj_.data(), sizeof(float), in_ch * out_ch, f);
+            fclose(f);
+            printf("[encoder] dumped sem_input_proj: %dx%d\n", in_ch, out_ch);
+        }
+    }
 }
 
 bool SpeechTokenizerEncoder::encode(
@@ -553,21 +582,15 @@ bool SpeechTokenizerEncoder::encode(
     }
 
     // Step 2: RVQ quantization on CPU
-    // The ggml output tensor has ne[0]=T, ne[1]=hidden (after final permute+cont)
-    // Data layout: hidden_out[t + h * T] = element at (time=t, hidden=h)
-    // We need row-major [T, hidden]: residual[t * hidden + h]
+    // The ggml output tensor has ne[0]=hidden(512), ne[1]=T (after final permute+cont)
+    // Data layout: hidden_out[h + t * hidden] — already row-major [T, hidden]
+    // No transpose needed.
 
     codes.resize(n_q);
     for (int q = 0; q < n_q; q++) codes[q].resize(T);
 
-    // Working buffers
-    std::vector<float> residual(hidden * T);
-    // Transpose from ggml [ne0=T, ne1=hidden] to row-major [T, hidden]
-    for (int h = 0; h < hidden; h++) {
-        for (int t = 0; t < T; t++) {
-            residual[t * hidden + h] = hidden_out[t + h * T];
-        }
-    }
+    // Working buffers — hidden_out is already [T, hidden] row-major
+    std::vector<float> residual = hidden_out;
 
     std::vector<float> projected(T * cb_dim);
     std::vector<float> quantized_cb(T * cb_dim);
@@ -613,6 +636,19 @@ bool SpeechTokenizerEncoder::encode(
     {
         matmul(sem_input_proj_.data(), residual.data(), projected.data(),
                T, hidden, cb_dim);
+
+        // Debug: dump projected vectors for comparison
+        {
+            FILE *f = fopen("logs/cpp_sem_projected.bin", "wb");
+            if (f) {
+                fwrite(&T, 4, 1, f);
+                fwrite(&cb_dim, 4, 1, f);
+                fwrite(projected.data(), sizeof(float), T * cb_dim, f);
+                fclose(f);
+                printf("[encoder] dumped projected (%dx%d), first 5: %.4f %.4f %.4f %.4f %.4f\n",
+                       T, cb_dim, projected[0], projected[1], projected[2], projected[3], projected[4]);
+            }
+        }
 
         const float *cb = codebooks_[0].data();
         for (int t = 0; t < T; t++) {
