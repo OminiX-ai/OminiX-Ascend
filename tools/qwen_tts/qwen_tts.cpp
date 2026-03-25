@@ -371,13 +371,7 @@ bool QwenTTS::generate(const QwenTTSParams& params, std::vector<float>& audio_ou
         audio_out = std::move(full_audio);
     }
 
-    // Apply short fade-in to mask decoder boundary artifact at cut point
-    {
-        int fade_samples = std::min((int)(0.05f * 24000), (int)audio_out.size());  // 50ms
-        for (int i = 0; i < fade_samples; i++) {
-            audio_out[i] *= (float)i / fade_samples;
-        }
-    }
+
 
     auto total_t1 = std::chrono::high_resolution_clock::now();
     double total_time = std::chrono::duration<double>(total_t1 - total_t0).count();
