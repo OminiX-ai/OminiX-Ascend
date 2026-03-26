@@ -1376,6 +1376,7 @@ bool TalkerLLM::generate(
     }
 
     printf("[talker] prefill %d tokens (dim=%d)...\n", prefill_len, dim);
+    auto prefill_t0 = std::chrono::high_resolution_clock::now();
     int decode_rc = llama_decode(llama_ctx_, batch);
     if (decode_rc != 0) {
         printf("[talker] prefill failed\n");
@@ -1383,6 +1384,8 @@ bool TalkerLLM::generate(
         return false;
     }
     llama_batch_free(batch);
+    auto prefill_t1 = std::chrono::high_resolution_clock::now();
+    double talker_prefill_ms = std::chrono::duration<double, std::milli>(prefill_t1 - prefill_t0).count();
 
     // 3. Get hidden states from last position
     float *embd = llama_get_embeddings_ith(llama_ctx_, -1);
@@ -1408,9 +1411,10 @@ bool TalkerLLM::generate(
            sampling.temperature, sampling.top_k, sampling.top_p,
            sampling.repetition_penalty);
 
-    double total_llm_ms = 0, total_cp_ms = 0, total_emb_ms = 0;
+    double total_llm_ms = 0, total_cp_ms = 0, total_emb_ms = 0, total_head_ms = 0;
 
     for (int step = 0; step < max_new_tokens; step++) {
+        auto head_t0 = std::chrono::high_resolution_clock::now();
         // 4a. Apply codec_head → group 0 logits
         apply_codec_head(hidden.data(), logits_buf.data());
 
@@ -1421,6 +1425,9 @@ bool TalkerLLM::generate(
         // 4c. Apply repetition penalty
         apply_repetition_penalty(logits_buf.data(), vocab_size,
                                   generated_g0, sampling.repetition_penalty);
+
+        auto head_t1 = std::chrono::high_resolution_clock::now();
+        total_head_ms += std::chrono::duration<double, std::milli>(head_t1 - head_t0).count();
 
         // 4d. Sample group 0
         int group0_token = sample_token(logits_buf.data(), vocab_size,
@@ -1528,9 +1535,8 @@ bool TalkerLLM::generate(
         }
     }
 
-    printf("[talker] timing: LLM=%.1fms (%.1f%%), CP=%.1fms (%.1f%%), EMB=%.1fms (%.1f%%)\n",
-           total_llm_ms, 100.0 * total_llm_ms / (total_llm_ms + total_cp_ms + total_emb_ms),
-           total_cp_ms, 100.0 * total_cp_ms / (total_llm_ms + total_cp_ms + total_emb_ms),
-           total_emb_ms, 100.0 * total_emb_ms / (total_llm_ms + total_cp_ms + total_emb_ms));
+    double total_accounted = talker_prefill_ms + total_head_ms + total_cp_ms + total_llm_ms + total_emb_ms;
+    printf("[talker] timing: prefill=%.0fms, head=%.0fms, CP=%.0fms, LLM=%.0fms, EMB=%.0fms (sum=%.0fms)\n",
+           talker_prefill_ms, total_head_ms, total_cp_ms, total_llm_ms, total_emb_ms, total_accounted);
     return true;
 }
