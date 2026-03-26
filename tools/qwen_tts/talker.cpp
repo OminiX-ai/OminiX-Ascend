@@ -1133,35 +1133,28 @@ bool TalkerLLM::predict_code_groups(
         std::vector<float> logits(vocab_size);
         std::vector<float> emb_buf(talker_hidden);
 
-        // Position 0: project talker hidden → CP space, feed to llama
+        // Positions 0+1: batch prefill (talker hidden + group0 embedding)
         cp_matvec_f32(cp_f32_.proj_w.data(), cp_f32_.proj_b.data(),
                       hidden_states, projected.data(), cp_hidden, talker_hidden);
 
-        {
-            llama_batch batch = llama_batch_init(1, cp_hidden, 1);
-            batch.n_tokens = 1;
-            memcpy(batch.embd, projected.data(), cp_hidden * sizeof(float));
-            batch.pos[0] = 0;
-            batch.n_seq_id[0] = 1;
-            batch.seq_id[0][0] = 0;
-            batch.logits[0] = 1;
-            llama_decode(cp_llama_ctx_, batch);
-            llama_batch_free(batch);
-        }
-
-        // Position 1: project group0 embedding → CP space, feed to llama
+        std::vector<float> projected1(cp_hidden);
         lookup_codec_embedding(group0_token, emb_buf.data());
         cp_matvec_f32(cp_f32_.proj_w.data(), cp_f32_.proj_b.data(),
-                      emb_buf.data(), projected.data(), cp_hidden, talker_hidden);
+                      emb_buf.data(), projected1.data(), cp_hidden, talker_hidden);
 
         {
-            llama_batch batch = llama_batch_init(1, cp_hidden, 1);
-            batch.n_tokens = 1;
+            llama_batch batch = llama_batch_init(2, cp_hidden, 1);
+            batch.n_tokens = 2;
             memcpy(batch.embd, projected.data(), cp_hidden * sizeof(float));
-            batch.pos[0] = 1;
+            memcpy(batch.embd + cp_hidden, projected1.data(), cp_hidden * sizeof(float));
+            batch.pos[0] = 0;
+            batch.pos[1] = 1;
             batch.n_seq_id[0] = 1;
+            batch.n_seq_id[1] = 1;
             batch.seq_id[0][0] = 0;
-            batch.logits[0] = 1;
+            batch.seq_id[1][0] = 0;
+            batch.logits[0] = 0;
+            batch.logits[1] = 1;  // only need output from pos 1
             llama_decode(cp_llama_ctx_, batch);
             llama_batch_free(batch);
         }

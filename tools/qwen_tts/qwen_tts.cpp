@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <numeric>
 #include <cmath>
+#include <thread>
 
 // ============================================================================
 // Load all model components
@@ -194,44 +195,38 @@ bool QwenTTS::generate(const QwenTTSParams& params, std::vector<float>& audio_ou
         }
     }
 
-    // Step 2: Extract speaker embedding
-    printf("\n--- Step 2: Extract speaker embedding ---\n");
+    // Step 2+3: Speaker embedding + Audio encoding (parallel)
+    printf("\n--- Step 2+3: Speaker + Encoder (parallel) ---\n");
     auto t0 = std::chrono::high_resolution_clock::now();
+
     std::vector<float> spk_embedding;
-    if (!speaker_encoder_.extract(ref_audio, 24000, spk_embedding)) {
-        printf("FAIL: speaker embedding extraction failed\n");
-        return false;
-    }
-    auto t1 = std::chrono::high_resolution_clock::now();
-    double spk_time = std::chrono::duration<double>(t1 - t0).count();
-    printf("  Speaker embedding: %zu dims (%.2f sec)\n",
-           spk_embedding.size(), spk_time);
-
-    if (params.profiling) {
-        FILE *f = fopen("logs/cpp_spk_embedding.bin", "wb");
-        if (f) {
-            int dim = (int)spk_embedding.size();
-            fwrite(&dim, 4, 1, f);
-            fwrite(spk_embedding.data(), sizeof(float), dim, f);
-            fclose(f);
-            printf("  [debug] dumped spk_embedding (%d dims)\n", dim);
-        }
-    }
-
-    // Step 3: Encode reference audio to codec tokens
-    printf("\n--- Step 3: Encode reference audio ---\n");
-    t0 = std::chrono::high_resolution_clock::now();
     std::vector<std::vector<int>> ref_codes;
     std::vector<float> encoder_hidden;
-    if (!tokenizer_encoder_.encode(ref_audio, ref_codes, &encoder_hidden)) {
-        printf("FAIL: audio encoding failed\n");
-        return false;
-    }
-    t1 = std::chrono::high_resolution_clock::now();
+    bool spk_ok = false, enc_ok = false;
+
+    // Run speaker encoder in a separate thread
+    std::thread spk_thread([&]() {
+        spk_ok = speaker_encoder_.extract(ref_audio, 24000, spk_embedding);
+    });
+
+    // Run audio encoder in main thread
+    enc_ok = tokenizer_encoder_.encode(ref_audio, ref_codes, &encoder_hidden);
+
+    spk_thread.join();
+
+    auto t1 = std::chrono::high_resolution_clock::now();
+    double parallel_time = std::chrono::duration<double>(t1 - t0).count();
+
+    if (!spk_ok) { printf("FAIL: speaker embedding extraction failed\n"); return false; }
+    if (!enc_ok) { printf("FAIL: audio encoding failed\n"); return false; }
+
     int n_ref_frames = ref_codes.empty() ? 0 : (int)ref_codes[0].size();
-    double enc_time = std::chrono::duration<double>(t1 - t0).count();
-    printf("  Ref codes: %d quantizers x %d frames (%.2f sec)\n",
-           (int)ref_codes.size(), n_ref_frames, enc_time);
+    double spk_time = parallel_time;  // for timing report compatibility
+    double enc_time = parallel_time;
+    printf("  Speaker embedding: %zu dims\n", spk_embedding.size());
+    printf("  Ref codes: %d quantizers x %d frames\n",
+           (int)ref_codes.size(), n_ref_frames);
+    printf("  Parallel time: %.2f sec\n", parallel_time);
 
     // Debug: dump ref_codes for round-trip testing
     if (params.profiling) {
