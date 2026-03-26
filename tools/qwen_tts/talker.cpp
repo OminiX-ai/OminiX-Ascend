@@ -570,83 +570,35 @@ void TalkerLLM::lookup_codec_embedding(int token_id, float *out) {
     read_embedding_row(m.codec_embedding_w, token_id, out, n_embd_);
 }
 
+// Forward declaration
+static void cp_matvec_f32(const float *W, const float *b,
+                            const float *x, float *out, int nout, int nin);
+
 // text_projection: fc1 (SiLU) → fc2
 // fc1: [out, in] + bias, fc2: [out, in] + bias
 // GGUF layout after dimension reversal: ne[0]=in_features, ne[1]=out_features
 // Data: W[out][in] = data[out * dim + in]
 // So: output[o] = sum_i data[o * dim + i] * input[i]
 void TalkerLLM::apply_text_projection(const float *in, float *out) {
-    auto &m = embed_session_->get_model();
+    init_head_f32_weights();
     int dim = n_embd_;
-
-    // fc1: tmp = SiLU(W1 * in + b1)
     std::vector<float> tmp(dim);
+    cp_matvec_f32(tp_fc1_w_.data(), tp_fc1_b_.empty() ? nullptr : tp_fc1_b_.data(),
+                   in, tmp.data(), dim, dim);
     for (int o = 0; o < dim; o++) {
-        float sum = 0.0f;
-        if (m.text_proj_fc1_w->type == GGML_TYPE_F16) {
-            const ggml_fp16_t *w = (const ggml_fp16_t *)m.text_proj_fc1_w->data;
-            for (int i = 0; i < dim; i++) {
-                sum += ggml_fp16_to_fp32(w[o * dim + i]) * in[i];
-            }
-        } else {
-            const float *w = (const float *)m.text_proj_fc1_w->data;
-            for (int i = 0; i < dim; i++) {
-                sum += w[o * dim + i] * in[i];
-            }
-        }
-        if (m.text_proj_fc1_b) {
-            const float *b = (const float *)m.text_proj_fc1_b->data;
-            sum += b[o];
-        }
-        // SiLU: x * sigmoid(x)
-        float sigmoid = 1.0f / (1.0f + expf(-sum));
-        tmp[o] = sum * sigmoid;
+        float x = tmp[o];
+        tmp[o] = x / (1.0f + expf(-x));
     }
-
-    // fc2: out = W2 * tmp + b2
-    for (int o = 0; o < dim; o++) {
-        float sum = 0.0f;
-        if (m.text_proj_fc2_w->type == GGML_TYPE_F16) {
-            const ggml_fp16_t *w = (const ggml_fp16_t *)m.text_proj_fc2_w->data;
-            for (int i = 0; i < dim; i++) {
-                sum += ggml_fp16_to_fp32(w[o * dim + i]) * tmp[i];
-            }
-        } else {
-            const float *w = (const float *)m.text_proj_fc2_w->data;
-            for (int i = 0; i < dim; i++) {
-                sum += w[o * dim + i] * tmp[i];
-            }
-        }
-        if (m.text_proj_fc2_b) {
-            const float *b = (const float *)m.text_proj_fc2_b->data;
-            sum += b[o];
-        }
-        out[o] = sum;
-    }
+    cp_matvec_f32(tp_fc2_w_.data(), tp_fc2_b_.empty() ? nullptr : tp_fc2_b_.data(),
+                   tmp.data(), out, dim, dim);
 }
 
 // codec_head: logits = W * hidden (no bias)
 // W: [hidden, vocab] in ggml col-major
 void TalkerLLM::apply_codec_head(const float *hidden, float *logits) {
-    auto &m = embed_session_->get_model();
-    int dim = n_embd_;
-    int vocab = talker_config_.vocab_size;
-
-    for (int v = 0; v < vocab; v++) {
-        float sum = 0.0f;
-        if (m.codec_head_w->type == GGML_TYPE_F16) {
-            const ggml_fp16_t *w = (const ggml_fp16_t *)m.codec_head_w->data;
-            for (int j = 0; j < dim; j++) {
-                sum += ggml_fp16_to_fp32(w[v * dim + j]) * hidden[j];
-            }
-        } else {
-            const float *w = (const float *)m.codec_head_w->data;
-            for (int j = 0; j < dim; j++) {
-                sum += w[v * dim + j] * hidden[j];
-            }
-        }
-        logits[v] = sum;
-    }
+    init_head_f32_weights();
+    cp_matvec_f32(codec_head_w_.data(), nullptr, hidden, logits,
+                   talker_config_.vocab_size, n_embd_);
 }
 
 // ============================================================================
@@ -915,6 +867,20 @@ void TalkerLLM::init_cp_f32_weights() {
 
     cp_f32_ready_ = true;
     printf("[talker] pre-converted CP weights to F32\n");
+}
+
+void TalkerLLM::init_head_f32_weights() {
+    if (head_f32_ready_) return;
+    auto &m = embed_session_->get_model();
+
+    tp_fc1_w_ = tensor_to_f32(m.text_proj_fc1_w);
+    tp_fc2_w_ = tensor_to_f32(m.text_proj_fc2_w);
+    if (m.text_proj_fc1_b) tp_fc1_b_ = tensor_to_f32(m.text_proj_fc1_b);
+    if (m.text_proj_fc2_b) tp_fc2_b_ = tensor_to_f32(m.text_proj_fc2_b);
+    codec_head_w_ = tensor_to_f32(m.codec_head_w);
+
+    head_f32_ready_ = true;
+    printf("[talker] pre-converted text_proj + codec_head to F32\n");
 }
 
 // F32 matrix-vector product with NEON + OpenMP: out[o] = sum_i W[o*in+i] * x[i] + b[o]
