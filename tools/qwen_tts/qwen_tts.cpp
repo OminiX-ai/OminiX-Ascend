@@ -171,6 +171,46 @@ bool QwenTTS::generate(const QwenTTSParams& params, std::vector<float>& audio_ou
 
     auto total_t0 = std::chrono::high_resolution_clock::now();
 
+    std::vector<float> spk_embedding;
+    std::vector<std::vector<int>> ref_codes;
+    std::vector<float> encoder_hidden;
+    bool used_cache = false;
+
+    // Try loading from ref_cache file
+    if (!params.ref_cache.empty()) {
+        FILE *fc = fopen(params.ref_cache.c_str(), "rb");
+        if (fc) {
+            // Load cached ref_codes + spk_embedding
+            int nq, nf, spk_dim;
+            if (fread(&nq, 4, 1, fc) == 1 && fread(&nf, 4, 1, fc) == 1) {
+                ref_codes.resize(nq);
+                for (int q = 0; q < nq; q++) {
+                    ref_codes[q].resize(nf);
+                    fread(ref_codes[q].data(), sizeof(int), nf, fc);
+                }
+                if (fread(&spk_dim, 4, 1, fc) == 1) {
+                    spk_embedding.resize(spk_dim);
+                    fread(spk_embedding.data(), sizeof(float), spk_dim, fc);
+                }
+                used_cache = true;
+                printf("\n--- Loaded ref cache: %s (%dx%d codes, spk=%d dims) ---\n",
+                       params.ref_cache.c_str(), nq, nf, spk_dim);
+            }
+            fclose(fc);
+        }
+    }
+
+    double spk_time = 0, enc_time = 0;
+    auto t0 = std::chrono::high_resolution_clock::now();
+    auto t1 = t0;
+
+    if (!used_cache) {
+        // Need ref_audio + ref_text for encoding
+        if (params.ref_audio.empty() || params.ref_text.empty()) {
+            printf("FAIL: --ref_audio and --ref_text required (no ref_cache found)\n");
+            return false;
+        }
+
     // Step 1: Load reference audio
     printf("\n--- Step 1: Load reference audio ---\n");
     std::vector<float> ref_audio;
@@ -199,9 +239,6 @@ bool QwenTTS::generate(const QwenTTSParams& params, std::vector<float>& audio_ou
     printf("\n--- Step 2+3: Speaker + Encoder (parallel) ---\n");
     auto t0 = std::chrono::high_resolution_clock::now();
 
-    std::vector<float> spk_embedding;
-    std::vector<std::vector<int>> ref_codes;
-    std::vector<float> encoder_hidden;
     bool spk_ok = false, enc_ok = false;
 
     // Run speaker encoder in a separate thread
@@ -256,6 +293,28 @@ bool QwenTTS::generate(const QwenTTSParams& params, std::vector<float>& audio_ou
                    n, 512, n / 512);
         }
     }
+
+    // Save ref cache if requested
+    if (!used_cache && !params.ref_cache.empty()) {
+        FILE *fc = fopen(params.ref_cache.c_str(), "wb");
+        if (fc) {
+            int nq = (int)ref_codes.size();
+            int nf = ref_codes.empty() ? 0 : (int)ref_codes[0].size();
+            int spk_dim = (int)spk_embedding.size();
+            fwrite(&nq, 4, 1, fc);
+            fwrite(&nf, 4, 1, fc);
+            for (int q = 0; q < nq; q++)
+                fwrite(ref_codes[q].data(), sizeof(int), nf, fc);
+            fwrite(&spk_dim, 4, 1, fc);
+            fwrite(spk_embedding.data(), sizeof(float), spk_dim, fc);
+            fclose(fc);
+            printf("  Saved ref cache: %s\n", params.ref_cache.c_str());
+        }
+    }
+
+    }  // end if (!used_cache)
+
+    int n_ref_frames = ref_codes.empty() ? 0 : (int)ref_codes[0].size();
 
     // Step 4: Tokenize text
     printf("\n--- Step 4: Tokenize text ---\n");
@@ -375,9 +434,11 @@ bool QwenTTS::generate(const QwenTTSParams& params, std::vector<float>& audio_ou
     printf("  Output: %zu samples (%.2f sec at 24kHz)\n",
            audio_out.size(), target_duration);
     printf("  Timing breakdown:\n");
-    printf("    Speaker Enc: %.2f sec\n", spk_time);
-    printf("    Audio Enc:   %.2f sec\n", enc_time);
-    printf("    Tokenize:    %.2f sec\n", prefill_time - spk_time - enc_time);
+    if (used_cache) {
+        printf("    Ref Cache:   loaded (encoder skipped)\n");
+    } else {
+        printf("    Speaker+Enc: %.2f sec (parallel)\n", spk_time);
+    }
     printf("    Prefill tot: %.2f sec\n", prefill_time);
     printf("    Generate:    %.2f sec\n", generate_time);
     printf("    Decode:      %.2f sec\n", decode_time);

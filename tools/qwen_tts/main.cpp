@@ -18,6 +18,9 @@ static void print_usage(const char* prog) {
     printf("  --target_lang <lang>       Target language (English/Chinese, default: English)\n");
     printf("  --ref_lang <lang>          Reference language (default: English)\n");
     printf("  -o, --output <path>        Output audio file (default: output.wav)\n");
+    printf("  --ref_cache <path>         Pre-computed ref cache file (.bin)\n");
+    printf("                             If file exists: load and skip encoder\n");
+    printf("                             If not exists + ref_audio given: encode and save\n");
     printf("  --talker_model <path>      Override Talker GGUF file (for quantized models)\n");
     printf("  --cp_model <path>          Override CP llama GGUF (for NPU acceleration)\n");
     printf("  -d, --device <device>      Compute device (CPU, default: CPU)\n");
@@ -65,6 +68,8 @@ int main(int argc, char** argv) {
             params.talker_model = argv[++i];
         } else if (arg == "--cp_model" && i + 1 < argc) {
             params.cp_model = argv[++i];
+        } else if (arg == "--ref_cache" && i + 1 < argc) {
+            params.ref_cache = argv[++i];
         } else if ((arg == "-d" || arg == "--device") && i + 1 < argc) {
             params.device = argv[++i];
         } else if ((arg == "-n" || arg == "--n_threads") && i + 1 < argc) {
@@ -95,9 +100,11 @@ int main(int argc, char** argv) {
         }
     }
 
+    bool has_ref_cache = !params.ref_cache.empty();
+    bool has_ref_audio = !params.ref_audio.empty() && !params.ref_text.empty();
     if (params.model_dir.empty() || params.text.empty() ||
-        params.ref_audio.empty() || params.ref_text.empty()) {
-        fprintf(stderr, "Error: --model_dir, --text, --ref_audio, and --ref_text are required\n\n");
+        (!has_ref_cache && !has_ref_audio)) {
+        fprintf(stderr, "Error: --model_dir, --text, and (--ref_audio + --ref_text or --ref_cache) are required\n\n");
         print_usage(argv[0]);
         return 1;
     }
