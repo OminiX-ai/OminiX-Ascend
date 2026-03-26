@@ -229,6 +229,12 @@ private:
     std::vector<float> tts_bos_embed_;   // [dim]
     std::vector<float> tts_eos_embed_;   // [dim]
 
+    // Pre-converted F32 weights for text_projection and codec_head
+    std::vector<float> tp_fc1_w_, tp_fc1_b_, tp_fc2_w_, tp_fc2_b_;
+    std::vector<float> codec_head_w_;
+    bool head_f32_ready_ = false;
+    void init_head_f32_weights();
+
     // Trailing text hidden for streaming ICL generation
     std::vector<float> trailing_text_;   // [trailing_text_len_ * dim] or [dim] if just tts_pad
     int trailing_text_len_ = 0;          // 0 = use tts_pad for all steps
