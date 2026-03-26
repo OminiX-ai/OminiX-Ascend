@@ -50,10 +50,10 @@ bool QwenTTS::load(const QwenTTSParams& params) {
         return false;
     }
 
-    // 3. Speech Tokenizer Encoder (CPU: CANN 2.3x slower due to kernel launch overhead)
+    // 3. Speech Tokenizer Encoder (testing CANN)
     printf("\n[3/5] Loading speech tokenizer encoder...\n");
     ContextParams enc_params;
-    enc_params.device_name = cpu_device;
+    enc_params.device_name = (params.n_gpu_layers > 0) ? "CANN0" : cpu_device;
     enc_params.n_threads = params.n_threads;
     enc_params.max_nodes = 8192;
     if (!tokenizer_encoder_.load(model_dir + "qwen_tts_tokenizer_enc.gguf",
