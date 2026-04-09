@@ -6,6 +6,173 @@
 #include <numeric>
 #include <cmath>
 #include <thread>
+#include <cctype>
+
+namespace {
+// Split target_text on sentence boundaries so each sentence can run
+// through the talker independently. Necessary because Qwen3-TTS was
+// trained on relatively short utterances; given a long input it
+// compresses speech to roughly half the natural rate (162 ms/token vs
+// 305 ms/token measured on a 100-word English paragraph), causing
+// slurred / garbled speech in the second half. Per-sentence runs each
+// get fresh talker state and stay inside the model's training
+// distribution.
+//
+// Boundaries:
+//   English: `. ! ?` followed by whitespace and an uppercase letter (or
+//     non-ASCII / EOT). Avoids splitting "Mr. Smith", "1.5", "U.S.A.".
+//   Chinese: `。！？` (3-byte UTF-8 forms).
+//   Always: em-dash (—, U+2014) and en-dash (–, U+2013) — these mark
+//     parenthetical clauses and the talker handles cleaner sentence-
+//     shaped fragments much better than parenthetical structure.
+//   Always: `;` (semicolon).
+//   `:` followed by whitespace, regardless of next-char case (so
+//     "ratio 3:2" / "11:30" don't split because they have no space, but
+//     "snapshot: unpretentious" does).
+//
+// For clause-level splits (em-dash, semicolon, colon) the dash / punct
+// is dropped and a `.` is appended to the preceding fragment via
+// ensure_terminal_punct() so the model gets a clear EOS signal.
+//
+// Always returns at least one element.
+static bool is_zh_sentence_end(const std::string &t, size_t i) {
+    if (i + 2 >= t.size()) return false;
+    unsigned char a = (unsigned char) t[i];
+    unsigned char b = (unsigned char) t[i + 1];
+    unsigned char c = (unsigned char) t[i + 2];
+    if (a == 0xE3 && b == 0x80 && c == 0x82) return true;            // 。
+    if (a == 0xEF && b == 0xBC && (c == 0x81 || c == 0x9F)) return true;  // ！？
+    return false;
+}
+
+// 3-byte UTF-8 dash characters that act as clause boundaries.
+//   — em-dash  U+2014 → E2 80 94
+//   – en-dash  U+2013 → E2 80 93
+static bool is_dash_clause_break(const std::string &t, size_t i) {
+    if (i + 2 >= t.size()) return false;
+    unsigned char a = (unsigned char) t[i];
+    unsigned char b = (unsigned char) t[i + 1];
+    unsigned char c = (unsigned char) t[i + 2];
+    return a == 0xE2 && b == 0x80 && (c == 0x94 || c == 0x93);
+}
+
+// Append `.` to fragments that don't already end with terminal
+// punctuation, so the talker has a clear EOS signal. Empirically a
+// fragment like "She wears a modern, cute dress in bright, soft colors"
+// (em-dash split, no period) over-generates because the model has been
+// trained on sentence-shaped inputs that end in `. ! ?`.
+static void ensure_terminal_punct(std::string &s) {
+    if (s.empty()) return;
+    char back = s.back();
+    if (back == '.' || back == '!' || back == '?') return;
+    if (s.size() >= 3) {
+        unsigned char a = (unsigned char) s[s.size() - 3];
+        unsigned char b = (unsigned char) s[s.size() - 2];
+        unsigned char c = (unsigned char) s[s.size() - 1];
+        if (a == 0xE3 && b == 0x80 && c == 0x82) return;  // 。
+        if (a == 0xEF && b == 0xBC && (c == 0x81 || c == 0x9F)) return;  // ！？
+    }
+    if (back == ',') s.pop_back();  // drop dangling comma before adding period
+    s.push_back('.');
+}
+
+static std::vector<std::string> split_sentences(const std::string &text) {
+    std::vector<std::string> out;
+    auto trim = [](std::string s) {
+        while (!s.empty() && std::isspace((unsigned char) s.front())) s.erase(s.begin());
+        while (!s.empty() && std::isspace((unsigned char) s.back()))  s.pop_back();
+        return s;
+    };
+    auto push_natural = [&](std::string s) {
+        s = trim(std::move(s));
+        if (!s.empty()) out.push_back(std::move(s));
+    };
+    auto push_fragment = [&](std::string s) {
+        s = trim(std::move(s));
+        if (s.empty()) return;
+        ensure_terminal_punct(s);
+        out.push_back(std::move(s));
+    };
+
+    size_t start = 0;
+    size_t i = 0;
+    while (i < text.size()) {
+        char c = text[i];
+        bool en_end     = (c == '.' || c == '!' || c == '?');
+        bool semicolon  = (c == ';');
+        bool colon      = (c == ':');
+        bool zh_end     = is_zh_sentence_end(text, i);
+        bool dash_break = is_dash_clause_break(text, i);
+
+        if (en_end) {
+            size_t j = i + 1;
+            if (j == text.size()) {
+                push_natural(text.substr(start, j - start));
+                start = j;
+                i = j;
+                continue;
+            }
+            if (!std::isspace((unsigned char) text[j])) {
+                i = j;
+                continue;
+            }
+            size_t k = j;
+            while (k < text.size() && std::isspace((unsigned char) text[k])) k++;
+            if (k == text.size()) {
+                push_natural(text.substr(start, j - start));
+                start = j;
+                i = k;
+                continue;
+            }
+            unsigned char nc = (unsigned char) text[k];
+            if ((nc >= 'A' && nc <= 'Z') || nc >= 0x80) {
+                push_natural(text.substr(start, j - start));
+                start = j;
+                i = k;
+                continue;
+            }
+            i = j;
+            continue;
+        }
+        if (colon) {
+            size_t j = i + 1;
+            if (j == text.size() || std::isspace((unsigned char) text[j])) {
+                push_fragment(text.substr(start, i - start));
+                start = j;
+                i = j;
+                continue;
+            }
+            i = j;
+            continue;
+        }
+        if (semicolon) {
+            push_fragment(text.substr(start, i - start));
+            start = i + 1;
+            i = i + 1;
+            continue;
+        }
+        if (dash_break) {
+            push_fragment(text.substr(start, i - start));
+            start = i + 3;
+            i = i + 3;
+            continue;
+        }
+        if (zh_end) {
+            size_t j = i + 3;
+            push_natural(text.substr(start, j - start));
+            start = j;
+            i = j;
+            continue;
+        }
+        i++;
+    }
+    if (start < text.size()) {
+        push_natural(text.substr(start));
+    }
+    if (out.empty()) out.push_back(text);
+    return out;
+}
+}  // namespace
 
 // ============================================================================
 // Load all model components
@@ -375,97 +542,57 @@ bool QwenTTS::generate(const QwenTTSParams& params, std::vector<float>& audio_ou
 
     }  // end if (!used_cache)
 
-    // Step 4: Tokenize text
-    // In xvec mode the talker doesn't need ref_text — pass an empty string so
-    // ref_text_tokens stays empty (build_input_embeddings xvec branch ignores it).
-    printf("\n--- Step 4: Tokenize text ---\n");
-    std::vector<int> ref_text_tokens, target_text_tokens;
+    // Step 4: split target_text on sentence boundaries when chunking is
+    // enabled. Qwen3-TTS was trained on relatively short utterances and
+    // compresses long inputs to ~half the natural speech rate (162 ms/
+    // token vs 305 ms/token measured), causing slurring / garbling in
+    // the second half of long paragraphs. Looping the talker per
+    // sentence keeps each call inside the model's training distribution.
     std::string effective_ref_text = xvec_mode
         ? std::string()
         : (cached_ref_text_.empty() ? params.ref_text : cached_ref_text_);
-    tokenize_tts_text(effective_ref_text,
-                       params.text,
-                       ref_text_tokens, target_text_tokens);
+
+    std::vector<std::string> sentences;
+    if (params.auto_sentence_chunk) {
+        sentences = split_sentences(params.text);
+    } else {
+        sentences = {params.text};
+    }
+    printf("\n--- Step 4: Tokenize text (%zu sentence%s) ---\n",
+           sentences.size(), sentences.size() == 1 ? "" : "s");
+    if (sentences.size() > 1) {
+        for (size_t i = 0; i < sentences.size(); i++) {
+            printf("  [%zu] %s\n", i + 1, sentences[i].c_str());
+        }
+    }
 
     auto prefill_end = std::chrono::high_resolution_clock::now();
     double prefill_time = std::chrono::duration<double>(prefill_end - total_t0).count();
-
-    if (params.profiling) {
-        FILE *f = fopen("logs/cpp_ref_text_tokens.bin", "wb");
-        if (f) {
-            int n = (int)ref_text_tokens.size();
-            fwrite(&n, 4, 1, f);
-            fwrite(ref_text_tokens.data(), sizeof(int), n, f);
-            fclose(f);
-        }
-        f = fopen("logs/cpp_target_text_tokens.bin", "wb");
-        if (f) {
-            int n = (int)target_text_tokens.size();
-            fwrite(&n, 4, 1, f);
-            fwrite(target_text_tokens.data(), sizeof(int), n, f);
-            fclose(f);
-        }
-        printf("  [debug] dumped text tokens (ref=%zu, tgt=%zu)\n",
-               ref_text_tokens.size(), target_text_tokens.size());
-    }
-
-    // Step 5+6: Generate codec tokens with Talker LLM (and stream-decode if
-    // a chunk callback is registered).
-    //
-    // In non-streaming mode (the default) the talker generates all codec
-    // frames first, then the decoder runs once on the full sequence.
-    //
-    // In streaming mode (params.stream_chunk_frames > 0) the talker fires
-    // a per-frame callback every step. Once `chunk_frames` new frames have
-    // accumulated, we slice them out, decode that slice in isolation (same
-    // "drop ref / no warmup" behavior as the non-streaming path — the
-    // codec decoder's sliding-window attention zero-pads missing left
-    // context, which is exactly how xvec_only_mode ships in production),
-    // and invoke params.stream_callback with the resulting PCM. The
-    // generation thread blocks until the user callback returns, so audio
-    // emission is synchronous and ordered. Any frames left in the buffer
-    // when the talker reaches EOS are flushed in a final chunk with
-    // is_final=true. The full audio is also accumulated into audio_out so
-    // callers that ignore the callback still get the same result.
-    printf("\n--- Step 5: Generate codec tokens ---\n");
-    if (params.stream_chunk_frames > 0 && params.stream_callback) {
-        printf("  [streaming] chunk_frames=%d\n", params.stream_chunk_frames);
-    }
-    t0 = std::chrono::high_resolution_clock::now();
 
     // Convert language string to lowercase for matching
     std::string lang = params.target_lang;
     for (auto &c : lang) c = tolower(c);
 
-    std::vector<std::vector<int>> codec_tokens;
-
-    // Streaming state shared with the per-frame callback below.
+    // Streaming state shared across all sentences. codec_tokens is reused
+    // (cleared) per sentence so the per-frame callback always observes
+    // the current sentence's accumulated frames; decoded_until resets to
+    // 0 at the top of each sentence.
     bool streaming = (params.stream_chunk_frames > 0 && params.stream_callback);
-    int  decoded_until = 0;            // frames already emitted (exclusive)
     int  chunk_frames  = streaming ? params.stream_chunk_frames : 0;
+    constexpr int kStreamWarmup = 72;  // matches OVERLAP_FRAMES inside the decoder
+    int  upsample_per_frame = 1920;    // 24kHz * 0.08s; matches DecoderConfig.decode_upsample_rate
+    std::vector<std::vector<int>> codec_tokens;
+    int decoded_until = 0;
     double stream_decode_time = 0;
     int    stream_chunks_emitted = 0;
+    bool   stream_failed = false;
     audio_out.clear();
 
     // Per-chunk decode with a left-context warmup window so the codec
     // decoder's pre-transformer sliding-window attention (window=72) and
-    // causal conv stacks see realistic context across chunk boundaries.
-    // Without warmup, frame 0 of each chunk would attend to nothing, and
-    // adjacent chunks produced sample discontinuities (~25x larger jumps
-    // than baseline at chunk boundaries → audible clicks).
-    //
-    // Strategy: feed the decoder [max(0, from - kStreamWarmup), to)
-    // codec frames. After decode, drop the leading
-    // (from - warmup_start) * decode_upsample_rate audio samples and
-    // keep only the (to - from) frames that this chunk owns.
-    //
-    // Cost: the first chunk decodes its native frames; subsequent chunks
-    // decode (chunk_frames + warmup) frames each but only emit chunk_frames
-    // worth of audio. Net decoder work scales linearly with sequence
-    // length (still single-shot under CANN_MAX_FRAMES=99 for typical
-    // chunk sizes) and is the price of correct cross-chunk continuity.
-    constexpr int kStreamWarmup = 72;  // matches OVERLAP_FRAMES inside the decoder
-    int upsample_per_frame = 1920;     // 24kHz * 0.08s; matches DecoderConfig.decode_upsample_rate
+    // causal conv stacks see realistic context across chunk boundaries
+    // within a sentence. Cross-sentence boundaries decode in isolation
+    // (negligible click measured: max boundary jump ~1.6% of full range).
     auto emit_chunk = [&](int from, int to, bool is_final) {
         if (to <= from) {
             if (is_final && params.stream_callback) {
@@ -488,8 +615,6 @@ bool QwenTTS::generate(const QwenTTSParams& params, std::vector<float>& audio_ou
         auto dec_t1 = std::chrono::high_resolution_clock::now();
         stream_decode_time += std::chrono::duration<double>(dec_t1 - dec_t0).count();
         stream_chunks_emitted++;
-        // Drop the warmup region's audio — we already emitted those samples
-        // in a previous chunk and we only keep this chunk's "new" frames.
         int warmup_samples = (from - warmup_start) * upsample_per_frame;
         if (warmup_samples > (int) chunk_audio.size()) {
             warmup_samples = (int) chunk_audio.size();
@@ -503,12 +628,11 @@ bool QwenTTS::generate(const QwenTTSParams& params, std::vector<float>& audio_ou
         return true;
     };
 
-    bool stream_failed = false;
     TalkerLLM::FrameCallback frame_cb = nullptr;
     if (streaming) {
         frame_cb = [&](int frame_idx,
                        const std::vector<std::vector<int>> &cur_tokens) {
-            (void) cur_tokens;  // we read codec_tokens directly via capture
+            (void) cur_tokens;
             if (stream_failed) return;
             int n_now = frame_idx + 1;
             while (n_now - decoded_until >= chunk_frames) {
@@ -522,75 +646,149 @@ bool QwenTTS::generate(const QwenTTSParams& params, std::vector<float>& audio_ou
         };
     }
 
-    if (!talker_.generate(ref_text_tokens, target_text_tokens,
-                           spk_embedding, ref_codes, lang,
-                           codec_tokens, params.max_new_tokens,
-                           params.sampling, xvec_mode, frame_cb)) {
-        printf("FAIL: codec generation failed\n");
-        return false;
-    }
-    if (stream_failed) {
-        return false;
-    }
-    t1 = std::chrono::high_resolution_clock::now();
-    int n_gen_frames = codec_tokens.empty() ? 0 : (int)codec_tokens[0].size();
-    double generate_time = std::chrono::duration<double>(t1 - t0).count();
+    // Per-sentence aggregates for the final timing report.
+    double generate_time = 0;
+    double decode_time   = 0;
+    int    n_gen_frames  = 0;
 
-    if (params.profiling) {
-        FILE *f = fopen("logs/cpp_codec_tokens.bin", "wb");
-        if (f) {
-            int nq = (int)codec_tokens.size();
-            int nf = codec_tokens.empty() ? 0 : (int)codec_tokens[0].size();
-            fwrite(&nq, 4, 1, f);
-            fwrite(&nf, 4, 1, f);
-            for (int q = 0; q < nq; q++)
-                fwrite(codec_tokens[q].data(), sizeof(int), nf, f);
-            fclose(f);
-            printf("  [debug] dumped codec_tokens (%dx%d)\n", nq, nf);
+    // === Sentence loop ============================================
+    for (size_t s_idx = 0; s_idx < sentences.size(); s_idx++) {
+        const std::string &sentence = sentences[s_idx];
+        bool is_last_sentence = (s_idx + 1 == sentences.size());
+
+        if (sentences.size() > 1) {
+            printf("\n=== Sentence %zu/%zu ===\n", s_idx + 1, sentences.size());
         }
-    }
 
-    printf("  Generated %d codec frames (%.2f sec, %.1f frames/sec)\n",
-           n_gen_frames, generate_time,
-           n_gen_frames / generate_time);
+        // Tokenize this sentence (ref_text shared across all sentences).
+        std::vector<int> ref_text_tokens, target_text_tokens;
+        tokenize_tts_text(effective_ref_text, sentence,
+                          ref_text_tokens, target_text_tokens);
 
-    // Step 6: Decode codec tokens to audio
-    //
-    // In non-streaming mode this is a single decoder run. In streaming
-    // mode the bulk of the audio has already been emitted from
-    // emit_chunk() above, but we still need to flush the trailing partial
-    // chunk (if n_gen_frames isn't a multiple of chunk_frames).
-    printf("\n--- Step 6: Decode to audio ---\n");
-    t0 = std::chrono::high_resolution_clock::now();
-
-    double decode_time = 0;
-    if (streaming) {
-        // Flush remaining frames as the final chunk.
-        if (decoded_until < n_gen_frames) {
-            if (!emit_chunk(decoded_until, n_gen_frames, /*is_final=*/true)) {
-                return false;
+        if (params.profiling && s_idx == 0) {
+            FILE *f = fopen("logs/cpp_ref_text_tokens.bin", "wb");
+            if (f) {
+                int n = (int)ref_text_tokens.size();
+                fwrite(&n, 4, 1, f);
+                fwrite(ref_text_tokens.data(), sizeof(int), n, f);
+                fclose(f);
             }
-            decoded_until = n_gen_frames;
-        } else if (params.stream_callback) {
-            // n_gen_frames was an exact multiple of chunk_frames; we still
-            // owe the user a final marker.
-            params.stream_callback(nullptr, 0, true);
+            f = fopen("logs/cpp_target_text_tokens.bin", "wb");
+            if (f) {
+                int n = (int)target_text_tokens.size();
+                fwrite(&n, 4, 1, f);
+                fwrite(target_text_tokens.data(), sizeof(int), n, f);
+                fclose(f);
+            }
+            printf("  [debug] dumped text tokens (ref=%zu, tgt=%zu)\n",
+                   ref_text_tokens.size(), target_text_tokens.size());
         }
-        decode_time = stream_decode_time;
-        printf("  Decoded %zu samples in %d streaming chunk(s) "
-               "(%.2f sec, ratio %.1fx)\n",
-               audio_out.size(), stream_chunks_emitted, decode_time,
-               audio_out.size() / 24000.0 / std::max(decode_time, 1e-6));
-    } else {
-        if (!tokenizer_decoder_.decode(codec_tokens, audio_out)) {
-            printf("FAIL: audio decoding failed\n");
+
+        // Auto max_tokens cap (per sentence). Heuristic upper bound on
+        // the codec frames the talker may emit, derived from the
+        // tokenized target text length: ~8 frames per English BPE token,
+        // ~6 per Chinese, 30-frame floor. Generic safety net that stops
+        // a failing-to-EOS talker from running to 2048 frames. Disabled
+        // when the user passes --max_tokens explicitly.
+        int effective_max_tokens = params.max_new_tokens;
+        if (params.auto_max_tokens && !target_text_tokens.empty()) {
+            std::string lang_lc = params.target_lang;
+            for (auto &c : lang_lc) c = (char) tolower((unsigned char) c);
+            int per_token = (lang_lc == "chinese") ? 6 : 8;
+            int auto_cap  = std::max(30, (int) target_text_tokens.size() * per_token);
+            if (auto_cap < effective_max_tokens) {
+                printf("  [auto-cap] %zu target tokens (lang=%s) → max_new_tokens=%d "
+                       "(~%.1fs of audio); pass --max_tokens to override\n",
+                       target_text_tokens.size(), params.target_lang.c_str(),
+                       auto_cap, auto_cap * 0.08f);
+                effective_max_tokens = auto_cap;
+            }
+        }
+
+        // Step 5: talker generation for this sentence.
+        printf("\n--- Step 5: Generate codec tokens ---\n");
+        if (streaming && s_idx == 0) {
+            printf("  [streaming] chunk_frames=%d\n", params.stream_chunk_frames);
+        }
+        codec_tokens.clear();
+        decoded_until = 0;
+
+        auto t_gen0 = std::chrono::high_resolution_clock::now();
+        if (!talker_.generate(ref_text_tokens, target_text_tokens,
+                               spk_embedding, ref_codes, lang,
+                               codec_tokens, effective_max_tokens,
+                               params.sampling, xvec_mode, frame_cb)) {
+            printf("FAIL: codec generation failed\n");
             return false;
         }
-        t1 = std::chrono::high_resolution_clock::now();
-        decode_time = std::chrono::duration<double>(t1 - t0).count();
-        printf("  Decoded %zu samples (%.2f sec, ratio %.1fx)\n",
-               audio_out.size(), decode_time,
-               audio_out.size() / 24000.0 / decode_time);
+        if (stream_failed) {
+            return false;
+        }
+        auto t_gen1 = std::chrono::high_resolution_clock::now();
+        generate_time += std::chrono::duration<double>(t_gen1 - t_gen0).count();
+
+        int sent_frames = codec_tokens.empty() ? 0 : (int)codec_tokens[0].size();
+        n_gen_frames += sent_frames;
+
+        if (params.profiling) {
+            FILE *f = fopen("logs/cpp_codec_tokens.bin",
+                            s_idx == 0 ? "wb" : "ab");
+            if (f) {
+                int nq = (int)codec_tokens.size();
+                int nf = sent_frames;
+                fwrite(&nq, 4, 1, f);
+                fwrite(&nf, 4, 1, f);
+                for (int q = 0; q < nq; q++)
+                    fwrite(codec_tokens[q].data(), sizeof(int), nf, f);
+                fclose(f);
+                printf("  [debug] dumped codec_tokens (%dx%d)\n", nq, nf);
+            }
+        }
+
+        printf("  Generated %d codec frames (%.2f sec, %.1f frames/sec)\n",
+               sent_frames,
+               std::chrono::duration<double>(t_gen1 - t_gen0).count(),
+               sent_frames / std::max(
+                   std::chrono::duration<double>(t_gen1 - t_gen0).count(), 1e-6));
+
+        // Step 6: decode this sentence's frames into audio.
+        printf("\n--- Step 6: Decode to audio ---\n");
+        auto t_dec0 = std::chrono::high_resolution_clock::now();
+        if (streaming) {
+            // Flush this sentence's leftover frames. is_final fires only
+            // on the last partial chunk of the last sentence.
+            if (decoded_until < sent_frames) {
+                bool fire_final = is_last_sentence;
+                if (!emit_chunk(decoded_until, sent_frames, fire_final)) {
+                    return false;
+                }
+                decoded_until = sent_frames;
+            } else if (is_last_sentence && params.stream_callback) {
+                params.stream_callback(nullptr, 0, true);
+            }
+            // decode_time is updated inside emit_chunk (stream_decode_time).
+        } else {
+            std::vector<float> sentence_audio;
+            if (!tokenizer_decoder_.decode(codec_tokens, sentence_audio)) {
+                printf("FAIL: audio decoding failed\n");
+                return false;
+            }
+            auto t_dec1 = std::chrono::high_resolution_clock::now();
+            decode_time += std::chrono::duration<double>(t_dec1 - t_dec0).count();
+            printf("  Decoded %zu samples (%.2f sec)\n",
+                   sentence_audio.size(),
+                   std::chrono::duration<double>(t_dec1 - t_dec0).count());
+            audio_out.insert(audio_out.end(),
+                             sentence_audio.begin(), sentence_audio.end());
+        }
+    }
+
+    if (streaming) {
+        decode_time = stream_decode_time;
+        printf("\n  Streaming totals: %zu samples in %d chunk(s) "
+               "(%.2f sec decode, ratio %.1fx)\n",
+               audio_out.size(), stream_chunks_emitted, decode_time,
+               audio_out.size() / 24000.0 / std::max(decode_time, 1e-6));
     }
 
     auto total_t1 = std::chrono::high_resolution_clock::now();

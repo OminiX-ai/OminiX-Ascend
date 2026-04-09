@@ -259,6 +259,14 @@ private:
     bool tts_embeds_cached_ = false;
     void cache_tts_embeddings();
 
+    // Near-repeat loop detector state. Counts how many consecutive codec
+    // frames had ≥ 10 of 16 quantizers matching the previous frame.
+    // After 3 consecutive near-repeats the talker generation loop forces
+    // EOS and drops the looping frames so the audio doesn't carry the
+    // stuck syllable. Catches the rare case where the model gets locked
+    // into a syllable repetition. Reset at the top of every generate().
+    int near_repeat_run_ = 0;
+
     // Embedding helpers (operate on raw weight data)
     void lookup_text_embedding(int token_id, float *out);
     void lookup_codec_embedding(int token_id, float *out);

@@ -120,7 +120,10 @@ static void print_usage(const char* prog) {
     printf("  -d, --device <device>      Compute device (CPU, default: CPU)\n");
     printf("  -n, --n_threads <num>      Thread count (default: 8)\n");
     printf("  --n_gpu_layers <num>       Layers to offload to GPU/NPU (default: 0)\n");
-    printf("  --max_tokens <num>         Max generated codec frames (default: 2048)\n");
+    printf("  --max_tokens <num>         Max generated codec frames. When omitted,\n");
+    printf("                             a per-text auto cap is applied (~8 frames per\n");
+    printf("                             English BPE token, ~6 per Chinese, min 30) so\n");
+    printf("                             the talker can't run away to the 2048 default.\n");
     printf("  --temperature <float>      Sampling temperature (default: 0.9)\n");
     printf("  --top_k <int>              Top-K sampling (default: 50, 0=disabled)\n");
     printf("  --top_p <float>            Top-P nucleus sampling (default: 1.0)\n");
@@ -188,6 +191,7 @@ int main(int argc, char** argv) {
             params.n_gpu_layers = std::atoi(argv[++i]);
         } else if (arg == "--max_tokens" && i + 1 < argc) {
             params.max_new_tokens = std::atoi(argv[++i]);
+            params.auto_max_tokens = false;  // user-set: skip the auto cap
         } else if (arg == "--temperature" && i + 1 < argc) {
             params.sampling.temperature = std::atof(argv[++i]);
         } else if (arg == "--top_k" && i + 1 < argc) {

@@ -30,6 +30,20 @@ struct QwenTTSParams {
     int n_threads = 8;
     int n_gpu_layers = 0;            // Number of layers to offload to GPU/NPU (0=CPU only)
     int max_new_tokens = 2048;
+    // When true, generate() lowers max_new_tokens to a heuristic per-text
+    // cap (~8 frames per English BPE token, ~6 per Chinese, min 30) so a
+    // failing-to-EOS talker can't run all the way to the 2048-frame max.
+    // main.cpp clears this flag whenever the user passes --max_tokens.
+    bool auto_max_tokens = true;
+    // When true, generate() splits target_text on sentence terminators
+    // (. ! ? for English, 。！？for Chinese) plus em-dash / semicolon /
+    // colon clause boundaries, and runs the talker once per sentence.
+    // Necessary because Qwen3-TTS was trained on relatively short
+    // utterances: for ~100-word inputs the model otherwise compresses
+    // speech to ~half the natural rate (162 ms/token vs 305 ms/token
+    // measured), slurring words together in the second half. The encoder
+    // and spk_embedding load only once per generate() call.
+    bool auto_sentence_chunk = true;
     bool profiling = false;
     // Sampling parameters (matching Python defaults)
     TalkerSamplingParams sampling;

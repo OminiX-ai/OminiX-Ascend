@@ -1418,6 +1418,9 @@ bool TalkerLLM::generate(
 
     auto gen_t0 = std::chrono::high_resolution_clock::now();
 
+    // Reset per-call state for the near-repeat loop detector.
+    near_repeat_run_ = 0;
+
     // Ensure TTS embeddings are cached
     cache_tts_embeddings();
 
@@ -1543,6 +1546,51 @@ bool TalkerLLM::generate(
 
             auto cp_t1 = std::chrono::high_resolution_clock::now();
             total_cp_ms += std::chrono::duration<double, std::milli>(cp_t1 - cp_t0).count();
+
+            // ----- Near-repeat / loop detector ----------------------------
+            // Generic safety net for any sampling configuration: if the
+            // talker drives itself into a state where consecutive codec
+            // frames share most of their quantizer tokens, the audio for
+            // those frames sounds like the same syllable looping forever.
+            // Captured signature in one observed regression:
+            //   frame N:   g0=1521 | 1443 1471 59 145 736 406 1034 632 ...
+            //   frame N+1: g0=1095 | 1443 1471 59 145 736 406 1034 632 ...
+            // 10+ of 16 quantizers identical between adjacent frames.
+            //
+            // Strategy: count consecutive frames whose total quantizer
+            // match against the previous frame is ≥ 10. After 3 such
+            // near-repeat frames in a row, declare a loop, drop the
+            // looping frames, and force EOS. The threshold leaves room
+            // for legitimate held syllables (which may share a few
+            // quantizers) but catches the tight-repetition pattern.
+            int n_so_far = (int) codec_tokens[0].size();
+            if (n_so_far >= 2) {
+                int last = n_so_far - 1;
+                int matches = 0;
+                int n_q = (int) codec_tokens.size();
+                for (int q = 0; q < n_q; q++) {
+                    if (codec_tokens[q][last] == codec_tokens[q][last - 1]) {
+                        matches++;
+                    }
+                }
+                if (matches >= 10) {
+                    near_repeat_run_++;
+                } else {
+                    near_repeat_run_ = 0;
+                }
+                if (near_repeat_run_ >= 3) {
+                    printf("[talker] near-repeat loop detected at step %d "
+                           "(%d/%d quantizers match prev frame for "
+                           "%d frames running) → forcing EOS\n",
+                           step, matches, n_q, near_repeat_run_);
+                    int drop = std::min(near_repeat_run_, n_so_far);
+                    for (int q = 0; q < n_q; q++) {
+                        codec_tokens[q].resize(n_so_far - drop);
+                    }
+                    near_repeat_run_ = 0;
+                    break;
+                }
+            }
 
             // Streaming hook: notify caller that a new frame is ready.
             // Fired only for real codec frames (special tokens skip CP and
