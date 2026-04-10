@@ -479,7 +479,7 @@ bool TalkerLLM::load_model(const std::string &talker_llama_path,
     ctx_params.n_threads = n_threads;
     ctx_params.n_threads_batch = n_threads;
     ctx_params.embeddings = true;   // Get hidden states, not logits
-    ctx_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    ctx_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
 
     llama_ctx_ = llama_init_from_model(llama_model_, ctx_params);
     if (!llama_ctx_) {
@@ -515,6 +515,11 @@ bool TalkerLLM::load_model(const std::string &talker_llama_path,
         if (!getenv("GGML_CANN_GRAPH_CACHE_CAPACITY")) {
             setenv("GGML_CANN_GRAPH_CACHE_CAPACITY", "32", 0);
         }
+        // ADD+RMS_NORM operator fusion reduces kernel launch overhead
+        // in transformer blocks (documented in LLM_CANN_OPTIMIZATIONS.md).
+        if (!getenv("GGML_CANN_OPERATOR_FUSION")) {
+            setenv("GGML_CANN_OPERATOR_FUSION", "on", 0);
+        }
 #endif
 
         llama_model_params cp_model_params = llama_model_default_params();
@@ -533,7 +538,7 @@ bool TalkerLLM::load_model(const std::string &talker_llama_path,
             cp_ctx_params.n_threads = n_threads;
             cp_ctx_params.n_threads_batch = n_threads;
             cp_ctx_params.embeddings = true;  // Get hidden states, not logits
-            cp_ctx_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+            cp_ctx_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
 
             cp_llama_ctx_ = llama_init_from_model(cp_llama_model_, cp_ctx_params);
             if (!cp_llama_ctx_) {
