@@ -1,4 +1,5 @@
 #include "talker.h"
+#include "tts_transformer.h"
 #include "ggml.h"
 #include <cmath>
 #include <cstdio>
@@ -372,6 +373,28 @@ bool TalkerEmbeddingModel::load_hparams(const ModelLoader &loader) {
         }
         printf("[talker_embed] loaded %zu language IDs\n",
                config.language_ids.size());
+    }
+
+    // Parse speaker IDs from JSON (CustomVoice model)
+    std::string spk_json;
+    loader.get_string("spk_ids_json", spk_json, false);
+    if (!spk_json.empty()) {
+        size_t pos = 0;
+        while ((pos = spk_json.find('"', pos)) != std::string::npos) {
+            size_t key_start = pos + 1;
+            size_t key_end = spk_json.find('"', key_start);
+            if (key_end == std::string::npos) break;
+            std::string key = spk_json.substr(key_start, key_end - key_start);
+            size_t colon = spk_json.find(':', key_end);
+            if (colon == std::string::npos) break;
+            int val = std::atoi(spk_json.c_str() + colon + 1);
+            config.spk_ids[key] = val;
+            pos = spk_json.find(',', colon);
+            if (pos == std::string::npos) break;
+            pos++;
+        }
+        printf("[talker_embed] loaded %zu speaker IDs (CustomVoice)\n",
+               config.spk_ids.size());
     }
 
     printf("[talker_embed] hidden=%d codec_vocab=%d text_vocab=%d groups=%d\n",
@@ -812,6 +835,274 @@ bool TalkerLLM::build_input_embeddings(
            seq_len, role_len, N - 1, icl_len, text_lens, codec_lens,
            trailing_text_len_);
 
+    return true;
+}
+
+// ============================================================================
+// Public C API accessors
+// ============================================================================
+
+void TalkerLLM::reset_cache_public() {
+    if (llama_ctx_) {
+        llama_memory_clear(llama_get_memory(llama_ctx_), true);
+    }
+    api_cur_pos_ = 0;
+}
+
+int TalkerLLM::forward_public(const float *input_embeds, int seq_len,
+                               float *logits_out, float *hidden_out) {
+    if (!llama_ctx_) return -1;
+    int dim = n_embd_;
+
+    cache_tts_embeddings();
+
+    llama_batch batch = llama_batch_init(seq_len, dim, 1);
+    batch.n_tokens = seq_len;
+    memcpy(batch.embd, input_embeds, (size_t)seq_len * dim * sizeof(float));
+
+    // For MROPE: position tensor needs 4× entries [temporal, h, w, extra]
+    // TTS uses temporal only: h=0, w=0, extra=0
+    bool use_mrope = talker_config_.language_ids.size() > 0 &&
+                     !talker_config_.language_ids.empty(); // crude check; real check is rope_sections
+    // Actually just check if we have mrope sections
+    // For safety, always zero-fill 4× positions when mrope is possible
+    // llama_batch_init allocates pos for n_tokens, but llama.cpp may read 4*n_tokens
+    // Reallocate pos to 4× size
+    free(batch.pos);
+    batch.pos = (llama_pos *)calloc(4 * seq_len, sizeof(llama_pos));  // calloc zeros all
+    for (int i = 0; i < seq_len; i++) {
+        batch.pos[i] = api_cur_pos_ + i;  // temporal positions
+        // batch.pos[seq_len + i] = 0;    // h = 0 (already zeroed by calloc)
+        // batch.pos[2*seq_len + i] = 0;  // w = 0
+        // batch.pos[3*seq_len + i] = 0;  // extra = 0
+    }
+    for (int i = 0; i < seq_len; i++) {
+        batch.n_seq_id[i] = 1;
+        batch.seq_id[i][0] = 0;
+        batch.logits[i] = (i == seq_len - 1) ? 1 : 0;
+    }
+
+    int rc = llama_decode(llama_ctx_, batch);
+    llama_batch_free(batch);
+    if (rc != 0) return rc;
+
+    api_cur_pos_ += seq_len;
+
+    // Extract hidden state
+    float *embd = llama_get_embeddings_ith(llama_ctx_, -1);
+    if (!embd) return -1;
+
+    if (hidden_out) {
+        memcpy(hidden_out, embd, dim * sizeof(float));
+    }
+
+    // Apply codec head → logits
+    if (logits_out) {
+        apply_codec_head(embd, logits_out);
+    }
+
+    return 0;
+}
+
+// ============================================================================
+// X-Vector voice clone prefill (matches MLX build_voice_clone_prefill_embedding)
+// 10 positions: [role(3)] + [codec_overlay(4)] + [spk(1)] + [bos+pad(1)] + [first_text+bos(1)]
+// ============================================================================
+
+bool TalkerLLM::build_xvec_prefill(
+    const std::vector<int> &target_text_tokens,
+    const std::vector<float> &spk_embedding,
+    const std::string &language,
+    std::vector<float> &embeddings,
+    int &seq_len) {
+
+    int dim = n_embd_;
+    auto &cfg = talker_config_;
+    cache_tts_embeddings();
+
+    // Resolve language ID
+    auto lang_it = cfg.language_ids.find(language);
+    if (lang_it == cfg.language_ids.end()) {
+        printf("[talker] unknown language: %s\n", language.c_str());
+        return false;
+    }
+    int lang_id = lang_it->second;
+
+    // codec prefix: [think, think_bos, lang, think_eos] (4 tokens, voice_design style)
+    std::vector<int> codec_prefix = {
+        cfg.codec_think_id,
+        cfg.codec_think_bos_id,
+        lang_id,
+        cfg.codec_think_eos_id,
+    };
+
+    seq_len = 10;  // role(3) + codec_overlay(4) + spk(1) + bos+pad(1) + first_text+bos(1)
+    embeddings.resize((size_t)seq_len * dim, 0.0f);
+
+    // Precompute trailing text for autoregressive loop
+    // x-vector mode: trailing = text_tokens[1:] + tts_eos + tts_pad*...
+    if (target_text_tokens.size() > 1) {
+        trailing_text_len_ = (int)target_text_tokens.size(); // includes first token already consumed
+        trailing_text_.resize((size_t)trailing_text_len_ * dim);
+        for (int i = 1; i < (int)target_text_tokens.size(); i++) {
+            lookup_text_projected(target_text_tokens[i],
+                                   trailing_text_.data() + (size_t)(i - 1) * dim);
+        }
+        // Last trailing position: tts_eos
+        memcpy(trailing_text_.data() + (size_t)(trailing_text_len_ - 1) * dim,
+               tts_eos_embed_.data(), dim * sizeof(float));
+    } else {
+        trailing_text_len_ = 0;
+    }
+
+    int pos = 0;
+
+    // --- Positions 0-2: Role prefix (text_proj only, NO codec) ---
+    int role_ids[] = {im_start_token_id, 77091, 198};  // <|im_start|> assistant \n
+    for (int i = 0; i < 3; i++) {
+        lookup_text_projected(role_ids[i], embeddings.data() + (size_t)pos * dim);
+        pos++;
+    }
+
+    // --- Positions 3-6: Codec prefix overlaid on tts_pad ---
+    for (int i = 0; i < 4; i++) {
+        float *dst = embeddings.data() + (size_t)pos * dim;
+        // text_proj(tts_pad) + codec_embed(prefix[i])
+        memcpy(dst, tts_pad_embed_.data(), dim * sizeof(float));
+        // Add codec embedding
+        std::vector<float> codec_emb(dim);
+        lookup_codec_embedding(codec_prefix[i], codec_emb.data());
+        for (int j = 0; j < dim; j++) dst[j] += codec_emb[j];
+        pos++;
+    }
+
+    // --- Position 7: Speaker embedding + tts_pad ---
+    {
+        float *dst = embeddings.data() + (size_t)pos * dim;
+        memcpy(dst, tts_pad_embed_.data(), dim * sizeof(float));
+        // Add speaker embedding (element-wise, broadcasting if enc_dim == dim)
+        int spk_dim = (int)spk_embedding.size();
+        int copy_dim = std::min(spk_dim, dim);
+        for (int j = 0; j < copy_dim; j++) dst[j] += spk_embedding[j];
+        pos++;
+    }
+
+    // --- Position 8: tts_bos + codec_pad ---
+    {
+        float *dst = embeddings.data() + (size_t)pos * dim;
+        memcpy(dst, tts_bos_embed_.data(), dim * sizeof(float));
+        std::vector<float> codec_emb(dim);
+        lookup_codec_embedding(cfg.codec_pad_id, codec_emb.data());
+        for (int j = 0; j < dim; j++) dst[j] += codec_emb[j];
+        pos++;
+    }
+
+    // --- Position 9: first_text_token + codec_bos ---
+    {
+        float *dst = embeddings.data() + (size_t)pos * dim;
+        int first_text = target_text_tokens.empty() ? tts_pad_token_id : target_text_tokens[0];
+        lookup_text_projected(first_text, dst);
+        std::vector<float> codec_emb(dim);
+        lookup_codec_embedding(cfg.codec_bos_id, codec_emb.data());
+        for (int j = 0; j < dim; j++) dst[j] += codec_emb[j];
+        pos++;
+    }
+
+    printf("[talker] x-vector prefill: seq_len=%d (role=3, codec=4, spk=1, bos=1, text=1)\n", seq_len);
+    return true;
+}
+
+// ============================================================================
+// CustomVoice prefill (built-in speakers — discrete spk_id token)
+// 10 positions: [role(3)] + [codec_prefix(5) with spk_id] + [bos+pad(1)] + [first_text+bos(1)]
+// ============================================================================
+
+bool TalkerLLM::build_customvoice_prefill(
+    const std::vector<int> &target_text_tokens,
+    int spk_token_id,
+    const std::string &language,
+    std::vector<float> &embeddings,
+    int &seq_len) {
+
+    int dim = n_embd_;
+    auto &cfg = talker_config_;
+    cache_tts_embeddings();
+
+    auto lang_it = cfg.language_ids.find(language);
+    if (lang_it == cfg.language_ids.end()) {
+        printf("[talker] unknown language: %s\n", language.c_str());
+        return false;
+    }
+    int lang_id = lang_it->second;
+
+    // codec prefix: [think, think_bos, lang, think_eos, spk_id] (5 tokens)
+    std::vector<int> codec_prefix = {
+        cfg.codec_think_id,
+        cfg.codec_think_bos_id,
+        lang_id,
+        cfg.codec_think_eos_id,
+        spk_token_id,
+    };
+
+    seq_len = 10;  // role(3) + codec_overlay(5) + bos+pad(1) + first_text+bos(1)
+    embeddings.resize((size_t)seq_len * dim, 0.0f);
+
+    // Precompute trailing text
+    if (target_text_tokens.size() > 1) {
+        trailing_text_len_ = (int)target_text_tokens.size();
+        trailing_text_.resize((size_t)trailing_text_len_ * dim);
+        for (int i = 1; i < (int)target_text_tokens.size(); i++) {
+            lookup_text_projected(target_text_tokens[i],
+                                   trailing_text_.data() + (size_t)(i - 1) * dim);
+        }
+        memcpy(trailing_text_.data() + (size_t)(trailing_text_len_ - 1) * dim,
+               tts_eos_embed_.data(), dim * sizeof(float));
+    } else {
+        trailing_text_len_ = 0;
+    }
+
+    int pos = 0;
+
+    // --- Positions 0-2: Role prefix ---
+    int role_ids[] = {im_start_token_id, 77091, 198};
+    for (int i = 0; i < 3; i++) {
+        lookup_text_projected(role_ids[i], embeddings.data() + (size_t)pos * dim);
+        pos++;
+    }
+
+    // --- Positions 3-7: Codec prefix (5 tokens) overlaid on tts_pad ---
+    for (int i = 0; i < 5; i++) {
+        float *dst = embeddings.data() + (size_t)pos * dim;
+        memcpy(dst, tts_pad_embed_.data(), dim * sizeof(float));
+        std::vector<float> codec_emb(dim);
+        lookup_codec_embedding(codec_prefix[i], codec_emb.data());
+        for (int j = 0; j < dim; j++) dst[j] += codec_emb[j];
+        pos++;
+    }
+
+    // --- Position 8: tts_bos + codec_pad ---
+    {
+        float *dst = embeddings.data() + (size_t)pos * dim;
+        memcpy(dst, tts_bos_embed_.data(), dim * sizeof(float));
+        std::vector<float> codec_emb(dim);
+        lookup_codec_embedding(cfg.codec_pad_id, codec_emb.data());
+        for (int j = 0; j < dim; j++) dst[j] += codec_emb[j];
+        pos++;
+    }
+
+    // --- Position 9: first_text_token + codec_bos ---
+    {
+        float *dst = embeddings.data() + (size_t)pos * dim;
+        int first_text = target_text_tokens.empty() ? tts_pad_token_id : target_text_tokens[0];
+        lookup_text_projected(first_text, dst);
+        std::vector<float> codec_emb(dim);
+        lookup_codec_embedding(cfg.codec_bos_id, codec_emb.data());
+        for (int j = 0; j < dim; j++) dst[j] += codec_emb[j];
+        pos++;
+    }
+
+    printf("[talker] customvoice prefill: seq_len=%d (role=3, codec=5, bos=1, text=1), spk_id=%d\n",
+           seq_len, spk_token_id);
     return true;
 }
 
@@ -1277,10 +1568,10 @@ void TalkerLLM::compute_next_embedding(
         }
     }
 
-    // Add tts_pad text component (every position = text + codec)
-    for (int i = 0; i < dim; i++) {
-        out[i] += tts_pad_embed_[i];
-    }
+    // NOTE: Do NOT add tts_pad here. The caller adds the text component
+    // (trailing_text or tts_pad) separately, matching the Rust/MLX implementation:
+    //   codec0_embed + codec_1_15_sum + text_embed
+    // Adding tts_pad here AND in the caller causes double-addition corruption.
 }
 
 // ============================================================================
@@ -1520,5 +1811,312 @@ bool TalkerLLM::generate(
     printf("[talker]   loop_sum:  %7.0f ms (per-step wall clock)\n", total_loop_ms);
     double total_accounted = build_emb_ms + talker_prefill_ms + total_loop_ms;
     printf("[talker]   TOTAL:     %7.0f ms (build_emb + prefill + loop)\n", total_accounted);
+    return true;
+}
+
+// ============================================================================
+// generate_xvec: x-vector voice clone (no ref audio codec)
+// ============================================================================
+
+bool TalkerLLM::generate_xvec(
+    const std::vector<int> &target_text_tokens,
+    const std::vector<float> &spk_embedding,
+    const std::string &language,
+    std::vector<std::vector<int>> &codec_tokens,
+    int max_new_tokens,
+    const TalkerSamplingParams &sampling) {
+
+    if (!llama_ctx_) { printf("[talker] backbone not loaded\n"); return false; }
+    int dim = n_embd_;
+    int n_groups = talker_config_.num_code_groups;
+    auto gen_t0 = std::chrono::high_resolution_clock::now();
+    cache_tts_embeddings();
+    codec_tokens.resize(n_groups);
+
+    // Build x-vector prefill
+    std::vector<float> prefill_embs;
+    int prefill_len = 0;
+    if (!build_xvec_prefill(target_text_tokens, spk_embedding, language,
+                            prefill_embs, prefill_len)) return false;
+
+    // Prefill
+    llama_memory_clear(llama_get_memory(llama_ctx_), true);
+    llama_batch batch = llama_batch_init(prefill_len, dim, 1);
+    batch.n_tokens = prefill_len;
+    memcpy(batch.embd, prefill_embs.data(), (size_t)prefill_len * dim * sizeof(float));
+    // MRoPE: position tensor needs 4× entries [temporal, h, w, extra]
+    // TTS uses temporal only: h=w=extra=0
+    free(batch.pos);
+    batch.pos = (llama_pos *)calloc(4 * prefill_len, sizeof(llama_pos));
+    for (int i = 0; i < prefill_len; i++) {
+        batch.pos[i] = i;  // temporal positions; h/w/extra = 0 (calloc)
+        batch.n_seq_id[i] = 1;  batch.seq_id[i][0] = 0;
+        batch.logits[i] = (i == prefill_len - 1) ? 1 : 0;
+    }
+    printf("[talker] x-vec prefill %d tokens (MRoPE 4×pos)...\n", prefill_len);
+    if (llama_decode(llama_ctx_, batch) != 0) { llama_batch_free(batch); return false; }
+    llama_batch_free(batch);
+
+    float *embd = llama_get_embeddings_ith(llama_ctx_, -1);
+    if (!embd) return false;
+    std::vector<float> hidden(dim);
+    memcpy(hidden.data(), embd, dim * sizeof(float));
+
+    // Autoregressive loop (same as ICL generate)
+    int cur_pos = prefill_len;
+    int vocab_size = talker_config_.vocab_size;
+    std::vector<float> logits_buf(vocab_size), next_emb(dim);
+    std::vector<int> generated_g0;
+
+    for (int step = 0; step < max_new_tokens; step++) {
+        apply_codec_head(hidden.data(), logits_buf.data());
+        suppress_special_tokens(logits_buf.data(), vocab_size, talker_config_.codec_eos_token_id);
+        apply_repetition_penalty(logits_buf.data(), vocab_size, generated_g0, sampling.repetition_penalty);
+
+        int g0 = sample_token(logits_buf.data(), vocab_size, sampling.temperature,
+                               sampling.top_k, sampling.top_p, sampling.do_sample);
+        generated_g0.push_back(g0);
+        if (g0 == talker_config_.codec_eos_token_id) { printf("[talker] EOS at step %d\n", step); break; }
+
+        bool is_special = (g0 >= 2048);
+        if (!is_special) {
+            std::vector<int> group_tokens;
+            if (!predict_code_groups(hidden.data(), 1, g0, group_tokens, sampling)) return false;
+            codec_tokens[0].push_back(g0);
+            for (int g = 0; g < (int)group_tokens.size(); g++) codec_tokens[g + 1].push_back(group_tokens[g]);
+            compute_next_embedding(g0, group_tokens, next_emb.data());
+        } else {
+            lookup_codec_embedding(g0, next_emb.data());
+        }
+
+        // Add trailing text
+        int gen_step = (int)codec_tokens[0].size();
+        if (trailing_text_len_ > 0 && gen_step < trailing_text_len_) {
+            const float *txt = trailing_text_.data() + (size_t)gen_step * dim;
+            for (int j = 0; j < dim; j++) next_emb[j] += txt[j];
+        } else {
+            for (int j = 0; j < dim; j++) next_emb[j] += tts_pad_embed_[j];
+        }
+
+        // Forward one step (MRoPE: 4× position layout)
+        llama_batch sb = llama_batch_init(1, dim, 1);
+        sb.n_tokens = 1;  memcpy(sb.embd, next_emb.data(), dim * sizeof(float));
+        free(sb.pos);
+        sb.pos = (llama_pos *)calloc(4, sizeof(llama_pos));
+        sb.pos[0] = cur_pos;  // temporal; h/w/extra = 0
+        sb.n_seq_id[0] = 1;  sb.seq_id[0][0] = 0;  sb.logits[0] = 1;
+        if (llama_decode(llama_ctx_, sb) != 0) { llama_batch_free(sb); return false; }
+        llama_batch_free(sb);
+        cur_pos++;
+        embd = llama_get_embeddings_ith(llama_ctx_, -1);
+        if (!embd) return false;
+        memcpy(hidden.data(), embd, dim * sizeof(float));
+    }
+
+    auto gen_t1 = std::chrono::high_resolution_clock::now();
+    printf("[talker] x-vec generate: %d frames in %.1f ms\n",
+           (int)codec_tokens[0].size(),
+           std::chrono::duration<double, std::milli>(gen_t1 - gen_t0).count());
+    return true;
+}
+
+// ============================================================================
+// generate_customvoice: built-in speaker (discrete token, no speaker encoder)
+// ============================================================================
+
+bool TalkerLLM::generate_customvoice(
+    const std::vector<int> &target_text_tokens,
+    const std::string &speaker,
+    const std::string &language,
+    std::vector<std::vector<int>> &codec_tokens,
+    int max_new_tokens,
+    const TalkerSamplingParams &sampling) {
+
+    if (!llama_ctx_) { printf("[talker] backbone not loaded\n"); return false; }
+
+    // Resolve speaker name to token ID
+    auto spk_it = talker_config_.spk_ids.find(speaker);
+    if (spk_it == talker_config_.spk_ids.end()) {
+        printf("[talker] unknown speaker: %s. Available:", speaker.c_str());
+        for (auto &p : talker_config_.spk_ids) printf(" %s(%d)", p.first.c_str(), p.second);
+        printf("\n");
+        return false;
+    }
+    int spk_token_id = spk_it->second;
+
+    int dim = n_embd_;
+    int n_groups = talker_config_.num_code_groups;
+    auto gen_t0 = std::chrono::high_resolution_clock::now();
+    cache_tts_embeddings();
+    codec_tokens.resize(n_groups);
+
+    // Build CustomVoice prefill
+    std::vector<float> prefill_embs;
+    int prefill_len = 0;
+    if (!build_customvoice_prefill(target_text_tokens, spk_token_id, language,
+                                   prefill_embs, prefill_len)) return false;
+
+    // Prefill
+    llama_memory_clear(llama_get_memory(llama_ctx_), true);
+    llama_batch batch = llama_batch_init(prefill_len, dim, 1);
+    batch.n_tokens = prefill_len;
+    memcpy(batch.embd, prefill_embs.data(), (size_t)prefill_len * dim * sizeof(float));
+    for (int i = 0; i < prefill_len; i++) {
+        batch.pos[i] = i;  batch.n_seq_id[i] = 1;  batch.seq_id[i][0] = 0;
+        batch.logits[i] = (i == prefill_len - 1) ? 1 : 0;
+    }
+    printf("[talker] customvoice prefill %d tokens (speaker=%s, id=%d)...\n",
+           prefill_len, speaker.c_str(), spk_token_id);
+    if (llama_decode(llama_ctx_, batch) != 0) { llama_batch_free(batch); return false; }
+    llama_batch_free(batch);
+
+    float *embd = llama_get_embeddings_ith(llama_ctx_, -1);
+    if (!embd) return false;
+    std::vector<float> hidden(dim);
+    memcpy(hidden.data(), embd, dim * sizeof(float));
+
+    // Autoregressive loop (same as x-vec/ICL)
+    int cur_pos = prefill_len;
+    int vocab_size = talker_config_.vocab_size;
+    std::vector<float> logits_buf(vocab_size), next_emb(dim);
+    std::vector<int> generated_g0;
+
+    for (int step = 0; step < max_new_tokens; step++) {
+        apply_codec_head(hidden.data(), logits_buf.data());
+        suppress_special_tokens(logits_buf.data(), vocab_size, talker_config_.codec_eos_token_id);
+        apply_repetition_penalty(logits_buf.data(), vocab_size, generated_g0, sampling.repetition_penalty);
+
+        int g0 = sample_token(logits_buf.data(), vocab_size, sampling.temperature,
+                               sampling.top_k, sampling.top_p, sampling.do_sample);
+        generated_g0.push_back(g0);
+        if (g0 == talker_config_.codec_eos_token_id) { printf("[talker] EOS at step %d\n", step); break; }
+
+        bool is_special = (g0 >= 2048);
+        if (!is_special) {
+            std::vector<int> group_tokens;
+            if (!predict_code_groups(hidden.data(), 1, g0, group_tokens, sampling)) return false;
+            codec_tokens[0].push_back(g0);
+            for (int g = 0; g < (int)group_tokens.size(); g++) codec_tokens[g + 1].push_back(group_tokens[g]);
+            compute_next_embedding(g0, group_tokens, next_emb.data());
+        } else {
+            lookup_codec_embedding(g0, next_emb.data());
+        }
+
+        int gen_step = (int)codec_tokens[0].size();
+        if (trailing_text_len_ > 0 && gen_step < trailing_text_len_) {
+            const float *txt = trailing_text_.data() + (size_t)gen_step * dim;
+            for (int j = 0; j < dim; j++) next_emb[j] += txt[j];
+        } else {
+            for (int j = 0; j < dim; j++) next_emb[j] += tts_pad_embed_[j];
+        }
+
+        llama_batch sb = llama_batch_init(1, dim, 1);
+        sb.n_tokens = 1;  memcpy(sb.embd, next_emb.data(), dim * sizeof(float));
+        sb.pos[0] = cur_pos;  sb.n_seq_id[0] = 1;  sb.seq_id[0][0] = 0;  sb.logits[0] = 1;
+        if (llama_decode(llama_ctx_, sb) != 0) { llama_batch_free(sb); return false; }
+        llama_batch_free(sb);
+        cur_pos++;
+        embd = llama_get_embeddings_ith(llama_ctx_, -1);
+        if (!embd) return false;
+        memcpy(hidden.data(), embd, dim * sizeof(float));
+    }
+
+    auto gen_t1 = std::chrono::high_resolution_clock::now();
+    printf("[talker] customvoice generate: %d frames in %.1f ms\n",
+           (int)codec_tokens[0].size(),
+           std::chrono::duration<double, std::milli>(gen_t1 - gen_t0).count());
+    return true;
+}
+
+// ============================================================================
+// generate_xvec_standalone: x-vector using standalone transformer (correct MRoPE)
+// ============================================================================
+
+bool TalkerLLM::generate_xvec_standalone(
+    const std::vector<int> &target_text_tokens,
+    const std::vector<float> &spk_embedding,
+    const std::string &language,
+    std::vector<std::vector<int>> &codec_tokens,
+    int max_new_tokens,
+    const TalkerSamplingParams &sampling,
+    TtsTransformer *tfm) {
+
+    int dim = n_embd_;
+    int n_groups = talker_config_.num_code_groups;
+    auto gen_t0 = std::chrono::high_resolution_clock::now();
+    cache_tts_embeddings();
+    codec_tokens.resize(n_groups);
+
+    // Build x-vector prefill (same as build_xvec_prefill)
+    std::vector<float> prefill_embs;
+    int prefill_len = 0;
+    if (!build_xvec_prefill(target_text_tokens, spk_embedding, language,
+                            prefill_embs, prefill_len)) return false;
+
+    // Forward through standalone transformer (correct MRoPE!)
+    tts_transformer_reset(tfm);
+    std::vector<float> hidden(dim);
+    printf("[standalone] prefill %d positions through transformer...\n", prefill_len);
+    auto prefill_t0 = std::chrono::high_resolution_clock::now();
+    int rc = tts_transformer_forward(tfm, prefill_embs.data(), prefill_len, hidden.data());
+    if (rc != 0) {
+        printf("[standalone] prefill failed: %d\n", rc);
+        return false;
+    }
+    auto prefill_t1 = std::chrono::high_resolution_clock::now();
+    double prefill_ms = std::chrono::duration<double, std::milli>(prefill_t1 - prefill_t0).count();
+    printf("[standalone] prefill: %.0f ms\n", prefill_ms);
+
+    // Apply codec head → logits
+    int vocab_size = talker_config_.vocab_size;
+    std::vector<float> logits(vocab_size);
+    apply_codec_head(hidden.data(), logits.data());
+
+    // Autoregressive loop (same as generate_xvec but using standalone transformer)
+    std::vector<float> next_emb(dim);
+    std::vector<int> generated_g0;
+
+    printf("[standalone] generating (max %d tokens)...\n", max_new_tokens);
+    for (int step = 0; step < max_new_tokens; step++) {
+        // Suppress special tokens
+        suppress_special_tokens(logits.data(), vocab_size, talker_config_.codec_eos_token_id);
+        apply_repetition_penalty(logits.data(), vocab_size, generated_g0, sampling.repetition_penalty);
+
+        int g0 = sample_token(logits.data(), vocab_size, sampling.temperature,
+                               sampling.top_k, sampling.top_p, sampling.do_sample);
+        generated_g0.push_back(g0);
+        if (g0 == talker_config_.codec_eos_token_id) {
+            printf("[standalone] EOS at step %d\n", step);
+            break;
+        }
+
+        // Code predictor for groups 1-15
+        std::vector<int> group_tokens;
+        if (!predict_code_groups(hidden.data(), 1, g0, group_tokens, sampling)) return false;
+        codec_tokens[0].push_back(g0);
+        for (int g = 0; g < (int)group_tokens.size(); g++)
+            codec_tokens[g + 1].push_back(group_tokens[g]);
+
+        // Build next embedding: codec_sum + trailing_text or tts_pad
+        compute_next_embedding(g0, group_tokens, next_emb.data());
+        // Add trailing text
+        int gen_step = (int)codec_tokens[0].size();
+        if (trailing_text_len_ > 0 && gen_step < trailing_text_len_) {
+            const float *txt = trailing_text_.data() + (size_t)gen_step * dim;
+            for (int j = 0; j < dim; j++) next_emb[j] += txt[j];
+        } else {
+            for (int j = 0; j < dim; j++) next_emb[j] += tts_pad_embed_[j];
+        }
+
+        // Forward one step through standalone transformer
+        rc = tts_transformer_forward(tfm, next_emb.data(), 1, hidden.data());
+        if (rc != 0) { printf("[standalone] forward failed at step %d\n", step); return false; }
+        apply_codec_head(hidden.data(), logits.data());
+    }
+
+    auto gen_t1 = std::chrono::high_resolution_clock::now();
+    printf("[standalone] xvec generate: %d frames in %.1f ms\n",
+           (int)codec_tokens[0].size(),
+           std::chrono::duration<double, std::milli>(gen_t1 - gen_t0).count());
     return true;
 }

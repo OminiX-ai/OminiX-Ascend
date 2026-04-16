@@ -134,6 +134,13 @@ def export_talker(model, output_dir: str):
         rs = cfg.rope_scaling
         if "mrope_section" in rs:
             writer.add_array("rope_scaling.mrope_section", rs["mrope_section"])
+            # Also write as qwen3.rope.dimension_sections (4-element array)
+            # so llama.cpp enables MRoPE via use_mrope() → CANN acceleration
+            sections = list(rs["mrope_section"])
+            while len(sections) < 4:
+                sections.append(0)
+            writer.add_array("qwen3.rope.dimension_sections",
+                             [int(s) for s in sections[:4]])
         writer.add_bool("rope_scaling.interleaved",
                         rs.get("interleaved", False))
 

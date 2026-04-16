@@ -523,18 +523,11 @@ bool QwenTTS::generate_xvec(const QwenTTSParams& params, std::vector<float>& aud
 
     // Generate codec tokens via x-vector mode
     std::vector<std::vector<int>> codec_tokens;
-    if (standalone_tfm_) {
-        // Use standalone transformer (correct MRoPE) for backbone
-        printf("  Using standalone transformer (correct MRoPE)\n");
-        if (!talker_.generate_xvec_standalone(target_text_tokens, spk_embedding,
-                                    lang, codec_tokens,
-                                    params.max_new_tokens, params.sampling,
-                                    standalone_tfm_)) {
-            printf("FAIL: standalone generation failed\n");
-            return false;
-        }
-    } else {
-        // Fallback to llama.cpp backbone (distorted but functional)
+    // Use llama.cpp backbone with MRoPE (dimension_sections in GGUF enables
+    // automatic MRoPE via use_mrope() → CANN-accelerated rope_multi kernel).
+    // The standalone transformer is no longer needed when GGUF has MRoPE metadata.
+    {
+        printf("  Using llama.cpp backbone (MRoPE via GGUF metadata)\n");
         if (!talker_.generate_xvec(target_text_tokens, spk_embedding,
                                     lang, codec_tokens,
                                     params.max_new_tokens, params.sampling)) {
