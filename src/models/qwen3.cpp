@@ -4,7 +4,16 @@ llm_build_qwen3::llm_build_qwen3(const llama_model & model, const llm_graph_para
     const int64_t n_embd_head = hparams.n_embd_head_v;
 
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k);
-    GGML_ASSERT(n_embd_head == hparams.n_rot);
+    // n_rot may differ from n_embd_head when MRoPE sections are used (TTS talker)
+    // GGML_ASSERT(n_embd_head == hparams.n_rot);
+
+    // Check if MRoPE sections are configured (for TTS talker)
+    bool use_mrope = false;
+    int sections[4] = {0, 0, 0, 0};
+    if (hparams.rope_sections[0] > 0) {
+        use_mrope = true;
+        std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
+    }
 
     ggml_tensor * cur;
     ggml_tensor * inpL;
@@ -46,20 +55,38 @@ llm_build_qwen3::llm_build_qwen3(const llama_model & model, const llm_graph_para
             Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, NULL, LLM_NORM_RMS, il);
             cb(Qcur, "Qcur_normed", il);
 
-            Qcur = ggml_rope_ext(
-                    ctx0, Qcur, inp_pos, nullptr,
-                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
-                    ext_factor, attn_factor, beta_fast, beta_slow
-                    );
+            if (use_mrope) {
+                // Use ggml_rope_multi with MROPE type + sections
+                // The GGML kernel now uses consecutive-pair rotation for MROPE
+                Qcur = ggml_rope_multi(
+                        ctx0, Qcur, inp_pos, nullptr,
+                        n_rot, sections, GGML_ROPE_TYPE_MROPE, n_ctx_orig, freq_base, freq_scale,
+                        ext_factor, attn_factor, beta_fast, beta_slow
+                        );
+            } else {
+                Qcur = ggml_rope_ext(
+                        ctx0, Qcur, inp_pos, nullptr,
+                        n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                        ext_factor, attn_factor, beta_fast, beta_slow
+                        );
+            }
 
             Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, NULL, LLM_NORM_RMS, il);
             cb(Kcur, "Kcur_normed", il);
 
-            Kcur = ggml_rope_ext(
-                    ctx0, Kcur, inp_pos, nullptr,
-                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
-                    ext_factor, attn_factor, beta_fast, beta_slow
-                    );
+            if (use_mrope) {
+                Kcur = ggml_rope_multi(
+                        ctx0, Kcur, inp_pos, nullptr,
+                        n_rot, sections, GGML_ROPE_TYPE_MROPE, n_ctx_orig, freq_base, freq_scale,
+                        ext_factor, attn_factor, beta_fast, beta_slow
+                        );
+            } else {
+                Kcur = ggml_rope_ext(
+                        ctx0, Kcur, inp_pos, nullptr,
+                        n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                        ext_factor, attn_factor, beta_fast, beta_slow
+                        );
+            }
 
             cb(Qcur, "Qcur", il);
             cb(Kcur, "Kcur", il);
