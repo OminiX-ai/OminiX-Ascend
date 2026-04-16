@@ -1334,8 +1334,11 @@ void TalkerLLM::cp_forward_one_token(const float *input_talker_space,
     cp_matvec_f32(cp_f32_.proj_w.data(), cp_f32_.proj_b.data(),
                   input_talker_space, cur, ch, th);
 
-    // 2. Transformer layers
-    for (int il = 0; il < cfg.num_hidden_layers; il++) {
+    // 2. Transformer layers (optionally limited by cp_active_layers_)
+    int n_layers = cfg.num_hidden_layers;
+    if (cp_active_layers_ > 0 && cp_active_layers_ < n_layers)
+        n_layers = cp_active_layers_;
+    for (int il = 0; il < n_layers; il++) {
         auto &lw = cp_f32_.layers[il];
 
         memcpy(residual, cur, ch * sizeof(float));
@@ -1408,6 +1411,9 @@ bool TalkerLLM::predict_code_groups(
     int talker_hidden = cp_config_.talker_hidden_size;  // 2048
     int cp_hidden = cp_config_.hidden_size;  // 1024
     int vocab_size = cp_config_.vocab_size;  // 2048
+
+    // Set active CP layer count (0=all)
+    cp_active_layers_ = sampling.cp_max_layers;
     // Zero-fill skipped groups — decoder sums contributions, zero = no effect.
     // Note: EOS may not fire when groups are skipped because the model wasn't
     // trained with partial codebooks. Use --max_tokens to limit output length.

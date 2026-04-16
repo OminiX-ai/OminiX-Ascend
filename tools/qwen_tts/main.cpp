@@ -35,6 +35,8 @@ static void print_usage(const char* prog) {
     printf("  --seed <int>               Random seed for sampling (default: 42)\n");
     printf("  --cp_groups <int>          Max codec groups to predict (1-15, default=all 15)\n");
     printf("                             Lower = faster but less detail (8 recommended)\n");
+    printf("  --cp_layers <int>          Max CP transformer layers (1-5, default=all 5)\n");
+    printf("                             Fewer layers = faster CP but less accurate codes\n");
     printf("  --mode <mode>              Generation mode: icl (default), xvec, customvoice\n");
     printf("  --speaker <name>           Speaker name for customvoice mode (e.g., serena)\n");
     printf("  -p, --profiling            Enable profiling\n");
@@ -95,6 +97,8 @@ int main(int argc, char** argv) {
             params.sampling.cp_do_sample = false;
         } else if (arg == "--cp_groups" && i + 1 < argc) {
             params.sampling.cp_max_groups = std::atoi(argv[++i]);
+        } else if (arg == "--cp_layers" && i + 1 < argc) {
+            params.sampling.cp_max_layers = std::atoi(argv[++i]);
         } else if (arg == "--seed" && i + 1 < argc) {
             set_sampling_seed(std::atoi(argv[++i]));
         } else if (arg == "--mode" && i + 1 < argc) {

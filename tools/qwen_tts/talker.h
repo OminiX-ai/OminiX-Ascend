@@ -37,6 +37,9 @@ struct TalkerSamplingParams {
     // Lower values skip higher codebook levels for faster inference.
     // Groups 1-8 carry ~95% of signal quality; 9-15 are fine detail.
     int cp_max_groups = 0;
+    // CP transformer layer limit: use only first N layers (0=all 5).
+    // Hypothesis: layers 3-4 are refinement; first 2-3 may suffice.
+    int cp_max_layers = 0;
 };
 
 // ============================================================================
@@ -360,6 +363,9 @@ private:
     void compute_next_embedding(int group0_token,
                                  const std::vector<int> &group_tokens,
                                  float *out);
+
+    // CP layer limit (0=all, set from sampling.cp_max_layers before predict_code_groups)
+    int cp_active_layers_ = 0;
 
     // CP KV cache for incremental code prediction (avoids full recompute)
     static constexpr int CP_MAX_SEQ = 17;  // 2 base + 15 groups
