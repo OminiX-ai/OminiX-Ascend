@@ -559,9 +559,9 @@ void TalkerCannEngine::forward_decode(const float *input_embed, int pos,
     assert(ready_);
     assert(pos >= 0 && pos < MAX_SEQ);
 
-    // Optional debug env: TALKER_CANN_DEBUG=1 syncs + logs stream status after
-    // each op per layer, making it obvious which op first returns an async
-    // error. Only the first layer is dumped (stops if !ok).
+    // Optional per-op sync probe — stays behind an env var so it's free in
+    // production but helps triangulate which op is the first to misbehave
+    // during bringup on new CANN toolkit versions.
     const bool dbg = getenv("TALKER_CANN_DEBUG") != nullptr;
     auto dbg_sync = [&](int il, const char *tag) {
         if (!dbg) return;
@@ -972,33 +972,12 @@ void TalkerCannEngine::forward_prefill(const float *input_embeds, int seq_len,
     aclTensor *t_cos = make_rope_batch(cos_win);
     aclTensor *t_sin = make_rope_batch(sin_win);
 
-    // Attention mask as pseShift (F16 additive bias). FIAS requires a
-    // [1 or B, n_heads, S_q, S_kv] tensor; we build a packed [S_q, S_kv]
-    // buffer on host and upload, then view with stride[heads]=0 so the
-    // same 2D mask broadcasts across all heads. Row i of the packed mask
-    // is query i at absolute position start_pos+i; it allows keys
-    // 0..(start_pos + i) inclusive.
-    {
-        std::vector<uint16_t> mask_host((size_t)seq_len * seq_len_total);
-        const uint16_t zero_bits    = fp32_to_fp16(0.0f);
-        const uint16_t neg_inf_bits = fp32_to_fp16(-65504.0f);  // F16 min
-        for (int i = 0; i < seq_len; ++i) {
-            int q_abs = start_pos + i;
-            for (int j = 0; j < seq_len_total; ++j) {
-                mask_host[(size_t)i * seq_len_total + j] =
-                    (j <= q_abs) ? zero_bits : neg_inf_bits;
-            }
-        }
-        upload_f16_bits(causal_mask_dev_, mask_host.data(),
-                         (size_t)seq_len * seq_len_total);
-    }
-    int64_t mask_shape[4]   = {1, (int64_t)n_heads_, (int64_t)seq_len,
-                                (int64_t)seq_len_total};
-    int64_t mask_strides[4] = {(int64_t)seq_len * seq_len_total,
-                                0,  // broadcast across heads
-                                (int64_t)seq_len_total, 1};
-    aclTensor *t_mask = tensor_strided(causal_mask_dev_, 4, mask_shape,
-                                         mask_strides, ACL_FLOAT16);
+    // Causality is enforced inside FIAS via `nextTokens=0` (see the
+    // GetWorkspaceSize call below). This is simpler than a user-supplied
+    // mask and, based on CANN 8.3's kernel tiling tables, more reliable
+    // than the pseShift / attenMask paths for the (GQA 16/8, small S_q)
+    // shape combinations the Talker hits during prefill.
+    (void)causal_mask_dev_;  // retained for future pseShift paths; unused now.
 
     for (int il = 0; il < n_layers_; ++il) {
         const auto &lw = layer_w_[il];
@@ -1342,7 +1321,6 @@ void TalkerCannEngine::forward_prefill(const float *input_embeds, int seq_len,
 
     g_cann.aclDestroyTensor(t_cos);
     g_cann.aclDestroyTensor(t_sin);
-    g_cann.aclDestroyTensor(t_mask);
 
     int end_pos = start_pos + seq_len;
     if (end_pos > kv_cache_len_) kv_cache_len_ = end_pos;

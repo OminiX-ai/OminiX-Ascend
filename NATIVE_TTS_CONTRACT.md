@@ -89,10 +89,12 @@ File: `tools/qwen_tts/talker_cann_engine.{h,cpp}` — mirrors `CpCannEngine`.
   (Landed. Fused attention via aclnnFusedInferAttentionScoreV2, sparseMode=0,
   F16 residual, F32 norm gammas.)
 - [x] 1.4 Implement `forward_prefill(input_embeds[seq_len, n_embd], seq_len,
-  hidden_out)`. (Landed. Causality enforced by `nextTokens=0`, sparseMode=0 —
-  no user mask needed; the built-in `sparseMode=1` triggered a missing
-  tilingKey for our (seq_len=4, GQA) shape. `nextTokens=0` works on all
-  shapes.)
+  hidden_out)`. (Landed. Causality enforced by FIAS built-in
+  `nextTokens=0` (no user mask needed) — simpler than the pseShift / attenMask
+  paths, and more reliable on CANN 8.3 for the (GQA 16/8, small S_q) shape
+  combinations the Talker prefills. Chunked prefill when seq_len > MAX_PREFILL
+  (=512). Only returns the last row's hidden state to match how TalkerLLM
+  consumes the prefill output.)
 - [x] 1.5 Implement `reset_kv_cache()` and `set_rope_speed(factor)`.
   (Landed. Verified reset restores deterministic output; set_rope_speed
   changes L1 output by ~2685 over default factor.)
@@ -206,15 +208,29 @@ File: `tools/qwen_tts/talker_cann_engine.{h,cpp}` — mirrors `CpCannEngine`.
   MLX golden used for structural match (DTW) but audibly different due
   to different weight rounding path.
 - **2026-04-18 M1 landed**: native Talker 28-layer engine working end-to-
-  end at the smoke level. All of M1.2-M1.6 passed. Key decisions:
-  (a) standalone test_talker_native binary needs `ggml_backend_dev_init`
-  called on the CANN backend to load op tiling kernels — `aclInit(nullptr)`
-  alone is insufficient. (b) Prefill uses `sparseMode=0, nextTokens=0` for
-  causality instead of `sparseMode=1` — the built-in causal mode is missing
-  a tilingKey for our (seq_len=4, GQA=16/8) shape. (c) Deferred full
-  byte-for-byte validation vs llama.cpp (would require linking the test
-  to the llama.cpp compute path); smoke gates cover "engine runs correctly"
-  and M2 will cover "audio quality matches".
+  end at the smoke level. All of M1.2-M1.6 passed. Key decisions /
+  surprises:
+  (a) Standalone binaries that don't link ggml-cann still need `aclInit(nullptr)`
+  to load op tiling kernels — without it every aclnn op dies with
+  "tiling_funcs NULL". `aclInit` was added to `cp_cann_symbols` and invoked
+  idempotently from `cp_cann_load_symbols`. (CANN silently returns "already
+  initialized" on the second call in binaries that ALSO link libggml-cann.so,
+  so this is safe for the production `qwen_tts` exe too.)
+  (b) Prefill uses FIAS built-in causality via `nextTokens=0, sparseMode=0`
+  rather than a user-supplied mask. Tried `attenMask` (rejected — 910B only
+  accepts BOOL/INT8/UINT8 masks) and `pseShift` (accepted but missing
+  tiling-key for [1, n_heads, small_Sq, small_Skv] with stride-0 head
+  broadcast on CANN 8.3). `nextTokens=0` works on every shape we tested
+  and matches the semantics exactly.
+  (c) `make_tensor` now computes `storage_len` as
+  `max_offset + 1 = sum((shape[i]-1) * stride[i]) + 1` instead of
+  `product(shape)` — required for any strided view into a larger buffer
+  (KV cache slices, RoPE table slices). The older product-of-shape
+  formulation worked accidentally in CpCannEngine because CP never took a
+  non-contiguous view into a buffer whose storage exceeded the view size.
+  (d) Deferred full byte-for-byte validation vs llama.cpp (would require
+  linking the test to the llama.cpp compute path); smoke gates cover
+  "engine runs correctly" and M2 will cover "audio quality matches".
 
 ## 9. Parallelism playbook
 
