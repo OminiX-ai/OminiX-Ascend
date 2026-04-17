@@ -240,13 +240,15 @@ ggml_tensor *build_conv1d(ggml_context *ctx0, ggml_tensor *cur, ggml_tensor *w,
   if (p < 0) {
     p = (w->ne[0] - 1) / 2;
   }
-  // ggml_conv_1d uses im2col with hardcoded GGML_TYPE_F16 kernel type.
-  // Cast weight to F16 if GGUF stored it as F32 (happens with newer decoder exports).
+  // ggml_conv_1d uses im2col with a hardcoded GGML_TYPE_F16 kernel type.
+  // If the GGUF stored the weight in F32 (newer decoder exports do),
+  // calling ggml_conv_1d trips an F16 assertion on the CPU fallback path
+  // (CANN falls back for some conv ops). Cast the weight to F16 first.
+  // `build_conv1d_f32` would be more precise but in practice produces
+  // silent output on this decoder graph — needs deeper investigation.
   if (w->type != GGML_TYPE_F16) {
     w = ggml_cast(ctx0, w, GGML_TYPE_F16);
   }
-  // Use original im2col+matmul approach (known working)
-  // Direct conv1d kernel available: ggml_conv_1d_direct(ctx0, w, cur, s, p, d);
   cur = ggml_conv_1d(ctx0, w, cur, s, p, d);
   if (b) {
     if (cur->ne[0] != b->ne[0]) {

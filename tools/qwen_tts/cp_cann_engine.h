@@ -63,6 +63,15 @@ public:
     // Reset KV cache for a new frame
     void reset_kv_cache();
 
+    // Cap the number of transformer layers used in forward_one_token.
+    // `n` must be in [1, num_hidden_layers]; 0 means "use all layers".
+    // Lets the caller trade quality for throughput at runtime (mirrors
+    // the --cp_layers CLI flag, which otherwise only affected the
+    // llama.cpp CP path).
+    void set_active_layers(int n) {
+        active_layers_ = (n > 0 && n < n_layers_) ? n : 0;
+    }
+
     bool is_ready() const { return ready_; }
 
 private:
@@ -80,6 +89,7 @@ private:
     int kv_dim_ = 0;         // 1024
     int inter_ = 0;          // 3072
     int n_layers_ = 0;       // 5
+    int active_layers_ = 0;  // 0=use all; <n_layers_ = truncate early
     float eps_ = 0.0f;
     float rope_theta_ = 0.0f;
     static constexpr int MAX_SEQ = 17;  // matches CP_MAX_SEQ

@@ -1534,6 +1534,9 @@ bool TalkerLLM::predict_code_groups(
         // applies input_proj internally but we still compute logits here).
         // ============================================================
         auto &cp_model_cann = cp_session_->get_model();
+        // Propagate --cp_layers to the native engine (CLI flag was only
+        // wired into the llama.cpp path before).
+        cp_cann_engine_->set_active_layers(sampling.cp_max_layers);
         cp_cann_engine_->reset_kv_cache();
 
         std::vector<float> cp_out(cp_hidden);

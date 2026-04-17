@@ -861,7 +861,9 @@ void CpCannEngine::forward_one_token(const float *input_talker_space,
     // Residual saved via F16 d2d memcpy at the start of each sublayer, then
     // added back with aclnnAdd (F16) at the end. This is the ggml-cann/
     // llama.cpp convention — the model was trained with F16 residuals.
-    for (int il = 0; il < n_layers_; ++il) {
+    const int layers_to_run = (active_layers_ > 0 && active_layers_ < n_layers_)
+                               ? active_layers_ : n_layers_;
+    for (int il = 0; il < layers_to_run; ++il) {
         const auto &lt = t_.layer[il];
 
         // residual = cur (F16 d2d async memcpy)
