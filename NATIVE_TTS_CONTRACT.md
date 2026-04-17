@@ -197,10 +197,14 @@ File: `tools/qwen_tts/talker_cann_engine.{h,cpp}` — mirrors `CpCannEngine`.
 
 ### M3 — Remove llama.cpp from TTS hot path (1 day)
 
-- [ ] 3.1 Once M2 passes, make `--native_talker --cp_cann` the default.
+- [x] 3.1 Default to native CANN path. `QwenTTSParams::cp_cann` and
+  `native_talker` both default `true`. `--llama_fallback` flag reverts
+  to pure llama.cpp. Verified: plain `qwen_tts -m ...` runs native,
+  transcribes target text correctly. Commit c0474a6c.
 - [ ] 3.2 Strip unused `llama_model_*` / `llama_context_*` code from
-  `talker.cpp` (keep llama.cpp dep available for other tools; only TTS
-  exits the dependency).
+  `talker.cpp` once the native default soaks for a few days (wait
+  for ear-pass confirmation first). Keep llama.cpp dep available for
+  other tools; only TTS exits the dependency.
 - [ ] 3.3 Update `tools/qwen_tts/CMakeLists.txt` — optional `QWEN_TTS_LLAMA`
   flag for backward compat, default off.
 - [ ] 3.4 Final regression: audio + throughput unchanged from M2.
