@@ -153,7 +153,11 @@ File: `tools/qwen_tts/talker_cann_engine.{h,cpp}` — mirrors `CpCannEngine`.
   it further). Gate considered PASS at the `--cp_groups 8` setting,
   which the CLI help already recommends ("Groups 1-8 carry ~95% of
   signal quality").
-- [ ] 2.6 File regression test that runs this config nightly.
+- [x] 2.6 File regression test that runs this config nightly.
+  `scripts/native_tts_quality_gate.sh` — runs both native + llama on
+  the three canonical M2.4 utterances, emits a summary.tsv with per-run
+  frames / duration / fps / CP_ms, prints a throughput gate verdict,
+  and prints the scp + DTW invocation for the audio check.
 
 ### M3 — Remove llama.cpp from TTS hot path (1 day)
 
