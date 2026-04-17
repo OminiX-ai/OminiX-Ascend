@@ -1154,12 +1154,19 @@ void TalkerCannEngine::forward_prefill(const float *input_embeds, int seq_len,
             aclOpExecutor *fa_exec = nullptr;
             char layout[5] = {'B','S','N','D',0};
             double scale = 1.0 / sqrt((double)head_dim_);
-            // FIAS built-in causal masking: sparseMode=1 (top-left causal)
-            // means the op applies a lower-triangular mask internally. No
-            // user mask needed. pseShift / attenMask both nullptr. preTokens
-            // = 65535 keeps full K history visible (limited only by the
-            // causal rule). Matches what ggml-cann uses for standard
-            // autoregressive LLM prefill.
+            // Batched-prefill attention: KNOWN BUG. Hidden-state cosine
+            // similarity vs iterative-decode reference is 0.28 (essentially
+            // orthogonal — the prefill is producing a completely different
+            // representation). Tried sparseMode=0/nextTokens=0 and
+            // sparseMode=1/nextTokens=65535; both produce identical wrong
+            // output, so the causality settings are not the cause. Likely
+            // suspects for next investigation:
+            //   - Q strides (batch stride reuse seq_len*q_dim vs q_dim)
+            //   - KV cache strided view into cache buffer (stride-0
+            //     broadcast from n_kv=8 to n_heads=16 via numKeyValueHeads)
+            //   - FIAS innerPrecise=2 precision path on batch Q
+            // Falls through to iterative_prefill via the default-off gating
+            // above; this code runs only under TALKER_PREFILL_BATCHED=1.
             ACL_CHECK_RET(g_cann.aclnnFusedInferAttentionScoreV2GetWorkspaceSize(
                 t_q_bsnd, t_k_list, t_v_list,
                 /*pseShift*/ nullptr,
@@ -1179,10 +1186,10 @@ void TalkerCannEngine::forward_prefill(const float *input_embeds, int seq_len,
                 /*numHeads*/ (int64_t)n_heads_,
                 /*scaleValue*/ scale,
                 /*preTokens*/ (int64_t)65535,
-                /*nextTokens*/ (int64_t)0,  // causal: no future tokens visible
+                /*nextTokens*/ (int64_t)0,
                 /*inputLayout*/ layout,
                 /*numKeyValueHeads*/ (int64_t)n_kv_,
-                /*sparseMode*/ (int64_t)0,  // causality enforced via nextTokens=0
+                /*sparseMode*/ (int64_t)0,
                 /*innerPrecise*/ (int64_t)2,  // S>1 prefill precision mode
                 /*blockSize*/ (int64_t)0,
                 /*antiquantMode*/ (int64_t)0,
