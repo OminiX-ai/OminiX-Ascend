@@ -10,6 +10,7 @@
 // ============================================================================
 
 #include <acl/acl.h>
+#include <aclnn/acl_meta.h>   // aclScalar, aclTensor
 #include <string>
 #include <vector>
 
@@ -41,6 +42,16 @@ public:
     // `device` is the ACL device ID (usually 0).
     bool init(const CpWeightsF32 &cp_f32, const CodePredictorConfig &cfg,
               int device = 0);
+
+    // Alternative init path: load weights directly from an MLX-style
+    // safetensors file containing BF16 tensors with names like
+    // `talker.code_predictor.small_to_mtp_projection.weight`, etc.
+    // Use this to match MLX's numerical trajectory bit-for-bit — the F16
+    // GGUF derived from the same pretrained model has subtly different
+    // rounding that shows up as audio fragments on the CP path.
+    bool init_from_safetensors(const std::string &path,
+                                const CodePredictorConfig &cfg,
+                                int device = 0);
 
     // Process one token through the CP transformer.
     // input_talker_space: [talker_hidden] F32 on HOST
@@ -106,40 +117,103 @@ private:
     void *up_dev_ = nullptr;        // [inter]
     void *ffn_out_dev_ = nullptr;   // [cp_hidden]
 
-    // Attention intermediates
-    void *scores_dev_ = nullptr;    // [n_heads, MAX_SEQ]
-    void *attn_weights_dev_ = nullptr; // [n_heads, MAX_SEQ]
+    // Attention intermediates (all device-side — v2 keeps everything on NPU).
+    // scores_dev_ is F32 (for F32 softmax stability matching llama.cpp).
+    // scores_f16_dev_ holds the F16 version used by the BMMs.
+    void *scores_dev_ = nullptr;       // F32 [n_heads * MAX_SEQ]
+    void *scores_f16_dev_ = nullptr;   // F16 [n_heads * MAX_SEQ]
 
-    // RoPE cos/sin table: precomputed for all positions [MAX_SEQ, head_dim/2]
+    // RoPE cos/sin tables: precomputed per position [MAX_SEQ, head_dim] where
+    // each row duplicates the half so the HF-style "rotate_half" formula maps
+    // to aclnnRotaryPositionEmbedding(mode=0, NEOX).
     void *rope_cos_dev_ = nullptr;
     void *rope_sin_dev_ = nullptr;
 
-    // RmsNorm rstd scratch: [1]
+    // RmsNorm rstd scratch: sized for the largest case (QK-norm over n_heads).
     void *rstd_dev_ = nullptr;
 
     // ---- KV cache on NPU [n_layers][MAX_SEQ * kv_dim] ----
-    std::vector<void *> k_cache_dev_;  // per-layer K cache
-    std::vector<void *> v_cache_dev_;  // per-layer V cache
+    std::vector<void *> k_cache_dev_;
+    std::vector<void *> v_cache_dev_;
     int kv_cache_len_ = 0;
 
-    // ---- Host scratch buffers (pre-allocated, avoid heap alloc per forward) ----
-    std::vector<float> q_host_;          // [q_dim]
-    std::vector<float> k_host_;          // [kv_dim]
-    std::vector<float> attn_out_host_;   // [q_dim]
-    std::vector<float> k_cache_host_;    // [MAX_SEQ * kv_dim]  (reused per layer)
-    std::vector<float> v_cache_host_;    // [MAX_SEQ * kv_dim]
-    std::vector<float> score_buf_;       // [MAX_SEQ]
+    // Attention-scale scalar: 1/sqrt(head_dim). Two copies — F32 for use with
+    // the F32 softmax path (applied pre-softmax) and F16 for legacy paths.
+    aclScalar *attn_scale_ = nullptr;       // F32
+    aclScalar *attn_scale_f16_ = nullptr;   // F16
+    // Alpha=1.0 scalar reused by aclnnAdd / aclnnInplaceAdd.
+    aclScalar *one_scalar_ = nullptr;
 
-    // ---- Host-cached QK-norm weights (avoid device download per forward) ----
-    struct LayerNormWeightsHost {
-        std::vector<float> q_norm_w;  // [head_dim]
-        std::vector<float> k_norm_w;  // [head_dim]
-    };
-    std::vector<LayerNormWeightsHost> qk_norm_host_;
+    // Boundary F32 staging buffers (I/O is F32; internal compute is F16).
+    void *input_stage_f32_dev_ = nullptr;
+    void *output_stage_f32_dev_ = nullptr;
+    // F32 scratch for the input projection output; cast F32->F16 afterwards.
+    // Also serves as the F32 residual ACCUMULATOR across all layers — F32
+    // adds preserve the small per-layer deltas that F16 rounds away.
+    void *proj_out_f32_dev_ = nullptr;
+    // Per-sublayer F16 delta is cast into this buffer before the F32 accum Add.
+    void *accum_scratch_f32_dev_ = nullptr;
+    // F32 RmsNorm output buffer — RmsNorm runs F32 end-to-end, then we Cast
+    // F32 -> F16 into normed_dev_ for the subsequent Mm.
+    void *normed_f32_dev_ = nullptr;
 
     // aclnn workspace (reusable, grown as needed)
     void *workspace_dev_ = nullptr;
     size_t workspace_size_ = 0;
+
+    // ---- Persistent aclTensor descriptors -------------------------------
+    // Building an aclTensor isn't free (it allocates metadata and validates
+    // shape/strides). The previous forward_one_token created ~300 of them per
+    // decode, which shows up as a few ms/frame even though the underlying
+    // buffers never change. Here we pre-create every handle whose shape + data
+    // pointer is fixed for the lifetime of the engine and reuse it across
+    // forwards. Only KV-cache views (seq_len-dependent + per-layer offset) and
+    // per-pos RoPE row views remain dynamic.
+    //
+    // Buffer-view naming: <buffer>_<shape-tag>.  Shape tags: `col` = [N, 1],
+    // `row` = [1, N], `flat` = [N], `gqa` = [n_kv, group, head_dim],
+    // `heads` = [n_heads, head_dim], `kv` = [n_kv, head_dim], `4d` = [1,1,N,D]
+    // for RoPE tensors.
+    struct LayerTensors {
+        aclTensor *q_proj, *k_proj, *v_proj, *o_proj;
+        aclTensor *q_norm, *k_norm;
+        aclTensor *gate_proj, *up_proj, *down_proj;
+        aclTensor *input_ln, *post_ln;
+    };
+    struct Tensors {
+        aclTensor *proj_w;
+        aclTensor *proj_b;
+        std::vector<LayerTensors> layer;
+        aclTensor *final_norm;
+
+        aclTensor *cur_row, *cur_flat;
+        aclTensor *residual_flat;
+        aclTensor *normed_row, *normed_col;
+        aclTensor *q_col, *q_heads, *q_rope_4d, *q_gqa;
+        aclTensor *k_col, *k_kv;
+        aclTensor *v_col;
+        aclTensor *attn_out_col, *attn_out_4d, *attn_out_gqa;
+        aclTensor *o_out_col, *o_out_flat;
+        aclTensor *gate_col, *gate_flat;
+        aclTensor *up_col, *up_flat;
+        aclTensor *ffn_out_col, *ffn_out_flat;
+        aclTensor *rstd_11, *rstd_heads, *rstd_kv;
+        // Boundary staging (F32) + cast targets (F16 views of existing bufs)
+        aclTensor *input_f32, *input_f16;
+        aclTensor *output_f16, *output_f32;
+        // F32 projection path: proj_w/proj_b stay F32, output in F32 scratch,
+        // then cast F32->F16 into cur_dev_.
+        aclTensor *proj_w_f32, *proj_b_f32;
+        aclTensor *proj_out_f32_col, *proj_out_f32_flat;
+        aclTensor *cur_f16_flat_as_target;  // [cp_hidden] F16 view of cur_dev_
+        // F32 accumulator scratch for residual adds
+        aclTensor *accum_scratch_f32_flat;  // F32 [cp_hidden]
+        // F32 views used by the RmsNorm-in-F32 path
+        aclTensor *accum_f32_row_2d;        // F32 [1, cp_hidden] — RmsNorm IN
+        aclTensor *normed_f32_row_2d;       // F32 [1, cp_hidden] — RmsNorm OUT
+        aclTensor *normed_f32_flat;         // F32 [cp_hidden]    — Cast input
+    };
+    Tensors t_{};
 
     // ---- Internal helpers ----
     void alloc_dev(void **ptr, size_t bytes);
@@ -147,14 +221,9 @@ private:
     void download(float *host, const void *dev, size_t n_floats);
     void ensure_workspace(size_t needed);
 
-    // Execute aclnn two-phase call, managing workspace
-    // (Each op call site uses the CANN_OP macro below instead)
-
-    // RoPE: apply NEOX-style rotation in-place on NPU
-    // We precompute cos/sin tables, then do element-wise multiply+add
-    void apply_rope_on_host(float *vec, int dim, int n_vecs, int pos);
-
-    // Per-head RmsNorm on host (small dim=128, not worth NPU launch)
-    void qk_norm_on_host(float *buf, int dim, int n_vecs,
-                         const float *norm_w_host);
+    // Create all persistent aclTensor descriptors after weights + buffers
+    // have been allocated. Called once at the end of init().
+    void build_persistent_tensors_();
+    // Destroy all persistent descriptors (called from destructor).
+    void destroy_persistent_tensors_();
 };

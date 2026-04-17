@@ -1,85 +1,117 @@
 // ============================================================================
-// CP CANN Engine: Direct ACL-based Code Predictor on Ascend NPU
+// CP CANN Engine v4 — F16 weights + F16 compute end-to-end.
 //
-// Design principles:
-// 1. ALL weights and intermediates pre-allocated on NPU at init().
-// 2. Forward pass: only aclnn kernel launches, zero malloc.
-// 3. Host<->Device copies: only input (1x 2048 floats) and output (1x 1024).
-// 4. RoPE + QK-norm done on host (tiny vectors, not worth kernel launch).
-// 5. KV cache lives on NPU, updated via small aclrtMemcpy per step.
+// Why F16: llama.cpp's CANN backend runs this model in F16 and the audio
+// sounds right. My earlier F32 path (v2/v3) was numerically correct (bit-
+// identical to the f32 CPU reference) but produced "garbled" speech because
+// the model was trained/tuned at F16 and F32 inference exposes numerical
+// artifacts the vocoder can't parse.
 //
-// Target: <1ms per CP decode step (vs 3ms with llama.cpp).
+// Interface stays F32: the caller still passes a `const float *` input and
+// receives a `float *` hidden state. We stage the boundary in F32 buffers
+// and aclnnCast into/out-of the F16 working tensors.
+//
+// Mechanics:
+//   - All device buffers (weights, intermediates, KV cache, cos/sin, scores,
+//     rstd) are F16 — half the memory of v3.
+//   - Weights converted F32 -> F16 on host at upload via __fp16 cast.
+//   - Scalars (attn_scale, one_scalar) created with ACL_FLOAT16.
+//   - aclnnCast at forward entry/exit only.
 // ============================================================================
 
 #include "cp_cann_engine.h"
-#include "talker.h"   // CodePredictorConfig
-
-#include <acl/acl.h>
-#include <aclnn/aclnn_base.h>
-#include <aclnnop/aclnn_mm.h>
-#include <aclnnop/aclnn_add.h>
-#include <aclnnop/aclnn_mul.h>
-#include <aclnnop/aclnn_silu.h>
-#include <aclnnop/aclnn_rms_norm.h>
+#include "cp_cann_symbols.h"
+#include "talker.h"
 
 #include <cmath>
 #include <cstdio>
+#include <cstdint>
 #include <cstring>
 #include <cassert>
+#include <vector>
+#include <fstream>
+#include <sstream>
+#include <map>
 
-// ============================================================================
-// ACL error check macro (simple for prototype)
-// ============================================================================
 #define ACL_CHECK_RET(stmt) do {                                      \
     aclError _ret = (stmt);                                           \
     if (_ret != 0) {                                                  \
-        fprintf(stderr, "[cp_cann] ACL error %d at %s:%d: %s\n",     \
-                _ret, __FILE__, __LINE__, aclGetRecentErrMsg());      \
+        fprintf(stderr, "[cp_cann] ACL error %d at %s:%d: %s\n",      \
+                _ret, __FILE__, __LINE__,                             \
+                g_cann.aclGetRecentErrMsg                             \
+                    ? g_cann.aclGetRecentErrMsg() : "<n/a>");         \
     }                                                                 \
-} while(0)
+} while (0)
 
-// ============================================================================
-// aclnn two-phase op execution macro (standalone, no ggml context needed)
-// ============================================================================
-#define CANN_OP(stream, ws_dev, ws_size, OP_NAME, ...) do {           \
+#define CANN_OP(OP_NAME, ...) do {                                    \
     uint64_t _ws_needed = 0;                                          \
     aclOpExecutor *_exec = nullptr;                                   \
-    ACL_CHECK_RET(aclnn##OP_NAME##GetWorkspaceSize(                   \
+    ACL_CHECK_RET(g_cann.aclnn##OP_NAME##GetWorkspaceSize(             \
         __VA_ARGS__, &_ws_needed, &_exec));                           \
-    void *_ws = nullptr;                                              \
-    if (_ws_needed > 0) {                                             \
-        if (_ws_needed > (ws_size)) {                                 \
-            if ((ws_dev)) aclrtFree((ws_dev));                        \
-            ACL_CHECK_RET(aclrtMalloc(&(ws_dev), _ws_needed,         \
-                          ACL_MEM_MALLOC_HUGE_FIRST));                \
-            (ws_size) = _ws_needed;                                   \
-        }                                                             \
-        _ws = (ws_dev);                                               \
+    if (_ws_needed > workspace_size_) {                               \
+        if (workspace_dev_) g_cann.aclrtFree(workspace_dev_);         \
+        ACL_CHECK_RET(g_cann.aclrtMalloc(&workspace_dev_, _ws_needed, \
+                       ACL_MEM_MALLOC_HUGE_FIRST));                   \
+        workspace_size_ = _ws_needed;                                 \
     }                                                                 \
-    ACL_CHECK_RET(aclnn##OP_NAME(_ws, _ws_needed, _exec, (stream))); \
-} while(0)
+    void *_ws = _ws_needed > 0 ? workspace_dev_ : nullptr;            \
+    ACL_CHECK_RET(g_cann.aclnn##OP_NAME(_ws, _ws_needed, _exec,       \
+                                         stream_));                   \
+} while (0)
 
 // ============================================================================
-// Helper: create a 1D or 2D ACL tensor descriptor over a device buffer
+// fp32 <-> fp16 helpers. On aarch64 we have native __fp16.
 // ============================================================================
-static aclTensor *make_tensor_1d(void *dev_buf, int64_t n) {
-    int64_t shape[1] = {n};
-    int64_t strides[1] = {1};
-    int64_t storage_len = n;
-    return aclCreateTensor(shape, 1, ACL_FLOAT, strides, 0,
-                           ACL_FORMAT_ND, &storage_len, 1, dev_buf);
+
+static inline uint16_t fp32_to_fp16(float x) {
+    __fp16 h = (__fp16)x;
+    uint16_t out;
+    std::memcpy(&out, &h, sizeof(out));
+    return out;
 }
 
-// 2D tensor: shape [rows, cols], row-major
-static aclTensor *make_tensor_2d(void *dev_buf, int64_t rows, int64_t cols) {
-    // ACL uses NCHW-like ordering: shape reversed from row-major
-    // For a [rows, cols] row-major matrix:
-    //   shape = {rows, cols}, strides = {cols, 1}
-    int64_t shape[2] = {rows, cols};
-    int64_t strides[2] = {cols, 1};
-    int64_t storage_len = rows * cols;
-    return aclCreateTensor(shape, 2, ACL_FLOAT, strides, 0,
-                           ACL_FORMAT_ND, &storage_len, 1, dev_buf);
+static aclScalar *make_f16_scalar(float value) {
+    uint16_t bits = fp32_to_fp16(value);
+    return g_cann.aclCreateScalar(&bits, ACL_FLOAT16);
+}
+
+// ============================================================================
+// Tensor-descriptor constructors. Default dtype is F16; override with F32 only
+// for the I/O staging tensors.
+// ============================================================================
+
+static aclTensor *make_tensor(void *buf, int64_t rank,
+                              const int64_t *shape, const int64_t *strides,
+                              aclDataType dtype) {
+    int64_t storage_len = 0;
+    if (rank > 0) {
+        int64_t n = 1;
+        for (int64_t i = 0; i < rank; ++i) n *= shape[i];
+        storage_len = n;
+    }
+    return g_cann.aclCreateTensor(shape, rank, dtype, strides, 0,
+                                   ACL_FORMAT_ND, &storage_len, 1, buf);
+}
+
+static aclTensor *tensor_1d(void *buf, int64_t n,
+                             aclDataType dtype = ACL_FLOAT16) {
+    int64_t shape[1]   = {n};
+    int64_t strides[1] = {1};
+    return make_tensor(buf, 1, shape, strides, dtype);
+}
+
+static aclTensor *tensor_2d(void *buf, int64_t d0, int64_t d1,
+                             aclDataType dtype = ACL_FLOAT16) {
+    int64_t shape[2]   = {d0, d1};
+    int64_t strides[2] = {d1, 1};
+    return make_tensor(buf, 2, shape, strides, dtype);
+}
+
+static aclTensor *tensor_strided(void *buf, int64_t rank,
+                                  const int64_t *shape,
+                                  const int64_t *strides,
+                                  aclDataType dtype = ACL_FLOAT16) {
+    return make_tensor(buf, rank, shape, strides, dtype);
 }
 
 // ============================================================================
@@ -89,7 +121,11 @@ static aclTensor *make_tensor_2d(void *dev_buf, int64_t rows, int64_t cols) {
 CpCannEngine::~CpCannEngine() {
     if (!ready_) return;
 
-    auto free_dev = [](void *&p) { if (p) { aclrtFree(p); p = nullptr; } };
+    destroy_persistent_tensors_();
+
+    auto free_dev = [](void *&p) {
+        if (p) { g_cann.aclrtFree(p); p = nullptr; }
+    };
 
     free_dev(proj_w_dev_);
     free_dev(proj_b_dev_);
@@ -120,7 +156,7 @@ CpCannEngine::~CpCannEngine() {
     free_dev(up_dev_);
     free_dev(ffn_out_dev_);
     free_dev(scores_dev_);
-    free_dev(attn_weights_dev_);
+    free_dev(scores_f16_dev_);
     free_dev(rope_cos_dev_);
     free_dev(rope_sin_dev_);
     free_dev(rstd_dev_);
@@ -129,90 +165,538 @@ CpCannEngine::~CpCannEngine() {
     for (auto &p : v_cache_dev_) free_dev(p);
 
     free_dev(workspace_dev_);
+    free_dev(input_stage_f32_dev_);
+    free_dev(output_stage_f32_dev_);
+    free_dev(proj_out_f32_dev_);
+    free_dev(accum_scratch_f32_dev_);
+    free_dev(normed_f32_dev_);
+
+    if (attn_scale_)     { g_cann.aclDestroyScalar(attn_scale_);     attn_scale_     = nullptr; }
+    if (attn_scale_f16_) { g_cann.aclDestroyScalar(attn_scale_f16_); attn_scale_f16_ = nullptr; }
+    if (one_scalar_)     { g_cann.aclDestroyScalar(one_scalar_);     one_scalar_     = nullptr; }
 
     if (stream_) {
-        aclrtDestroyStream(stream_);
+        g_cann.aclrtDestroyStream(stream_);
         stream_ = nullptr;
     }
 }
 
 // ============================================================================
-// Device memory helpers
+// Memory helpers
 // ============================================================================
 
 void CpCannEngine::alloc_dev(void **ptr, size_t bytes) {
-    ACL_CHECK_RET(aclrtMalloc(ptr, bytes, ACL_MEM_MALLOC_HUGE_FIRST));
+    ACL_CHECK_RET(g_cann.aclrtMalloc(ptr, bytes, ACL_MEM_MALLOC_HUGE_FIRST));
 }
 
 void CpCannEngine::upload(void *dev, const float *host, size_t n_floats) {
-    ACL_CHECK_RET(aclrtMemcpy(dev, n_floats * sizeof(float),
-                               host, n_floats * sizeof(float),
-                               ACL_MEMCPY_HOST_TO_DEVICE));
+    ACL_CHECK_RET(g_cann.aclrtMemcpy(dev, n_floats * sizeof(float),
+                                      host, n_floats * sizeof(float),
+                                      ACL_MEMCPY_HOST_TO_DEVICE));
 }
 
 void CpCannEngine::download(float *host, const void *dev, size_t n_floats) {
-    ACL_CHECK_RET(aclrtMemcpy(host, n_floats * sizeof(float),
-                               dev, n_floats * sizeof(float),
-                               ACL_MEMCPY_DEVICE_TO_HOST));
+    ACL_CHECK_RET(g_cann.aclrtMemcpy(host, n_floats * sizeof(float),
+                                      dev, n_floats * sizeof(float),
+                                      ACL_MEMCPY_DEVICE_TO_HOST));
 }
 
 void CpCannEngine::ensure_workspace(size_t needed) {
     if (needed <= workspace_size_) return;
-    if (workspace_dev_) aclrtFree(workspace_dev_);
-    ACL_CHECK_RET(aclrtMalloc(&workspace_dev_, needed,
-                               ACL_MEM_MALLOC_HUGE_FIRST));
+    if (workspace_dev_) g_cann.aclrtFree(workspace_dev_);
+    ACL_CHECK_RET(g_cann.aclrtMalloc(&workspace_dev_, needed,
+                                      ACL_MEM_MALLOC_HUGE_FIRST));
     workspace_size_ = needed;
 }
 
+// F16 upload: convert F32 host -> uint16 F16 bit pattern -> device.
+static void upload_f16(void *dev, const float *host, size_t n) {
+    std::vector<uint16_t> buf(n);
+    for (size_t i = 0; i < n; ++i) buf[i] = fp32_to_fp16(host[i]);
+    ACL_CHECK_RET(g_cann.aclrtMemcpy(dev, n * sizeof(uint16_t),
+                                      buf.data(), n * sizeof(uint16_t),
+                                      ACL_MEMCPY_HOST_TO_DEVICE));
+}
+
 // ============================================================================
-// Init: upload weights + allocate buffers
+// Persistent aclTensor construction / destruction
+// ============================================================================
+
+void CpCannEngine::build_persistent_tensors_() {
+    const int group = n_heads_ / n_kv_;
+
+    // Input-projection tensors — these stay F32. Transformer weights below
+    // remain F16. The F16 view of proj_w/proj_b is unused (we upload F32 now),
+    // but the member still exists in the struct — just point it at the F32
+    // buffer with F32 dtype for symmetry.
+    t_.proj_w = tensor_2d(proj_w_dev_, cp_hidden_, talker_hidden_, ACL_FLOAT);
+    t_.proj_b = tensor_1d(proj_b_dev_, cp_hidden_,                 ACL_FLOAT);
+    t_.proj_w_f32 = t_.proj_w;
+    t_.proj_b_f32 = t_.proj_b;
+    t_.proj_out_f32_col  = tensor_2d(proj_out_f32_dev_, cp_hidden_, 1,
+                                      ACL_FLOAT);
+    t_.proj_out_f32_flat = tensor_1d(proj_out_f32_dev_, cp_hidden_,
+                                      ACL_FLOAT);
+    t_.cur_f16_flat_as_target = tensor_1d(cur_dev_, cp_hidden_,
+                                           ACL_FLOAT16);
+    t_.accum_scratch_f32_flat = tensor_1d(accum_scratch_f32_dev_,
+                                           cp_hidden_, ACL_FLOAT);
+    t_.accum_f32_row_2d   = tensor_2d(proj_out_f32_dev_, 1, cp_hidden_,
+                                       ACL_FLOAT);
+    t_.normed_f32_row_2d  = tensor_2d(normed_f32_dev_, 1, cp_hidden_,
+                                       ACL_FLOAT);
+    t_.normed_f32_flat    = tensor_1d(normed_f32_dev_, cp_hidden_, ACL_FLOAT);
+
+    t_.layer.resize(n_layers_);
+    for (int il = 0; il < n_layers_; ++il) {
+        auto &lw = layer_w_[il];
+        auto &lt = t_.layer[il];
+        lt.q_proj    = tensor_2d(lw.q_proj_w,    q_dim_,     cp_hidden_);
+        lt.k_proj    = tensor_2d(lw.k_proj_w,    kv_dim_,    cp_hidden_);
+        lt.v_proj    = tensor_2d(lw.v_proj_w,    kv_dim_,    cp_hidden_);
+        lt.o_proj    = tensor_2d(lw.o_proj_w,    cp_hidden_, q_dim_);
+        // Norms kept F32 to match GGUF storage + aclnnRmsNorm SupportInfo[0].
+        lt.q_norm    = tensor_1d(lw.q_norm_w,    head_dim_,  ACL_FLOAT);
+        lt.k_norm    = tensor_1d(lw.k_norm_w,    head_dim_,  ACL_FLOAT);
+        lt.gate_proj = tensor_2d(lw.gate_proj_w, inter_,     cp_hidden_);
+        lt.up_proj   = tensor_2d(lw.up_proj_w,   inter_,     cp_hidden_);
+        lt.down_proj = tensor_2d(lw.down_proj_w, cp_hidden_, inter_);
+        lt.input_ln  = tensor_1d(lw.input_ln_w,  cp_hidden_, ACL_FLOAT);
+        lt.post_ln   = tensor_1d(lw.post_ln_w,   cp_hidden_, ACL_FLOAT);
+    }
+    t_.final_norm = tensor_1d(final_norm_w_dev_, cp_hidden_, ACL_FLOAT);
+
+    t_.cur_row       = tensor_2d(cur_dev_, 1, cp_hidden_);
+    t_.cur_flat      = tensor_1d(cur_dev_, cp_hidden_);
+    t_.residual_flat = tensor_1d(residual_dev_, cp_hidden_);
+    t_.normed_row    = tensor_2d(normed_dev_, 1,         cp_hidden_);
+    t_.normed_col    = tensor_2d(normed_dev_, cp_hidden_, 1);
+
+    t_.q_col    = tensor_2d(q_dev_, q_dim_, 1);
+    t_.q_heads  = tensor_2d(q_dev_, n_heads_, head_dim_);
+    {
+        int64_t shape[4]   = {1, 1, (int64_t)n_heads_, (int64_t)head_dim_};
+        int64_t strides[4] = {(int64_t)q_dim_, (int64_t)q_dim_,
+                               (int64_t)head_dim_, 1};
+        t_.q_rope_4d = tensor_strided(q_dev_, 4, shape, strides);
+    }
+    {
+        int64_t shape[3]   = {(int64_t)n_kv_, (int64_t)group,
+                               (int64_t)head_dim_};
+        int64_t strides[3] = {(int64_t)group * head_dim_,
+                               (int64_t)head_dim_, 1};
+        t_.q_gqa = tensor_strided(q_dev_, 3, shape, strides);
+    }
+
+    t_.k_col = tensor_2d(k_dev_, kv_dim_, 1);
+    t_.k_kv  = tensor_2d(k_dev_, n_kv_, head_dim_);
+
+    t_.v_col = tensor_2d(v_dev_, kv_dim_, 1);
+
+    t_.attn_out_col = tensor_2d(attn_out_dev_, q_dim_, 1);
+    {
+        int64_t shape[4]   = {1, 1, (int64_t)n_heads_, (int64_t)head_dim_};
+        int64_t strides[4] = {(int64_t)q_dim_, (int64_t)q_dim_,
+                               (int64_t)head_dim_, 1};
+        t_.attn_out_4d = tensor_strided(attn_out_dev_, 4, shape, strides);
+    }
+    {
+        int64_t shape[3]   = {(int64_t)n_kv_, (int64_t)group,
+                               (int64_t)head_dim_};
+        int64_t strides[3] = {(int64_t)group * head_dim_,
+                               (int64_t)head_dim_, 1};
+        t_.attn_out_gqa = tensor_strided(attn_out_dev_, 3, shape, strides);
+    }
+
+    t_.o_out_col  = tensor_2d(o_out_dev_, cp_hidden_, 1);
+    t_.o_out_flat = tensor_1d(o_out_dev_, cp_hidden_);
+
+    t_.gate_col  = tensor_2d(gate_dev_, inter_, 1);
+    t_.gate_flat = tensor_1d(gate_dev_, inter_);
+    t_.up_col    = tensor_2d(up_dev_,   inter_, 1);
+    t_.up_flat   = tensor_1d(up_dev_,   inter_);
+
+    t_.ffn_out_col  = tensor_2d(ffn_out_dev_, cp_hidden_, 1);
+    t_.ffn_out_flat = tensor_1d(ffn_out_dev_, cp_hidden_);
+
+    // rstd MUST be F32 even with F16 input — aclnnRmsNorm only supports
+    // rstd dtype=F32 on Ascend (validated against the op's SupportInfo list).
+    t_.rstd_11    = tensor_2d(rstd_dev_, 1,        1,    ACL_FLOAT);
+    t_.rstd_heads = tensor_2d(rstd_dev_, n_heads_, 1,    ACL_FLOAT);
+    t_.rstd_kv    = tensor_2d(rstd_dev_, n_kv_,    1,    ACL_FLOAT);
+
+    // --- Boundary staging tensors (F32) for aclnnCast entry/exit --
+    t_.input_f32  = tensor_1d(input_stage_f32_dev_,  talker_hidden_, ACL_FLOAT);
+    t_.input_f16  = tensor_1d(q_dev_,                talker_hidden_, ACL_FLOAT16);
+    t_.output_f16 = tensor_1d(normed_dev_,           cp_hidden_,     ACL_FLOAT16);
+    t_.output_f32 = tensor_1d(output_stage_f32_dev_, cp_hidden_,     ACL_FLOAT);
+}
+
+void CpCannEngine::destroy_persistent_tensors_() {
+    auto drop = [](aclTensor *&t) {
+        if (t) { g_cann.aclDestroyTensor(t); t = nullptr; }
+    };
+    drop(t_.proj_w);
+    drop(t_.proj_b);
+    for (auto &lt : t_.layer) {
+        drop(lt.q_proj); drop(lt.k_proj); drop(lt.v_proj); drop(lt.o_proj);
+        drop(lt.q_norm); drop(lt.k_norm);
+        drop(lt.gate_proj); drop(lt.up_proj); drop(lt.down_proj);
+        drop(lt.input_ln); drop(lt.post_ln);
+    }
+    t_.layer.clear();
+    drop(t_.final_norm);
+    drop(t_.cur_row);   drop(t_.cur_flat);
+    drop(t_.residual_flat);
+    drop(t_.normed_row); drop(t_.normed_col);
+    drop(t_.q_col); drop(t_.q_heads); drop(t_.q_rope_4d); drop(t_.q_gqa);
+    drop(t_.k_col); drop(t_.k_kv);
+    drop(t_.v_col);
+    drop(t_.attn_out_col); drop(t_.attn_out_4d); drop(t_.attn_out_gqa);
+    drop(t_.o_out_col); drop(t_.o_out_flat);
+    drop(t_.gate_col); drop(t_.gate_flat);
+    drop(t_.up_col);   drop(t_.up_flat);
+    drop(t_.ffn_out_col); drop(t_.ffn_out_flat);
+    drop(t_.rstd_11); drop(t_.rstd_heads); drop(t_.rstd_kv);
+    drop(t_.input_f32); drop(t_.input_f16);
+    drop(t_.output_f16); drop(t_.output_f32);
+    // proj_w_f32 / proj_b_f32 are aliases of proj_w / proj_b (already dropped).
+    t_.proj_w_f32 = nullptr;
+    t_.proj_b_f32 = nullptr;
+    drop(t_.proj_out_f32_col); drop(t_.proj_out_f32_flat);
+    drop(t_.cur_f16_flat_as_target);
+    drop(t_.accum_scratch_f32_flat);
+    drop(t_.accum_f32_row_2d);
+    drop(t_.normed_f32_row_2d);
+    drop(t_.normed_f32_flat);
+}
+
+// ============================================================================
+// Minimal safetensors reader for the MLX-extracted CP weight file.
+//
+// Format: uint64 header_size little-endian | JSON header | raw tensor bytes.
+// Header JSON maps `name` → {dtype, shape, data_offsets: [start, end]}.
+// We don't pull in a real JSON library — the entries we need are looked up
+// by string search, and data_offsets is a flat numeric array.
+// ============================================================================
+
+namespace {
+
+struct StEntry {
+    uint64_t data_start = 0;  // offset relative to tensor data region
+    uint64_t data_end   = 0;
+};
+
+// Find `"<name>":{...}` and extract its `"data_offsets":[start,end]`.
+bool st_lookup(const std::string &header, const std::string &name,
+               StEntry &out) {
+    std::string key = "\"" + name + "\"";
+    size_t p = header.find(key);
+    if (p == std::string::npos) return false;
+    size_t do_pos = header.find("\"data_offsets\"", p);
+    if (do_pos == std::string::npos) return false;
+    size_t lb = header.find('[', do_pos);
+    size_t rb = header.find(']', lb);
+    if (lb == std::string::npos || rb == std::string::npos) return false;
+    std::string inner = header.substr(lb + 1, rb - lb - 1);
+    size_t comma = inner.find(',');
+    if (comma == std::string::npos) return false;
+    out.data_start = std::stoull(inner.substr(0, comma));
+    out.data_end   = std::stoull(inner.substr(comma + 1));
+    return true;
+}
+
+// Convert a buffer of BF16 values (stored as uint16_t big-endian-ish halfs of
+// the original F32) into F16 values ready for NPU upload. For values within
+// F16's exponent range (true for trained transformer weights), this conversion
+// is effectively lossless — F16 has more mantissa bits than BF16, so the
+// BF16 → F32 → F16 round-trip fills the extra bits with zeros.
+void bf16_buf_to_fp16_buf(const uint16_t *bf16_src,
+                           uint16_t *fp16_dst, size_t n) {
+    for (size_t i = 0; i < n; ++i) {
+        union { uint32_t u; float f; } v;
+        v.u = ((uint32_t)bf16_src[i]) << 16;
+        __fp16 h = (__fp16)v.f;
+        std::memcpy(&fp16_dst[i], &h, sizeof(uint16_t));
+    }
+}
+
+}  // namespace
+
+bool CpCannEngine::init_from_safetensors(const std::string &path,
+                                          const CodePredictorConfig &cfg,
+                                          int device) {
+    if (!cp_cann_load_symbols()) {
+        fprintf(stderr, "[cp_cann] symbol load failed; engine disabled\n");
+        return false;
+    }
+
+    // Cache dims first.
+    device_ = device;
+    talker_hidden_ = cfg.talker_hidden_size;
+    cp_hidden_     = cfg.hidden_size;
+    n_heads_       = cfg.num_attention_heads;
+    n_kv_          = cfg.num_key_value_heads;
+    head_dim_      = cfg.head_dim;
+    q_dim_         = n_heads_ * head_dim_;
+    kv_dim_        = n_kv_ * head_dim_;
+    inter_         = cfg.intermediate_size;
+    n_layers_      = cfg.num_hidden_layers;
+    eps_           = cfg.rms_norm_eps;
+    rope_theta_    = cfg.rope_theta;
+
+    // Open + read header.
+    std::ifstream f(path, std::ios::binary);
+    if (!f) {
+        fprintf(stderr, "[cp_cann] safetensors open failed: %s\n", path.c_str());
+        return false;
+    }
+    uint64_t header_size = 0;
+    f.read(reinterpret_cast<char *>(&header_size), 8);
+    std::string header(header_size, '\0');
+    f.read(&header[0], header_size);
+    const std::streamoff data_base = 8 + (std::streamoff)header_size;
+
+    ACL_CHECK_RET(g_cann.aclrtSetDevice(device_));
+    ACL_CHECK_RET(g_cann.aclrtCreateStream(&stream_));
+
+    // Helper: load one tensor by name, convert BF16 → F16 on host, upload.
+    auto load_one_f16 = [&](const std::string &name, void *&dev,
+                            size_t expected_elems) {
+        StEntry e;
+        if (!st_lookup(header, name, e)) {
+            fprintf(stderr, "[cp_cann] missing tensor: %s\n", name.c_str());
+            return false;
+        }
+        size_t nbytes = e.data_end - e.data_start;
+        if (nbytes != expected_elems * 2) {
+            fprintf(stderr,
+                    "[cp_cann] size mismatch for %s: got %zu bytes, "
+                    "expected %zu (%zu bf16 elems)\n",
+                    name.c_str(), nbytes, expected_elems * 2, expected_elems);
+            return false;
+        }
+        std::vector<uint16_t> bf16_buf(expected_elems);
+        f.seekg(data_base + (std::streamoff)e.data_start);
+        f.read(reinterpret_cast<char *>(bf16_buf.data()), nbytes);
+        std::vector<uint16_t> fp16_buf(expected_elems);
+        bf16_buf_to_fp16_buf(bf16_buf.data(), fp16_buf.data(), expected_elems);
+        alloc_dev(&dev, expected_elems * 2);
+        ACL_CHECK_RET(g_cann.aclrtMemcpy(
+            dev, nbytes, fp16_buf.data(), nbytes,
+            ACL_MEMCPY_HOST_TO_DEVICE));
+        return true;
+    };
+    // For tensors we keep as F32 on device (norm gammas, proj_w/b for the
+    // F32 input projection). BF16 → F32 is exact (just high-bit shift).
+    auto load_one_f32 = [&](const std::string &name, void *&dev,
+                            size_t expected_elems) {
+        StEntry e;
+        if (!st_lookup(header, name, e)) {
+            fprintf(stderr, "[cp_cann] missing tensor: %s\n", name.c_str());
+            return false;
+        }
+        size_t nbytes = e.data_end - e.data_start;
+        if (nbytes != expected_elems * 2) {
+            fprintf(stderr, "[cp_cann] size mismatch for %s\n", name.c_str());
+            return false;
+        }
+        std::vector<uint16_t> bf16_buf(expected_elems);
+        f.seekg(data_base + (std::streamoff)e.data_start);
+        f.read(reinterpret_cast<char *>(bf16_buf.data()), nbytes);
+        std::vector<float> f32_buf(expected_elems);
+        for (size_t i = 0; i < expected_elems; ++i) {
+            union { uint32_t u; float f; } v;
+            v.u = ((uint32_t)bf16_buf[i]) << 16;
+            f32_buf[i] = v.f;
+        }
+        alloc_dev(&dev, expected_elems * sizeof(float));
+        ACL_CHECK_RET(g_cann.aclrtMemcpy(
+            dev, expected_elems * sizeof(float), f32_buf.data(),
+            expected_elems * sizeof(float), ACL_MEMCPY_HOST_TO_DEVICE));
+        return true;
+    };
+
+    const std::string pfx = "talker.code_predictor.";
+    const std::string mpfx = pfx + "model.";
+
+    // Input projection: F32 on device to match MLX's F32 input embedding
+    // precision + our F32 projection compute path.
+    if (!load_one_f32(pfx + "small_to_mtp_projection.weight", proj_w_dev_,
+                      (size_t)cp_hidden_ * talker_hidden_)) return false;
+    if (!load_one_f32(pfx + "small_to_mtp_projection.bias",   proj_b_dev_,
+                      cp_hidden_)) return false;
+
+    // Per-layer weights.
+    layer_w_.resize(n_layers_);
+    for (int il = 0; il < n_layers_; ++il) {
+        auto &dst = layer_w_[il];
+        const std::string lp = mpfx + "layers." + std::to_string(il) + ".";
+        if (!load_one_f16(lp + "self_attn.q_proj.weight", dst.q_proj_w,
+                          (size_t)q_dim_ * cp_hidden_)) return false;
+        if (!load_one_f16(lp + "self_attn.k_proj.weight", dst.k_proj_w,
+                          (size_t)kv_dim_ * cp_hidden_)) return false;
+        if (!load_one_f16(lp + "self_attn.v_proj.weight", dst.v_proj_w,
+                          (size_t)kv_dim_ * cp_hidden_)) return false;
+        if (!load_one_f16(lp + "self_attn.o_proj.weight", dst.o_proj_w,
+                          (size_t)cp_hidden_ * q_dim_)) return false;
+        if (!load_one_f16(lp + "mlp.gate_proj.weight", dst.gate_proj_w,
+                          (size_t)inter_ * cp_hidden_)) return false;
+        if (!load_one_f16(lp + "mlp.up_proj.weight", dst.up_proj_w,
+                          (size_t)inter_ * cp_hidden_)) return false;
+        if (!load_one_f16(lp + "mlp.down_proj.weight", dst.down_proj_w,
+                          (size_t)cp_hidden_ * inter_)) return false;
+        // Norms kept F32 (matches the F32 norm path in v9/v11).
+        if (!load_one_f32(lp + "self_attn.q_norm.weight", dst.q_norm_w,
+                          head_dim_)) return false;
+        if (!load_one_f32(lp + "self_attn.k_norm.weight", dst.k_norm_w,
+                          head_dim_)) return false;
+        if (!load_one_f32(lp + "input_layernorm.weight", dst.input_ln_w,
+                          cp_hidden_)) return false;
+        if (!load_one_f32(lp + "post_attention_layernorm.weight",
+                          dst.post_ln_w, cp_hidden_)) return false;
+    }
+    if (!load_one_f32(mpfx + "norm.weight", final_norm_w_dev_, cp_hidden_))
+        return false;
+
+    // --- The rest of init (buffers, scalars, cos/sin, persistent tensors,
+    //     workspace) is identical to init(); reuse by setting up the shared
+    //     tail. Factor it out to keep this maintainable. ---
+    const size_t E = sizeof(uint16_t);
+
+    alloc_dev(&cur_dev_,       cp_hidden_ * E);
+    alloc_dev(&residual_dev_,  cp_hidden_ * E);
+    alloc_dev(&normed_dev_,    cp_hidden_ * E);
+    alloc_dev(&q_dev_,         q_dim_     * E);
+    alloc_dev(&k_dev_,         kv_dim_    * E);
+    alloc_dev(&v_dev_,         kv_dim_    * E);
+    alloc_dev(&attn_out_dev_,  q_dim_     * E);
+    alloc_dev(&o_out_dev_,     cp_hidden_ * E);
+    alloc_dev(&gate_dev_,      inter_     * E);
+    alloc_dev(&up_dev_,        inter_     * E);
+    alloc_dev(&ffn_out_dev_,   cp_hidden_ * E);
+    alloc_dev(&scores_dev_,    (size_t)n_heads_ * MAX_SEQ * sizeof(float));
+    alloc_dev(&scores_f16_dev_,(size_t)n_heads_ * MAX_SEQ * E);
+    alloc_dev(&rstd_dev_,      (size_t)n_heads_ * sizeof(float));
+    alloc_dev(&input_stage_f32_dev_,  talker_hidden_ * sizeof(float));
+    alloc_dev(&output_stage_f32_dev_, cp_hidden_     * sizeof(float));
+    alloc_dev(&proj_out_f32_dev_,     cp_hidden_     * sizeof(float));
+    alloc_dev(&accum_scratch_f32_dev_, cp_hidden_    * sizeof(float));
+    alloc_dev(&normed_f32_dev_,        cp_hidden_    * sizeof(float));
+
+    {
+        const int half = head_dim_ / 2;
+        std::vector<float> cos_table((size_t)MAX_SEQ * head_dim_);
+        std::vector<float> sin_table((size_t)MAX_SEQ * head_dim_);
+        for (int p = 0; p < MAX_SEQ; ++p) {
+            for (int j = 0; j < half; ++j) {
+                float freq  = 1.0f / powf(rope_theta_, (float)(2 * j) / head_dim_);
+                float angle = (float)p * freq;
+                float c = cosf(angle);
+                float s = sinf(angle);
+                cos_table[(size_t)p * head_dim_ + j]        = c;
+                cos_table[(size_t)p * head_dim_ + j + half] = c;
+                sin_table[(size_t)p * head_dim_ + j]        = s;
+                sin_table[(size_t)p * head_dim_ + j + half] = s;
+            }
+        }
+        alloc_dev(&rope_cos_dev_, (size_t)MAX_SEQ * head_dim_ * E);
+        alloc_dev(&rope_sin_dev_, (size_t)MAX_SEQ * head_dim_ * E);
+        upload_f16(rope_cos_dev_, cos_table.data(),
+                   (size_t)MAX_SEQ * head_dim_);
+        upload_f16(rope_sin_dev_, sin_table.data(),
+                   (size_t)MAX_SEQ * head_dim_);
+    }
+
+    k_cache_dev_.resize(n_layers_, nullptr);
+    v_cache_dev_.resize(n_layers_, nullptr);
+    for (int il = 0; il < n_layers_; ++il) {
+        alloc_dev(&k_cache_dev_[il], (size_t)MAX_SEQ * kv_dim_ * E);
+        alloc_dev(&v_cache_dev_[il], (size_t)MAX_SEQ * kv_dim_ * E);
+    }
+    kv_cache_len_ = 0;
+
+    {
+        float scale_val = 1.0f / sqrtf((float)head_dim_);
+        attn_scale_     = g_cann.aclCreateScalar(&scale_val, ACL_FLOAT);
+    }
+    attn_scale_f16_ = make_f16_scalar(1.0f / sqrtf((float)head_dim_));
+    one_scalar_     = make_f16_scalar(1.0f);
+
+    workspace_size_ = 4 * 1024 * 1024;
+    ACL_CHECK_RET(g_cann.aclrtMalloc(&workspace_dev_, workspace_size_,
+                                      ACL_MEM_MALLOC_HUGE_FIRST));
+
+    build_persistent_tensors_();
+
+    ready_ = true;
+    printf("[cp_cann] BF16-weights engine initialized from %s\n", path.c_str());
+    printf("[cp_cann] dims: cp_hidden=%d q_dim=%d kv_dim=%d inter=%d head=%d\n",
+           cp_hidden_, q_dim_, kv_dim_, inter_, head_dim_);
+    return true;
+}
+
+// ============================================================================
+// init — allocate F16 buffers, convert weights F32->F16 at upload.
 // ============================================================================
 
 bool CpCannEngine::init(const CpWeightsF32 &w, const CodePredictorConfig &cfg,
                         int device) {
+    if (!cp_cann_load_symbols()) {
+        fprintf(stderr, "[cp_cann] symbol load failed; engine disabled\n");
+        return false;
+    }
+
     device_ = device;
-    ACL_CHECK_RET(aclrtSetDevice(device_));
-    ACL_CHECK_RET(aclrtCreateStream(&stream_));
+    ACL_CHECK_RET(g_cann.aclrtSetDevice(device_));
+    ACL_CHECK_RET(g_cann.aclrtCreateStream(&stream_));
 
-    // Cache dimensions
-    talker_hidden_ = cfg.talker_hidden_size;  // 2048
-    cp_hidden_ = cfg.hidden_size;             // 1024
-    n_heads_ = cfg.num_attention_heads;       // 16
-    n_kv_ = cfg.num_key_value_heads;          // 8
-    head_dim_ = cfg.head_dim;                 // 128
-    q_dim_ = n_heads_ * head_dim_;            // 2048
-    kv_dim_ = n_kv_ * head_dim_;             // 1024
-    inter_ = cfg.intermediate_size;           // 3072
-    n_layers_ = cfg.num_hidden_layers;        // 5
-    eps_ = cfg.rms_norm_eps;
-    rope_theta_ = cfg.rope_theta;
+    talker_hidden_ = cfg.talker_hidden_size;
+    cp_hidden_     = cfg.hidden_size;
+    n_heads_       = cfg.num_attention_heads;
+    n_kv_          = cfg.num_key_value_heads;
+    head_dim_      = cfg.head_dim;
+    q_dim_         = n_heads_ * head_dim_;
+    kv_dim_        = n_kv_ * head_dim_;
+    inter_         = cfg.intermediate_size;
+    n_layers_      = cfg.num_hidden_layers;
+    eps_           = cfg.rms_norm_eps;
+    rope_theta_    = cfg.rope_theta;
 
-    // ---- Upload projection weights ----
-    alloc_dev(&proj_w_dev_, cp_hidden_ * talker_hidden_ * sizeof(float));
-    upload(proj_w_dev_, w.proj_w.data(), cp_hidden_ * talker_hidden_);
+    // All device buffers are F16 (2 bytes/elem).
+    const size_t E = sizeof(uint16_t);
+
+    // --- Upload projection weights as F32 (matches llama.cpp's CP path,
+    //    which does the input projection on CPU with F32 precision). This
+    //    is the single most precision-sensitive matmul in the CP because it
+    //    converts between talker-space (high variance) and cp-space. ---
+    alloc_dev(&proj_w_dev_,
+              (size_t)cp_hidden_ * talker_hidden_ * sizeof(float));
+    upload(proj_w_dev_, w.proj_w.data(),
+           (size_t)cp_hidden_ * talker_hidden_);
     alloc_dev(&proj_b_dev_, cp_hidden_ * sizeof(float));
     upload(proj_b_dev_, w.proj_b.data(), cp_hidden_);
 
-    // ---- Upload per-layer weights ----
     layer_w_.resize(n_layers_);
-    for (int il = 0; il < n_layers_; il++) {
-        auto &src = w.layers[il];
+    auto upload_mat_f16 = [&](void *&dev, const std::vector<float> &host,
+                               int rows, int cols) {
+        alloc_dev(&dev, (size_t)rows * cols * E);
+        upload_f16(dev, host.data(), (size_t)rows * cols);
+    };
+    for (int il = 0; il < n_layers_; ++il) {
+        const auto &src = w.layers[il];
         auto &dst = layer_w_[il];
-
-        auto upload_mat = [&](void *&dev, const std::vector<float> &host,
-                              int rows, int cols) {
-            alloc_dev(&dev, (size_t)rows * cols * sizeof(float));
-            upload(dev, host.data(), (size_t)rows * cols);
-        };
-
-        upload_mat(dst.q_proj_w, src.q_proj_w, q_dim_, cp_hidden_);
-        upload_mat(dst.k_proj_w, src.k_proj_w, kv_dim_, cp_hidden_);
-        upload_mat(dst.v_proj_w, src.v_proj_w, kv_dim_, cp_hidden_);
-        upload_mat(dst.o_proj_w, src.o_proj_w, cp_hidden_, q_dim_);
-        upload_mat(dst.gate_proj_w, src.gate_proj_w, inter_, cp_hidden_);
-        upload_mat(dst.up_proj_w, src.up_proj_w, inter_, cp_hidden_);
-        upload_mat(dst.down_proj_w, src.down_proj_w, cp_hidden_, inter_);
-
+        upload_mat_f16(dst.q_proj_w,    src.q_proj_w,    q_dim_,     cp_hidden_);
+        upload_mat_f16(dst.k_proj_w,    src.k_proj_w,    kv_dim_,    cp_hidden_);
+        upload_mat_f16(dst.v_proj_w,    src.v_proj_w,    kv_dim_,    cp_hidden_);
+        upload_mat_f16(dst.o_proj_w,    src.o_proj_w,    cp_hidden_, q_dim_);
+        upload_mat_f16(dst.gate_proj_w, src.gate_proj_w, inter_,     cp_hidden_);
+        upload_mat_f16(dst.up_proj_w,   src.up_proj_w,   inter_,     cp_hidden_);
+        upload_mat_f16(dst.down_proj_w, src.down_proj_w, cp_hidden_, inter_);
+        // RMSNorm gammas are stored as F32 in the GGUF and aclnnRmsNorm
+        // natively accepts F32 gamma with F16 input (SupportInfo[0]).
+        // Casting them to F16 loses precision for a 1-in-1024-sized vector
+        // that gets applied 5+ times per decode — noticeable in output.
         alloc_dev(&dst.q_norm_w, head_dim_ * sizeof(float));
         upload(dst.q_norm_w, src.q_norm_w.data(), head_dim_);
         alloc_dev(&dst.k_norm_w, head_dim_ * sizeof(float));
@@ -222,472 +706,358 @@ bool CpCannEngine::init(const CpWeightsF32 &w, const CodePredictorConfig &cfg,
         alloc_dev(&dst.post_ln_w, cp_hidden_ * sizeof(float));
         upload(dst.post_ln_w, src.post_ln_w.data(), cp_hidden_);
     }
-
     alloc_dev(&final_norm_w_dev_, cp_hidden_ * sizeof(float));
     upload(final_norm_w_dev_, w.norm_w.data(), cp_hidden_);
 
-    // ---- Cache QK-norm weights on host ----
-    qk_norm_host_.resize(n_layers_);
-    for (int il = 0; il < n_layers_; il++) {
-        qk_norm_host_[il].q_norm_w = w.layers[il].q_norm_w;
-        qk_norm_host_[il].k_norm_w = w.layers[il].k_norm_w;
-    }
+    // --- Fixed-size working buffers (F16) ---
+    alloc_dev(&cur_dev_,       cp_hidden_ * E);
+    alloc_dev(&residual_dev_,  cp_hidden_ * E);
+    alloc_dev(&normed_dev_,    cp_hidden_ * E);
+    alloc_dev(&q_dev_,         q_dim_     * E);  // also F16 input stage post-cast (q_dim ≥ talker_hidden)
+    alloc_dev(&k_dev_,         kv_dim_    * E);
+    alloc_dev(&v_dev_,         kv_dim_    * E);
+    alloc_dev(&attn_out_dev_,  q_dim_     * E);
+    alloc_dev(&o_out_dev_,     cp_hidden_ * E);
+    alloc_dev(&gate_dev_,      inter_     * E);
+    alloc_dev(&up_dev_,        inter_     * E);
+    alloc_dev(&ffn_out_dev_,   cp_hidden_ * E);
 
-    // ---- Allocate intermediate buffers ----
-    alloc_dev(&cur_dev_, cp_hidden_ * sizeof(float));
-    alloc_dev(&residual_dev_, cp_hidden_ * sizeof(float));
-    alloc_dev(&normed_dev_, cp_hidden_ * sizeof(float));
-    alloc_dev(&q_dev_, q_dim_ * sizeof(float));
-    alloc_dev(&k_dev_, kv_dim_ * sizeof(float));
-    alloc_dev(&v_dev_, kv_dim_ * sizeof(float));
-    alloc_dev(&attn_out_dev_, q_dim_ * sizeof(float));
-    alloc_dev(&o_out_dev_, cp_hidden_ * sizeof(float));
-    alloc_dev(&gate_dev_, inter_ * sizeof(float));
-    alloc_dev(&up_dev_, inter_ * sizeof(float));
-    alloc_dev(&ffn_out_dev_, cp_hidden_ * sizeof(float));
-
-    // Attention score buffers
+    // Attention scores buffer — kept F32 so softmax can run in F32 (matches
+    // the precision of llama.cpp's aclnnFusedInferAttentionScoreV2 internal
+    // softmax, which the user-audible F16-throughout softmax can't replicate).
     alloc_dev(&scores_dev_, (size_t)n_heads_ * MAX_SEQ * sizeof(float));
-    alloc_dev(&attn_weights_dev_, (size_t)n_heads_ * MAX_SEQ * sizeof(float));
+    // Separate F16 scratch for the attn_weights BMM input (F16 required).
+    alloc_dev(&scores_f16_dev_, (size_t)n_heads_ * MAX_SEQ * E);
+    // rstd is F32 (aclnnRmsNorm spec); sized for the largest case (n_heads).
+    alloc_dev(&rstd_dev_,   (size_t)n_heads_ * sizeof(float));
 
-    // RmsNorm rstd scratch
-    alloc_dev(&rstd_dev_, sizeof(float));
+    // Boundary F32 staging buffers
+    alloc_dev(&input_stage_f32_dev_,  talker_hidden_ * sizeof(float));
+    alloc_dev(&output_stage_f32_dev_, cp_hidden_     * sizeof(float));
+    // F32 scratch for the input-projection output AND the running F32
+    // residual accumulator used through all transformer layers.
+    alloc_dev(&proj_out_f32_dev_,     cp_hidden_     * sizeof(float));
+    alloc_dev(&accum_scratch_f32_dev_, cp_hidden_    * sizeof(float));
+    alloc_dev(&normed_f32_dev_,        cp_hidden_    * sizeof(float));
 
-    // ---- Precompute RoPE cos/sin table on host, upload ----
+    // --- Precompute cos/sin tables as F16 ---
     {
-        int half = head_dim_ / 2;
-        std::vector<float> cos_table(MAX_SEQ * half);
-        std::vector<float> sin_table(MAX_SEQ * half);
-        for (int pos = 0; pos < MAX_SEQ; pos++) {
-            for (int i = 0; i < half; i++) {
-                float freq = 1.0f / powf(rope_theta_, (float)(2 * i) / head_dim_);
-                float angle = pos * freq;
-                cos_table[pos * half + i] = cosf(angle);
-                sin_table[pos * half + i] = sinf(angle);
+        const int half = head_dim_ / 2;
+        std::vector<float> cos_table((size_t)MAX_SEQ * head_dim_);
+        std::vector<float> sin_table((size_t)MAX_SEQ * head_dim_);
+        for (int p = 0; p < MAX_SEQ; ++p) {
+            for (int j = 0; j < half; ++j) {
+                float freq  = 1.0f / powf(rope_theta_, (float)(2 * j) / head_dim_);
+                float angle = (float)p * freq;
+                float c = cosf(angle);
+                float s = sinf(angle);
+                cos_table[(size_t)p * head_dim_ + j]        = c;
+                cos_table[(size_t)p * head_dim_ + j + half] = c;
+                sin_table[(size_t)p * head_dim_ + j]        = s;
+                sin_table[(size_t)p * head_dim_ + j + half] = s;
             }
         }
-        alloc_dev(&rope_cos_dev_, MAX_SEQ * half * sizeof(float));
-        alloc_dev(&rope_sin_dev_, MAX_SEQ * half * sizeof(float));
-        upload(rope_cos_dev_, cos_table.data(), MAX_SEQ * half);
-        upload(rope_sin_dev_, sin_table.data(), MAX_SEQ * half);
+        alloc_dev(&rope_cos_dev_, (size_t)MAX_SEQ * head_dim_ * E);
+        alloc_dev(&rope_sin_dev_, (size_t)MAX_SEQ * head_dim_ * E);
+        upload_f16(rope_cos_dev_, cos_table.data(), (size_t)MAX_SEQ * head_dim_);
+        upload_f16(rope_sin_dev_, sin_table.data(), (size_t)MAX_SEQ * head_dim_);
     }
 
-    // ---- KV cache ----
+    // --- KV cache (F16) ---
     k_cache_dev_.resize(n_layers_, nullptr);
     v_cache_dev_.resize(n_layers_, nullptr);
-    for (int il = 0; il < n_layers_; il++) {
-        alloc_dev(&k_cache_dev_[il], (size_t)MAX_SEQ * kv_dim_ * sizeof(float));
-        alloc_dev(&v_cache_dev_[il], (size_t)MAX_SEQ * kv_dim_ * sizeof(float));
+    for (int il = 0; il < n_layers_; ++il) {
+        alloc_dev(&k_cache_dev_[il], (size_t)MAX_SEQ * kv_dim_ * E);
+        alloc_dev(&v_cache_dev_[il], (size_t)MAX_SEQ * kv_dim_ * E);
     }
     kv_cache_len_ = 0;
 
-    // ---- Pre-allocate host scratch buffers ----
-    q_host_.resize(q_dim_);
-    k_host_.resize(kv_dim_);
-    attn_out_host_.resize(q_dim_);
-    k_cache_host_.resize(MAX_SEQ * kv_dim_);
-    v_cache_host_.resize(MAX_SEQ * kv_dim_);
-    score_buf_.resize(MAX_SEQ);
+    // --- Scalars: F32 attn_scale for the F32 softmax path; F16 one_scalar
+    //    for Add/InplaceAdd on F16 tensors. ---
+    {
+        float scale_val = 1.0f / sqrtf((float)head_dim_);
+        attn_scale_     = g_cann.aclCreateScalar(&scale_val, ACL_FLOAT);
+    }
+    attn_scale_f16_ = make_f16_scalar(1.0f / sqrtf((float)head_dim_));
+    one_scalar_     = make_f16_scalar(1.0f);
 
-    // Pre-allocate workspace (start with 4MB, grows if needed)
+    // --- Workspace seed ---
     workspace_size_ = 4 * 1024 * 1024;
-    ACL_CHECK_RET(aclrtMalloc(&workspace_dev_, workspace_size_,
-                               ACL_MEM_MALLOC_HUGE_FIRST));
+    ACL_CHECK_RET(g_cann.aclrtMalloc(&workspace_dev_, workspace_size_,
+                                      ACL_MEM_MALLOC_HUGE_FIRST));
+
+    build_persistent_tensors_();
 
     ready_ = true;
-    printf("[cp_cann] Engine initialized: %d layers, device %d\n",
+    printf("[cp_cann] v4 F16 engine initialized: %d layers, device %d\n",
            n_layers_, device_);
-    printf("[cp_cann] Buffers: cp_hidden=%d, q_dim=%d, kv_dim=%d, inter=%d\n",
-           cp_hidden_, q_dim_, kv_dim_, inter_);
+    printf("[cp_cann] dims: cp_hidden=%d q_dim=%d kv_dim=%d inter=%d head=%d\n",
+           cp_hidden_, q_dim_, kv_dim_, inter_, head_dim_);
     return true;
 }
 
-// ============================================================================
-// Host-side helpers for RoPE and QK-norm
-// (These operate on tiny vectors -- kernel launch overhead > compute time)
-// ============================================================================
-
-void CpCannEngine::apply_rope_on_host(float *vec, int dim, int n_vecs,
-                                       int pos) {
-    int half = dim / 2;
-    for (int v = 0; v < n_vecs; v++) {
-        float *h = vec + v * dim;
-        for (int i = 0; i < half; i++) {
-            float freq = 1.0f / powf(rope_theta_, (float)(2 * i) / dim);
-            float angle = pos * freq;
-            float cos_a = cosf(angle);
-            float sin_a = sinf(angle);
-            float x0 = h[i];
-            float x1 = h[i + half];
-            h[i]        = x0 * cos_a - x1 * sin_a;
-            h[i + half] = x1 * cos_a + x0 * sin_a;
-        }
-    }
-}
-
-void CpCannEngine::qk_norm_on_host(float *buf, int dim, int n_vecs,
-                                     const float *norm_w_host) {
-    for (int v = 0; v < n_vecs; v++) {
-        float *h = buf + v * dim;
-        float sum_sq = 0.0f;
-        for (int i = 0; i < dim; i++) sum_sq += h[i] * h[i];
-        float scale = 1.0f / sqrtf(sum_sq / dim + eps_);
-        for (int i = 0; i < dim; i++) h[i] = h[i] * scale * norm_w_host[i];
-    }
-}
-
-// ============================================================================
-// Reset KV cache
-// ============================================================================
-
 void CpCannEngine::reset_kv_cache() {
     kv_cache_len_ = 0;
-    // No need to zero memory -- we track length and only read [0..len)
 }
 
 // ============================================================================
-// Forward one token through CP transformer on NPU
-//
-// Strategy: Large matmuls (linear projections, attention V*scores, FFN) run
-// on NPU via aclnnMm. RmsNorm runs on NPU via aclnnRmsNorm.
-// Small per-head ops (QK-norm, RoPE) run on host to avoid launch overhead.
-// Attention score computation uses batched matmul on NPU.
+// forward_one_token — F16 end-to-end with F32 staging at the boundaries.
 // ============================================================================
 
 void CpCannEngine::forward_one_token(const float *input_talker_space,
                                       int pos, float *hidden_out) {
     assert(ready_);
-    ACL_CHECK_RET(aclrtSetDevice(device_));
 
-    // ================================================================
-    // 1. Upload input and run input projection: cur = proj_w @ input + proj_b
-    //    input: [talker_hidden], cur: [cp_hidden]
-    //    matmul: [cp_hidden, talker_hidden] x [talker_hidden, 1] -> [cp_hidden, 1]
-    // ================================================================
+    // 1. Upload F32 input embedding to f32 stage buffer.
+    ACL_CHECK_RET(g_cann.aclrtMemcpy(
+        input_stage_f32_dev_, talker_hidden_ * sizeof(float),
+        input_talker_space,   talker_hidden_ * sizeof(float),
+        ACL_MEMCPY_HOST_TO_DEVICE));
 
-    // Upload input to a temporary device buffer (reuse q_dev_ as temp since
-    // it's large enough: q_dim_ = 2048 >= talker_hidden_ = 2048)
-    upload(q_dev_, input_talker_space, talker_hidden_);
-
+    // 2. Input projection in F32 (proj_w/proj_b are F32; input is F32).
+    //    Output goes to proj_out_f32_dev_ (F32). This matches the precision
+    //    llama.cpp uses — cp_matvec_f32 on CPU — which is the only reference
+    //    that produces audibly-correct output.
     {
-        // Mm: cur = proj_w @ input  (as 2D matmul: [ch, th] x [th, 1] -> [ch, 1])
-        aclTensor *t_w = make_tensor_2d(proj_w_dev_, cp_hidden_, talker_hidden_);
-        aclTensor *t_x = make_tensor_2d(q_dev_, talker_hidden_, 1);
-        aclTensor *t_y = make_tensor_2d(cur_dev_, cp_hidden_, 1);
-
-        CANN_OP(stream_, workspace_dev_, workspace_size_,
-                Mm, t_w, t_x, t_y, 0);
-
-        aclDestroyTensor(t_w);
-        aclDestroyTensor(t_x);
-        aclDestroyTensor(t_y);
+        aclTensor *t_x = tensor_2d(input_stage_f32_dev_,
+                                    talker_hidden_, 1, ACL_FLOAT);
+        CANN_OP(Mm, t_.proj_w_f32, t_x, t_.proj_out_f32_col,
+                /*cubeMathType=*/0);
+        g_cann.aclDestroyTensor(t_x);
     }
-
-    // Add bias: cur += proj_b
+    // Add proj_b in F32: F32 Add with alpha=1.
     {
-        aclTensor *t_cur = make_tensor_1d(cur_dev_, cp_hidden_);
-        aclTensor *t_b = make_tensor_1d(proj_b_dev_, cp_hidden_);
-        float alpha_val = 1.0f;
-        aclScalar *alpha = aclCreateScalar(&alpha_val, ACL_FLOAT);
-
-        CANN_OP(stream_, workspace_dev_, workspace_size_,
-                InplaceAdd, t_cur, t_b, alpha);
-
-        aclDestroyScalar(alpha);
-        aclDestroyTensor(t_cur);
-        aclDestroyTensor(t_b);
+        float one = 1.0f;
+        aclScalar *alpha_f32 = g_cann.aclCreateScalar(&one, ACL_FLOAT);
+        CANN_OP(InplaceAdd, t_.proj_out_f32_flat, t_.proj_b_f32, alpha_f32);
+        g_cann.aclDestroyScalar(alpha_f32);
     }
+    // Cast F32 projected -> F16 cur_dev_ so the first RmsNorm can run F16
+    // with F32 gamma (matches ggml-cann's Qwen3 precision convention).
+    // From this point on the transformer runs F16 end-to-end, residual adds
+    // included — this is the llama.cpp/ggml-cann convention.
+    CANN_OP(Cast, t_.proj_out_f32_flat, ACL_FLOAT16,
+            t_.cur_f16_flat_as_target);
 
-    // ================================================================
-    // 2. Transformer layers
-    // ================================================================
+    const int seq_len = pos + 1;
+    const int group   = n_heads_ / n_kv_;
 
-    for (int il = 0; il < n_layers_; il++) {
-        auto &lw = layer_w_[il];
+    uint16_t *cos_pos = (uint16_t *)rope_cos_dev_ + (size_t)pos * head_dim_;
+    uint16_t *sin_pos = (uint16_t *)rope_sin_dev_ + (size_t)pos * head_dim_;
+    aclTensor *t_cos = [&]() {
+        int64_t shape[4]   = {1, 1, 1, (int64_t)head_dim_};
+        int64_t strides[4] = {(int64_t)head_dim_, (int64_t)head_dim_,
+                               (int64_t)head_dim_, 1};
+        return tensor_strided(cos_pos, 4, shape, strides);
+    }();
+    aclTensor *t_sin = [&]() {
+        int64_t shape[4]   = {1, 1, 1, (int64_t)head_dim_};
+        int64_t strides[4] = {(int64_t)head_dim_, (int64_t)head_dim_,
+                               (int64_t)head_dim_, 1};
+        return tensor_strided(sin_pos, 4, shape, strides);
+    }();
 
-        // -- Save residual: residual = cur --
-        ACL_CHECK_RET(aclrtMemcpyAsync(
-            residual_dev_, cp_hidden_ * sizeof(float),
-            cur_dev_, cp_hidden_ * sizeof(float),
+    // Hidden state lives in cur_dev_ (F16) throughout the transformer.
+    // Residual saved via F16 d2d memcpy at the start of each sublayer, then
+    // added back with aclnnAdd (F16) at the end. This is the ggml-cann/
+    // llama.cpp convention — the model was trained with F16 residuals.
+    for (int il = 0; il < n_layers_; ++il) {
+        const auto &lt = t_.layer[il];
+
+        // residual = cur (F16 d2d async memcpy)
+        ACL_CHECK_RET(g_cann.aclrtMemcpyAsync(
+            residual_dev_, cp_hidden_ * sizeof(uint16_t),
+            cur_dev_,      cp_hidden_ * sizeof(uint16_t),
             ACL_MEMCPY_DEVICE_TO_DEVICE, stream_));
 
-        // -- Input LayerNorm: normed = rms_norm(cur, input_ln_w) --
-        {
-            aclTensor *t_cur = make_tensor_1d(cur_dev_, cp_hidden_);
-            aclTensor *t_dst = make_tensor_1d(normed_dev_, cp_hidden_);
-            aclTensor *t_gamma = make_tensor_1d(lw.input_ln_w, cp_hidden_);
-            aclTensor *t_rstd = make_tensor_1d(rstd_dev_, 1);
+        CANN_OP(RmsNorm, t_.cur_row, lt.input_ln, (double)eps_,
+                t_.normed_row, t_.rstd_11);
 
-            CANN_OP(stream_, workspace_dev_, workspace_size_,
-                    RmsNorm, t_cur, t_gamma, eps_, t_dst, t_rstd);
+        CANN_OP(Mm, lt.q_proj, t_.normed_col, t_.q_col, /*cubeMathType=*/0);
+        CANN_OP(Mm, lt.k_proj, t_.normed_col, t_.k_col, /*cubeMathType=*/0);
+        CANN_OP(Mm, lt.v_proj, t_.normed_col, t_.v_col, /*cubeMathType=*/0);
 
-            aclDestroyTensor(t_cur);
-            aclDestroyTensor(t_dst);
-            aclDestroyTensor(t_gamma);
-            aclDestroyTensor(t_rstd);
-        }
+        CANN_OP(RmsNorm, t_.q_heads, lt.q_norm, (double)eps_,
+                t_.q_heads, t_.rstd_heads);
+        CANN_OP(RmsNorm, t_.k_kv,    lt.k_norm, (double)eps_,
+                t_.k_kv,    t_.rstd_kv);
 
-        // -- Q/K/V projections: q = q_proj @ normed, etc --
-        // Q: [q_dim, cp_hidden] x [cp_hidden, 1] -> [q_dim, 1]
-        {
-            aclTensor *t_w = make_tensor_2d(lw.q_proj_w, q_dim_, cp_hidden_);
-            aclTensor *t_x = make_tensor_2d(normed_dev_, cp_hidden_, 1);
-            aclTensor *t_y = make_tensor_2d(q_dev_, q_dim_, 1);
-            CANN_OP(stream_, workspace_dev_, workspace_size_, Mm, t_w, t_x, t_y, 0);
-            aclDestroyTensor(t_w); aclDestroyTensor(t_x); aclDestroyTensor(t_y);
-        }
-        // K: [kv_dim, cp_hidden] x [cp_hidden, 1] -> [kv_dim, 1]
-        {
-            aclTensor *t_w = make_tensor_2d(lw.k_proj_w, kv_dim_, cp_hidden_);
-            aclTensor *t_x = make_tensor_2d(normed_dev_, cp_hidden_, 1);
-            aclTensor *t_y = make_tensor_2d(k_dev_, kv_dim_, 1);
-            CANN_OP(stream_, workspace_dev_, workspace_size_, Mm, t_w, t_x, t_y, 0);
-            aclDestroyTensor(t_w); aclDestroyTensor(t_x); aclDestroyTensor(t_y);
-        }
-        // V: [kv_dim, cp_hidden] x [cp_hidden, 1] -> [kv_dim, 1]
-        {
-            aclTensor *t_w = make_tensor_2d(lw.v_proj_w, kv_dim_, cp_hidden_);
-            aclTensor *t_x = make_tensor_2d(normed_dev_, cp_hidden_, 1);
-            aclTensor *t_y = make_tensor_2d(v_dev_, kv_dim_, 1);
-            CANN_OP(stream_, workspace_dev_, workspace_size_, Mm, t_w, t_x, t_y, 0);
-            aclDestroyTensor(t_w); aclDestroyTensor(t_x); aclDestroyTensor(t_y);
-        }
+        // RoPE (F16)
+        CANN_OP(RotaryPositionEmbedding,
+                t_.q_rope_4d, t_cos, t_sin,
+                /*mode=*/(int64_t)0, t_.attn_out_4d);
 
-        // Sync stream before downloading Q/K for host-side QK-norm + RoPE
-        ACL_CHECK_RET(aclrtSynchronizeStream(stream_));
+        uint16_t *k_cache_slot =
+            (uint16_t *)k_cache_dev_[il] + (size_t)pos * kv_dim_;
+        aclTensor *t_k_rope_src = [&]() {
+            int64_t shape[4]   = {1, 1, (int64_t)n_kv_, (int64_t)head_dim_};
+            int64_t strides[4] = {(int64_t)kv_dim_, (int64_t)kv_dim_,
+                                   (int64_t)head_dim_, 1};
+            return tensor_strided(k_dev_, 4, shape, strides);
+        }();
+        aclTensor *t_k_rope_dst = [&]() {
+            int64_t shape[4]   = {1, 1, (int64_t)n_kv_, (int64_t)head_dim_};
+            int64_t strides[4] = {(int64_t)kv_dim_, (int64_t)kv_dim_,
+                                   (int64_t)head_dim_, 1};
+            return tensor_strided(k_cache_slot, 4, shape, strides);
+        }();
+        CANN_OP(RotaryPositionEmbedding,
+                t_k_rope_src, t_cos, t_sin,
+                /*mode=*/(int64_t)0, t_k_rope_dst);
+        g_cann.aclDestroyTensor(t_k_rope_src);
+        g_cann.aclDestroyTensor(t_k_rope_dst);
 
-        // Download Q and K to host for QK-norm + RoPE
-        download(q_host_.data(), q_dev_, q_dim_);
-        download(k_host_.data(), k_dev_, kv_dim_);
+        // V -> cache slot
+        uint16_t *v_cache_slot =
+            (uint16_t *)v_cache_dev_[il] + (size_t)pos * kv_dim_;
+        ACL_CHECK_RET(g_cann.aclrtMemcpyAsync(
+            v_cache_slot, kv_dim_ * sizeof(uint16_t),
+            v_dev_,       kv_dim_ * sizeof(uint16_t),
+            ACL_MEMCPY_DEVICE_TO_DEVICE, stream_));
 
-        // -- QK Norm (per-head RmsNorm with shared weights, cached on host) --
-        qk_norm_on_host(q_host_.data(), head_dim_, n_heads_,
-                        qk_norm_host_[il].q_norm_w.data());
-        qk_norm_on_host(k_host_.data(), head_dim_, n_kv_,
-                        qk_norm_host_[il].k_norm_w.data());
-
-        // -- RoPE (NEOX style) --
-        apply_rope_on_host(q_host_.data(), head_dim_, n_heads_, pos);
-        apply_rope_on_host(k_host_.data(), head_dim_, n_kv_, pos);
-
-        // Upload Q back to device (needed for attention matmul)
-        upload(q_dev_, q_host_.data(), q_dim_);
-
-        // -- Store K/V in KV cache --
-        // K -> k_cache[il][pos * kv_dim .. (pos+1) * kv_dim)
-        ACL_CHECK_RET(aclrtMemcpy(
-            (char *)k_cache_dev_[il] + (size_t)pos * kv_dim_ * sizeof(float),
-            kv_dim_ * sizeof(float),
-            k_host_.data(), kv_dim_ * sizeof(float),
-            ACL_MEMCPY_HOST_TO_DEVICE));
-
-        // V stays on device -- download is wasteful, copy device->device
-        // But we already have V on device (v_dev_), so copy directly
-        ACL_CHECK_RET(aclrtMemcpy(
-            (char *)v_cache_dev_[il] + (size_t)pos * kv_dim_ * sizeof(float),
-            kv_dim_ * sizeof(float),
-            v_dev_, kv_dim_ * sizeof(float),
-            ACL_MEMCPY_DEVICE_TO_DEVICE));
-
-        int seq_len = pos + 1;
-
-        // -- Attention: Q @ K^T -> scores, softmax -> weights, weights @ V -> out --
-        // GQA: n_heads=16 query heads, n_kv=8 KV heads, group_size=2
+        // --- Fused attention: aclnnFusedInferAttentionScoreV2. This is the
+        // exact op llama.cpp's ggml-cann backend uses for Qwen3 attention.
+        // By calling it here with the same params (layout="BSND",
+        // innerPrecise=0 for S=1 decode, no mask), we inherit llama.cpp's
+        // numerical behavior — same weights (F16 GGUF) + same op + same
+        // params → same output. Prior manual BMM path diverged precisely
+        // because it was a custom attention with subtly-different numerics.
         //
-        // For this tiny model (seq_len <= 17, head_dim=128), the attention
-        // computation is small enough that batched matmul is efficient.
-        //
-        // Strategy: do attention per-head on host for simplicity and to avoid
-        // complex GQA reshaping on NPU. The vectors are tiny.
+        // Input layouts (BSND with B=1):
+        //   Q:   [1, 1, n_heads, head_dim]  over attn_out_dev_ (RoPE'd Q)
+        //   K:   [1, seq_len, n_kv, head_dim] view of KV cache (native)
+        //   V:   same as K, over v_cache_dev_
+        //   Out: [1, 1, n_heads, head_dim]  into q_dev_
+        aclTensor *t_q_bsnd = [&]() {
+            int64_t shape[4]   = {1, 1, (int64_t)n_heads_, (int64_t)head_dim_};
+            int64_t strides[4] = {(int64_t)q_dim_, (int64_t)q_dim_,
+                                   (int64_t)head_dim_, 1};
+            return tensor_strided(attn_out_dev_, 4, shape, strides,
+                                   ACL_FLOAT16);
+        }();
+        aclTensor *t_k_bsnd = [&]() {
+            int64_t shape[4]   = {1, (int64_t)seq_len, (int64_t)n_kv_,
+                                   (int64_t)head_dim_};
+            int64_t strides[4] = {(int64_t)seq_len * kv_dim_,
+                                   (int64_t)kv_dim_,
+                                   (int64_t)head_dim_, 1};
+            return tensor_strided(k_cache_dev_[il], 4, shape, strides,
+                                   ACL_FLOAT16);
+        }();
+        aclTensor *t_v_bsnd = [&]() {
+            int64_t shape[4]   = {1, (int64_t)seq_len, (int64_t)n_kv_,
+                                   (int64_t)head_dim_};
+            int64_t strides[4] = {(int64_t)seq_len * kv_dim_,
+                                   (int64_t)kv_dim_,
+                                   (int64_t)head_dim_, 1};
+            return tensor_strided(v_cache_dev_[il], 4, shape, strides,
+                                   ACL_FLOAT16);
+        }();
+        aclTensor *t_attn_out_bsnd = [&]() {
+            int64_t shape[4]   = {1, 1, (int64_t)n_heads_, (int64_t)head_dim_};
+            int64_t strides[4] = {(int64_t)q_dim_, (int64_t)q_dim_,
+                                   (int64_t)head_dim_, 1};
+            return tensor_strided(q_dev_, 4, shape, strides, ACL_FLOAT16);
+        }();
+
+        aclTensorList *t_k_list = g_cann.aclCreateTensorList(&t_k_bsnd, 1);
+        aclTensorList *t_v_list = g_cann.aclCreateTensorList(&t_v_bsnd, 1);
+
         {
-            // Read all cached K and V for this layer [0..seq_len)
-            download(k_cache_host_.data(), k_cache_dev_[il], seq_len * kv_dim_);
-            download(v_cache_host_.data(), v_cache_dev_[il], seq_len * kv_dim_);
-
-            int group_size = n_heads_ / n_kv_;
-            float kq_scale = 1.0f / sqrtf((float)head_dim_);
-
-            for (int h = 0; h < n_heads_; h++) {
-                int kv_h = h / group_size;
-                const float *q_h = q_host_.data() + h * head_dim_;
-                float *out_h = attn_out_host_.data() + h * head_dim_;
-
-                // Compute attention scores
-                float max_s = -INFINITY;
-                for (int p = 0; p < seq_len; p++) {
-                    const float *k_p = k_cache_host_.data() + (size_t)p * kv_dim_ + kv_h * head_dim_;
-                    float dot = 0.0f;
-                    for (int d = 0; d < head_dim_; d++) dot += q_h[d] * k_p[d];
-                    score_buf_[p] = dot * kq_scale;
-                    if (score_buf_[p] > max_s) max_s = score_buf_[p];
-                }
-
-                // Softmax
-                float sum = 0.0f;
-                for (int p = 0; p < seq_len; p++) {
-                    score_buf_[p] = expf(score_buf_[p] - max_s);
-                    sum += score_buf_[p];
-                }
-                float inv_sum = 1.0f / sum;
-                for (int p = 0; p < seq_len; p++) score_buf_[p] *= inv_sum;
-
-                // Weighted sum of V
-                for (int d = 0; d < head_dim_; d++) {
-                    float val = 0.0f;
-                    for (int p = 0; p < seq_len; p++) {
-                        val += score_buf_[p] *
-                               v_cache_host_[(size_t)p * kv_dim_ + kv_h * head_dim_ + d];
-                    }
-                    out_h[d] = val;
-                }
+            uint64_t fa_ws = 0;
+            aclOpExecutor *fa_exec = nullptr;
+            char layout[5] = {'B','S','N','D',0};
+            double scale = 1.0 / sqrt((double)head_dim_);
+            ACL_CHECK_RET(g_cann.aclnnFusedInferAttentionScoreV2GetWorkspaceSize(
+                t_q_bsnd, t_k_list, t_v_list,
+                /*pseShift*/ nullptr, /*attenMask*/ nullptr,
+                /*actSeqLen*/ nullptr, /*actSeqLenKv*/ nullptr,
+                /*deqScale1*/ nullptr, /*quantScale1*/ nullptr,
+                /*deqScale2*/ nullptr, /*quantScale2*/ nullptr,
+                /*quantOffset2*/ nullptr,
+                /*antiquantScale*/ nullptr, /*antiquantOffset*/ nullptr,
+                /*blockTable*/ nullptr,
+                /*queryPaddingSize*/ nullptr, /*kvPaddingSize*/ nullptr,
+                /*keyAntiquantScale*/ nullptr, /*keyAntiquantOffset*/ nullptr,
+                /*valueAntiquantScale*/ nullptr,
+                /*valueAntiquantOffset*/ nullptr,
+                /*keySharedPrefix*/ nullptr, /*valueSharedPrefix*/ nullptr,
+                /*actualSharedPrefixLen*/ nullptr,
+                /*numHeads*/ (int64_t)n_heads_,
+                /*scaleValue*/ scale,
+                /*preTokens*/ (int64_t)65535,
+                /*nextTokens*/ (int64_t)65535,
+                /*inputLayout*/ layout,
+                /*numKeyValueHeads*/ (int64_t)n_kv_,
+                /*sparseMode*/ (int64_t)0,
+                /*innerPrecise*/ (int64_t)0,  // S=1 → high precision mode
+                /*blockSize*/ (int64_t)0,
+                /*antiquantMode*/ (int64_t)0,
+                /*softmaxLseFlag*/ false,
+                /*keyAntiquantMode*/ (int64_t)0,
+                /*valueAntiquantMode*/ (int64_t)0,
+                /*attentionOut*/ t_attn_out_bsnd,
+                /*softmaxLse*/ nullptr,
+                &fa_ws, &fa_exec));
+            if (fa_ws > workspace_size_) {
+                if (workspace_dev_) g_cann.aclrtFree(workspace_dev_);
+                ACL_CHECK_RET(g_cann.aclrtMalloc(&workspace_dev_, fa_ws,
+                               ACL_MEM_MALLOC_HUGE_FIRST));
+                workspace_size_ = fa_ws;
             }
-
-            // Upload attention output to device
-            upload(attn_out_dev_, attn_out_host_.data(), q_dim_);
+            void *ws = fa_ws > 0 ? workspace_dev_ : nullptr;
+            ACL_CHECK_RET(g_cann.aclnnFusedInferAttentionScoreV2(
+                ws, fa_ws, fa_exec, stream_));
         }
 
-        // -- O projection: o_out = o_proj @ attn_out --
-        // [cp_hidden, q_dim] x [q_dim, 1] -> [cp_hidden, 1]
-        {
-            aclTensor *t_w = make_tensor_2d(lw.o_proj_w, cp_hidden_, q_dim_);
-            aclTensor *t_x = make_tensor_2d(attn_out_dev_, q_dim_, 1);
-            aclTensor *t_y = make_tensor_2d(o_out_dev_, cp_hidden_, 1);
-            CANN_OP(stream_, workspace_dev_, workspace_size_, Mm, t_w, t_x, t_y, 0);
-            aclDestroyTensor(t_w); aclDestroyTensor(t_x); aclDestroyTensor(t_y);
-        }
+        g_cann.aclDestroyTensorList(t_k_list);
+        g_cann.aclDestroyTensorList(t_v_list);
+        g_cann.aclDestroyTensor(t_q_bsnd);
+        g_cann.aclDestroyTensor(t_attn_out_bsnd);
+        // t_k_bsnd / t_v_bsnd are owned by the destroyed lists — no free here.
 
-        // -- Residual add: cur = residual + o_out --
-        {
-            aclTensor *t_res = make_tensor_1d(residual_dev_, cp_hidden_);
-            aclTensor *t_o = make_tensor_1d(o_out_dev_, cp_hidden_);
-            aclTensor *t_cur = make_tensor_1d(cur_dev_, cp_hidden_);
-            float alpha_val = 1.0f;
-            aclScalar *alpha = aclCreateScalar(&alpha_val, ACL_FLOAT);
+        CANN_OP(Mm, lt.o_proj, t_.q_col, t_.o_out_col,
+                /*cubeMathType=*/0);
 
-            CANN_OP(stream_, workspace_dev_, workspace_size_,
-                    Add, t_res, t_o, alpha, t_cur);
+        // cur = residual + o_out  (F16 add)
+        CANN_OP(Add, t_.residual_flat, t_.o_out_flat, one_scalar_,
+                t_.cur_flat);
 
-            aclDestroyScalar(alpha);
-            aclDestroyTensor(t_res);
-            aclDestroyTensor(t_o);
-            aclDestroyTensor(t_cur);
-        }
-
-        // -- Post-attention LayerNorm + FFN --
-        // Save residual
-        ACL_CHECK_RET(aclrtMemcpyAsync(
-            residual_dev_, cp_hidden_ * sizeof(float),
-            cur_dev_, cp_hidden_ * sizeof(float),
+        // residual = cur  (for FFN)
+        ACL_CHECK_RET(g_cann.aclrtMemcpyAsync(
+            residual_dev_, cp_hidden_ * sizeof(uint16_t),
+            cur_dev_,      cp_hidden_ * sizeof(uint16_t),
             ACL_MEMCPY_DEVICE_TO_DEVICE, stream_));
 
-        // Post-attention RmsNorm
-        {
-            aclTensor *t_cur = make_tensor_1d(cur_dev_, cp_hidden_);
-            aclTensor *t_dst = make_tensor_1d(normed_dev_, cp_hidden_);
-            aclTensor *t_gamma = make_tensor_1d(lw.post_ln_w, cp_hidden_);
-            aclTensor *t_rstd = make_tensor_1d(rstd_dev_, 1);
+        CANN_OP(RmsNorm, t_.cur_row, lt.post_ln, (double)eps_,
+                t_.normed_row, t_.rstd_11);
 
-            CANN_OP(stream_, workspace_dev_, workspace_size_,
-                    RmsNorm, t_cur, t_gamma, eps_, t_dst, t_rstd);
+        CANN_OP(Mm, lt.gate_proj, t_.normed_col, t_.gate_col,
+                /*cubeMathType=*/0);
+        CANN_OP(Mm, lt.up_proj,   t_.normed_col, t_.up_col,
+                /*cubeMathType=*/0);
+        CANN_OP(Silu, t_.gate_flat, t_.gate_flat);
+        CANN_OP(InplaceMul, t_.gate_flat, t_.up_flat);
+        CANN_OP(Mm, lt.down_proj, t_.gate_col, t_.ffn_out_col,
+                /*cubeMathType=*/0);
 
-            aclDestroyTensor(t_cur);
-            aclDestroyTensor(t_dst);
-            aclDestroyTensor(t_gamma);
-            aclDestroyTensor(t_rstd);
-        }
-
-        // -- SwiGLU FFN --
-        // gate = gate_proj @ normed
-        {
-            aclTensor *t_w = make_tensor_2d(lw.gate_proj_w, inter_, cp_hidden_);
-            aclTensor *t_x = make_tensor_2d(normed_dev_, cp_hidden_, 1);
-            aclTensor *t_y = make_tensor_2d(gate_dev_, inter_, 1);
-            CANN_OP(stream_, workspace_dev_, workspace_size_, Mm, t_w, t_x, t_y, 0);
-            aclDestroyTensor(t_w); aclDestroyTensor(t_x); aclDestroyTensor(t_y);
-        }
-        // up = up_proj @ normed
-        {
-            aclTensor *t_w = make_tensor_2d(lw.up_proj_w, inter_, cp_hidden_);
-            aclTensor *t_x = make_tensor_2d(normed_dev_, cp_hidden_, 1);
-            aclTensor *t_y = make_tensor_2d(up_dev_, inter_, 1);
-            CANN_OP(stream_, workspace_dev_, workspace_size_, Mm, t_w, t_x, t_y, 0);
-            aclDestroyTensor(t_w); aclDestroyTensor(t_x); aclDestroyTensor(t_y);
-        }
-
-        // SwiGLU: output = silu(gate) * up, computed via:
-        //   1. silu_out = SiLU(gate)   [use attn_out_dev_ as temp, big enough]
-        //   2. silu_out *= up           [in-place multiply]
-        //   3. ffn_out = down_proj @ silu_out
-        // Note: attn_out_dev_ is [q_dim=2048] but we need [inter=3072].
-        // So we use ffn_out_dev_ isn't big enough either ([cp_hidden=1024]).
-        // We already have scores_dev_ and attn_weights_dev_ that are small.
-        // Simplest: just do SiLU in-place on gate (same buffer, elementwise).
-        {
-            aclTensor *t_src = make_tensor_1d(gate_dev_, inter_);
-            aclTensor *t_dst = make_tensor_1d(gate_dev_, inter_);
-            CANN_OP(stream_, workspace_dev_, workspace_size_,
-                    Silu, t_src, t_dst);
-            aclDestroyTensor(t_src);
-            aclDestroyTensor(t_dst);
-        }
-
-        // gate *= up (element-wise multiply, in-place on gate)
-        {
-            aclTensor *t_gate = make_tensor_1d(gate_dev_, inter_);
-            aclTensor *t_up = make_tensor_1d(up_dev_, inter_);
-            CANN_OP(stream_, workspace_dev_, workspace_size_,
-                    InplaceMul, t_gate, t_up);
-            aclDestroyTensor(t_gate);
-            aclDestroyTensor(t_up);
-        }
-
-        // down = down_proj @ gate -> ffn_out
-        {
-            aclTensor *t_w = make_tensor_2d(lw.down_proj_w, cp_hidden_, inter_);
-            aclTensor *t_x = make_tensor_2d(gate_dev_, inter_, 1);
-            aclTensor *t_y = make_tensor_2d(ffn_out_dev_, cp_hidden_, 1);
-            CANN_OP(stream_, workspace_dev_, workspace_size_, Mm, t_w, t_x, t_y, 0);
-            aclDestroyTensor(t_w); aclDestroyTensor(t_x); aclDestroyTensor(t_y);
-        }
-
-        // -- Residual add: cur = residual + ffn_out --
-        {
-            aclTensor *t_res = make_tensor_1d(residual_dev_, cp_hidden_);
-            aclTensor *t_ffn = make_tensor_1d(ffn_out_dev_, cp_hidden_);
-            aclTensor *t_cur = make_tensor_1d(cur_dev_, cp_hidden_);
-            float alpha_val = 1.0f;
-            aclScalar *alpha = aclCreateScalar(&alpha_val, ACL_FLOAT);
-
-            CANN_OP(stream_, workspace_dev_, workspace_size_,
-                    Add, t_res, t_ffn, alpha, t_cur);
-
-            aclDestroyScalar(alpha);
-            aclDestroyTensor(t_res);
-            aclDestroyTensor(t_ffn);
-            aclDestroyTensor(t_cur);
-        }
-    }  // end layer loop
-
-    // ================================================================
-    // 3. Final RmsNorm: hidden_out = rms_norm(cur, final_norm_w)
-    // ================================================================
-    {
-        aclTensor *t_cur = make_tensor_1d(cur_dev_, cp_hidden_);
-        // Write final norm output into normed_dev_ (reuse)
-        aclTensor *t_dst = make_tensor_1d(normed_dev_, cp_hidden_);
-        aclTensor *t_gamma = make_tensor_1d(final_norm_w_dev_, cp_hidden_);
-        aclTensor *t_rstd = make_tensor_1d(rstd_dev_, 1);
-
-        CANN_OP(stream_, workspace_dev_, workspace_size_,
-                RmsNorm, t_cur, t_gamma, eps_, t_dst, t_rstd);
-
-        aclDestroyTensor(t_cur);
-        aclDestroyTensor(t_dst);
-        aclDestroyTensor(t_gamma);
-        aclDestroyTensor(t_rstd);
+        // cur = residual + ffn_out  (F16 add)
+        CANN_OP(Add, t_.residual_flat, t_.ffn_out_flat, one_scalar_,
+                t_.cur_flat);
     }
 
-    // Sync and download result
-    ACL_CHECK_RET(aclrtSynchronizeStream(stream_));
-    download(hidden_out, normed_dev_, cp_hidden_);
+    // Final RmsNorm (F16 input/output, F32 gamma).
+    CANN_OP(RmsNorm, t_.cur_row, t_.final_norm, (double)eps_,
+            t_.normed_row, t_.rstd_11);
+
+    // Cast F16 hidden -> F32 staging, then download to host.
+    CANN_OP(Cast, t_.output_f16, ACL_FLOAT, t_.output_f32);
+    ACL_CHECK_RET(g_cann.aclrtSynchronizeStream(stream_));
+    ACL_CHECK_RET(g_cann.aclrtMemcpy(
+        hidden_out, cp_hidden_ * sizeof(float),
+        output_stage_f32_dev_, cp_hidden_ * sizeof(float),
+        ACL_MEMCPY_DEVICE_TO_HOST));
+
+    g_cann.aclDestroyTensor(t_cos);
+    g_cann.aclDestroyTensor(t_sin);
 }
