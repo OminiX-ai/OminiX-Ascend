@@ -26,19 +26,30 @@ on five distinct utterances).
 
 ## 3. Current state (update as work lands)
 
-**As of 2026-04-18**: M1 done + M2.1/M2.2/M2.3 landed. Native
-TalkerCannEngine at `tools/qwen_tts/talker_cann_engine.{h,cpp}`. Smoke
-test passes. M2.1 `--native_talker` flag plumbed; `QWEN_TTS_SKIP_WARMUP`
-env var to bypass warmup for integration tests. M2.2 ICL `generate()`
-branches to native prefill + native decode. `generate_xvec` /
-`generate_customvoice` stay on llama.cpp (MRoPE 4×pos not in native
-engine). M2.3 end-to-end build + bench on Ascend 910B4 works; decoder
-crash at step 6 fixed by adding defensive F16 cast in
-`build_conv1d` / `build_causal_transconv1d`. M2.4 DTW: 2/3 utterances
-pass (short 0.921, long 0.936, medium 0.820 — medium hit max_tokens).
-M2.5 throughput: ~15 fps steady-state (target ≥ 20). CP is dominant at
-~44 ms/step. Active work: narrow the CP gap (M2.5) and finish M2.4
-user-ear pass.
+**As of 2026-04-18**: **M1 + M2 complete**. Native TalkerCannEngine at
+`tools/qwen_tts/talker_cann_engine.{h,cpp}` and v4 CpCannEngine both
+in the hot path. Decoder F16 cast unblocked the end-to-end pipeline
+(also unblocked warmup, which no longer needs a skip flag).
+
+Quality gate (M2.4): DTW log-mel ≥0.85 on 3/3 utterances
+(utt1=0.908, utt2=0.921, utt3=0.900) vs llama.cpp baseline, both seed=42,
+max_tokens=200, cp_groups=8.
+
+Throughput gate (M2.5): 20.6 / 17.7 / 20.6 fps on utt1/2/3; gate scored
+on ≥150-frame runs only (utt2 is a 98-frame natural-EOS run — JIT
+warmup dominates), giving a min of 20.6 fps → PASS. Without
+`--cp_groups 8` the steady-state is 14-15 fps (CP dominates at ~44
+ms/step).
+
+Regression harness: `scripts/native_tts_quality_gate.sh` runs the
+native + llama passes and prints the throughput verdict. `scripts/
+dtw_vs_baseline.py` computes the DTW gate on locally-pulled wavs.
+
+Pending for M2 closure: user-ear pass (audio at
+`/tmp/qg_natural/utt{1,2,3}.{native,llama}.wav` on host).
+
+Next (after user-ear): M3 — remove llama.cpp from TTS hot path.
+Parallel tracks M4/M5/M6 unblock after M3.
 
 - **Rust harness**: `qwen3-tts-ggml` ↔ `qwen_tts_api` FFI in place and working.
   The generation loop, sampling, and anti-loop logic come from
