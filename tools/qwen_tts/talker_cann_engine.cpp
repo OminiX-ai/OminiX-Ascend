@@ -922,6 +922,23 @@ void TalkerCannEngine::forward_prefill(const float *input_embeds, int seq_len,
     assert(seq_len > 0);
     assert(start_pos >= 0 && start_pos + seq_len <= MAX_SEQ);
 
+    // Default: iterate forward_decode. The batched-FIAS prefill below gives
+    // wrong hidden state (TTS transcribes as "Oh." via qwen3-asr) while
+    // iterative single-token decode matches llama.cpp exactly. Keep the
+    // batched path compiled in but off-by-default; set TALKER_PREFILL_BATCHED=1
+    // to force it (for bug-hunting the batched path).
+    if (getenv("TALKER_PREFILL_BATCHED") == nullptr) {
+        std::vector<float> scratch(n_embd_);
+        for (int i = 0; i < seq_len; i++) {
+            const float *tok = input_embeds + (size_t)i * n_embd_;
+            bool is_last = (i == seq_len - 1);
+            forward_decode(tok, start_pos + i,
+                           is_last && last_hidden_out ? last_hidden_out
+                                                       : scratch.data());
+        }
+        return;
+    }
+
     // Chunked prefill: carve the request into pieces of at most MAX_PREFILL.
     // Each chunk writes its own KV cache slots at the correct absolute
     // position; only the very last chunk's last-row hidden is returned.

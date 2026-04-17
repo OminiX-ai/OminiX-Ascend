@@ -1840,6 +1840,31 @@ bool TalkerLLM::generate(
     auto prefill_t1 = std::chrono::high_resolution_clock::now();
     double talker_prefill_ms = std::chrono::duration<double, std::milli>(prefill_t1 - prefill_t0).count();
 
+    // Prefill hidden-state debug probe. Set TALKER_PREFILL_DUMP=<path> and the
+    // first 16 floats + norm stats + full binary are written for a
+    // llama.cpp-vs-native diff. Kept behind an env var so production is free.
+    if (const char *dump = getenv("TALKER_PREFILL_DUMP")) {
+        double sum = 0, sumsq = 0, amin = hidden[0], amax = hidden[0];
+        for (int i = 0; i < dim; i++) {
+            sum += hidden[i];
+            sumsq += (double)hidden[i] * hidden[i];
+            if (hidden[i] < amin) amin = hidden[i];
+            if (hidden[i] > amax) amax = hidden[i];
+        }
+        double mean = sum / dim;
+        double rms  = std::sqrt(sumsq / dim);
+        printf("[talker][prefill-dump] dim=%d mean=%.6f rms=%.6f min=%.6f max=%.6f"
+               " first16=[", dim, mean, rms, amin, amax);
+        for (int i = 0; i < 16; i++) printf("%s%.4f", i ? " " : "", hidden[i]);
+        printf("]\n");
+        FILE *f = fopen(dump, "wb");
+        if (f) {
+            fwrite(hidden.data(), sizeof(float), (size_t)dim, f);
+            fclose(f);
+            printf("[talker][prefill-dump] wrote %s (%d floats)\n", dump, dim);
+        }
+    }
+
     // 4. Autoregressive decode loop
     int cur_pos = prefill_len;
     int vocab_size = talker_config_.vocab_size;
