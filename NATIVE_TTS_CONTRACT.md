@@ -26,15 +26,19 @@ on five distinct utterances).
 
 ## 3. Current state (update as work lands)
 
-**As of 2026-04-18**: M1 done + M2.1/M2.2 wired. Native TalkerCannEngine
-lands at `tools/qwen_tts/talker_cann_engine.{h,cpp}`. Smoke test passes
-(init, forward_decode, forward_prefill, reset_kv_cache, set_rope_speed).
-M2.1 `--native_talker` flag plumbed main.cpp → QwenTTSParams → TalkerLLM::
-load_model. M2.2 ICL `generate()` branches to native prefill + native
-decode when flag is active. `generate_xvec` / `generate_customvoice`
-stay on llama.cpp for now (they use MRoPE 4×pos — native engine is pure
-temporal RoPE; would need M2+ extension). Active work: M2.3 end-to-end
-build + bench on Ascend 910B4.
+**As of 2026-04-18**: M1 done + M2.1/M2.2/M2.3 landed. Native
+TalkerCannEngine at `tools/qwen_tts/talker_cann_engine.{h,cpp}`. Smoke
+test passes. M2.1 `--native_talker` flag plumbed; `QWEN_TTS_SKIP_WARMUP`
+env var to bypass warmup for integration tests. M2.2 ICL `generate()`
+branches to native prefill + native decode. `generate_xvec` /
+`generate_customvoice` stay on llama.cpp (MRoPE 4×pos not in native
+engine). M2.3 end-to-end build + bench on Ascend 910B4 works; decoder
+crash at step 6 fixed by adding defensive F16 cast in
+`build_conv1d` / `build_causal_transconv1d`. M2.4 DTW: 2/3 utterances
+pass (short 0.921, long 0.936, medium 0.820 — medium hit max_tokens).
+M2.5 throughput: ~15 fps steady-state (target ≥ 20). CP is dominant at
+~44 ms/step. Active work: narrow the CP gap (M2.5) and finish M2.4
+user-ear pass.
 
 - **Rust harness**: `qwen3-tts-ggml` ↔ `qwen_tts_api` FFI in place and working.
   The generation loop, sampling, and anti-loop logic come from
@@ -124,11 +128,23 @@ File: `tools/qwen_tts/talker_cann_engine.{h,cpp}` — mirrors `CpCannEngine`.
   to it when flag is active. Prefill → `forward_prefill`, per-step decode
   → `forward_decode`. `generate_xvec` / `generate_customvoice` remain on
   llama.cpp (MRoPE 4×pos not yet supported in native engine).
-- [ ] 2.3 With both `--native_talker --cp_cann` enabled, generate on same
-  utterance+seed as the llama.cpp baseline. Compare audio.
-- [ ] 2.4 **Quality gate**: DTW log-mel vs llama.cpp baseline ≥ 0.85;
-  user-ear pass on 3 distinct utterances.
+- [x] 2.3 With both `--native_talker --cp_cann` enabled, generate on same
+  utterance+seed as the llama.cpp baseline. Compare audio. Produced
+  short/medium/long pairs on ellen ref, seed=42, max_tokens=100/250/250.
+  Decoder fix (build_conv1d F16 cast) was required to unblock this —
+  pre-existing regression from F32 decoder weight export.
+- [~] 2.4 **Quality gate**: DTW log-mel vs llama.cpp baseline ≥ 0.85.
+  DTW results: short=0.921 PASS, long=0.936 PASS, medium=0.820 FAIL.
+  2/3 pass. Medium case hit `max_tokens=250` on both paths → DTW
+  incorporates post-EOS drift. User-ear pass on 3 utterances still
+  pending user time. **Decision**: mark partial for now; revisit with
+  higher max_tokens + text that terminates naturally.
 - [ ] 2.5 **Throughput gate**: ≥ 20 fps end-to-end on benchmark script.
+  Current steady-state: ~15 fps on 200-frame run. CP decode is the
+  dominant cost at ~44 ms/step; native Talker itself is ~17 ms/step
+  (→58 fps ceiling if CP overlapped). Gap closure is either CP
+  optimization (cp_max_layers / cp_max_groups tuning, or native CP v5)
+  or M6 CP-Talker pipelining.
 - [ ] 2.6 File regression test that runs this config nightly.
 
 ### M3 — Remove llama.cpp from TTS hot path (1 day)
