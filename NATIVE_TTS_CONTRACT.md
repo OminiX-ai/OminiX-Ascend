@@ -310,10 +310,57 @@ File: `tools/qwen_tts/talker_cann_engine.{h,cpp}` — mirrors `CpCannEngine`.
 
 ### M6 — Multi-stream pipelining (1 week) — PARALLEL after M3
 
-- [ ] 6.1 Add secondary `aclrtStream` to `TalkerCannEngine` and
+- [x] 6.1 Add secondary `aclrtStream` to `TalkerCannEngine` and
   `CpCannEngine`.
-- [ ] 6.2 Parallelize Talker decode (stream A) with CP decode of previous
+  Both engines now own two streams — `primary_stream_` (default target of
+  every engine op) and `stream_b_` (spare for multi-stream overlap). The
+  existing member `stream_` is now a *pointer-valued* alias that defaults
+  to `primary_stream_`; a new `set_stream(aclrtStream)` setter swaps it at
+  runtime, and `get_stream()` / `get_stream_b()` / `get_primary_stream()`
+  expose the handles to an orchestrator. The engine does NOT take
+  ownership of externally-supplied streams — only `primary_stream_` and
+  `stream_b_` are destroyed in the dtor. Event-sync primitives
+  (`aclrtCreateEvent`, `aclrtDestroyEvent`, `aclrtRecordEvent`,
+  `aclrtStreamWaitEvent`, `aclrtSynchronizeEvent`) were added to
+  `CannSyms` / `cp_cann_symbols.cpp` so callers can fence one stream
+  against another without host roundtrips. No op body was touched — the
+  existing `run_decode_ops_` / `forward_one_token` / `forward_prefill`
+  still post ops to the engine's `stream_` field exactly as before; the
+  only difference is that `stream_` is now user-swappable.
+  **Verified-by:** (a) commit-pending in OminiX-Ascend worktree
+  `tools/qwen_tts/{cp_cann_symbols.{h,cpp},{talker,cp}_cann_engine.{h,cpp}}`;
+  (b) `cmake --build build --target qwen_tts` clean build on the Ascend
+  910B4 target (no warnings, 1,883,152-byte binary with `libllama.so.0`
+  in ldd matching the M3.3 ON build); (c) end-to-end smoke run of the
+  canonical long utterance "Speech synthesis on neural processing units
+  is a compelling application of modern deep learning." with default
+  `--cp_cann --native_talker` produces 76 codec frames at 14.3 fps
+  (within noise of the 14.5 fps baseline), and ASR transcribes the wav
+  verbatim — i.e., the new stream plumbing didn't regress either
+  throughput or audio content. Gate = smoke.
+- [~] 6.2 Parallelize Talker decode (stream A) with CP decode of previous
   frame (stream B). Use `aclrtStreamWaitEvent` for sync.
+  **Blocked by the CP-body edit restriction** in the Track-E scope (file
+  ownership limited `cp_cann_engine.cpp` to adding `stream_b_` /
+  `set_stream` / `get_stream` only — forward body untouchable). The
+  contract-described provisional-embedding trick requires either
+  (a) splitting `TalkerCannEngine::forward_decode` so the F32 input
+  upload + Cast is separable from the rest of `run_decode_ops_`, so a
+  host-side "add-CP-delta-into-input_stage_f32_dev_" can be inserted
+  between the two phases, OR (b) making `CpCannEngine::forward_one_token`
+  non-blocking (remove the trailing `aclrtSynchronizeStream` +
+  `aclrtMemcpy D2H`) and exposing a separate finish/event API so the
+  host can queue all 15 CP groups' launches asynchronously. Both changes
+  edit bodies that Track E is not allowed to touch. The host-level code
+  in `talker.cpp` currently serializes: `sample → predict_code_groups
+  (blocks host on every group's D2H) → compute_next_embedding →
+  forward_decode`, and even with two independent streams at the engine
+  level, CP's per-group host syncs leave no window for Talker[N+1]
+  launch to overlap with CP[N]. Throughput on the canonical long
+  utterance stays at 14.3 fps (matches pre-M6.1 baseline of 14.5 fps).
+  **Decision**: M6.1 plumbing stays (zero-risk, enables future M6.3+
+  work), M6.2 marked `[~]` with the fps shortfall recorded here. Full
+  §8 note appended below.
 - [ ] 6.3 Pipeline encoder + tokenizer encoder in prefill path (already
   parallel via threads; move to NPU streams).
 - [ ] 6.4 Overlap codec decoder chunks with Talker/CP generation.
@@ -453,6 +500,71 @@ carrying a silent false claim.
   `decode_graphs_` cache, opt-in init, capture/replay flow, workspace-
   grow invalidation, destructor cleanup). No edits to `main.cpp`,
   `CMakeLists.txt`, or `forward_prefill`.
+- **2026-04-19 Track E (M6.1 + attempted M6.2) — infrastructure landed,
+  pipelining blocked by scope**: M6.1 (secondary stream on both engines
+  + `set_stream`/`get_stream*` setters + event symbols in CannSyms) is
+  now wired end-to-end. Build is clean, ASR passes 4/4 (utt1-utt3 plus
+  the 32-word technical sentence), and fps holds at 14.3 fps on the
+  long utterance (was 14.5 fps baseline; 0.2 fps delta is run-to-run
+  jitter — eight-group CP at ~22 ms/step × 76 frames + Talker decode at
+  ~17 ms/step + prefill + overhead — the plumbing is a no-op until a
+  caller actually calls `set_stream()` to redirect an engine).
+  **Why M6.2 (Talker[N+1] || CP[N]) does NOT land under Track E**:
+  The structurally-required edits live in files Track E is explicitly
+  not allowed to touch. The scope line says
+  > `cp_cann_engine.{h,cpp}` — ONLY add `stream_b_`, `set_stream`,
+  > `get_stream`. Do NOT edit `forward_one_token`.
+  and the analogous rule for `talker_cann_engine.cpp`. With those
+  constraints:
+  (1) `CpCannEngine::forward_one_token` ends with an
+      `aclrtSynchronizeStream` + host D2H memcpy. Every one of the 15
+      per-group CP calls in `TalkerLLM::predict_code_groups` therefore
+      blocks the host before the next call can even queue onto its
+      stream — there is no window in which Talker[N+1] could launch on
+      stream A while CP[N] keeps running on stream B.
+  (2) Even if CP were made fire-and-forget, the provisional-embedding
+      strategy from §5 M6.2 requires that, after CP[N] finishes, we add
+      `delta = embed(cp_code[g]) - embed(pad_token)` into
+      Talker[N+1]'s `input_stage_f32_dev_` *before* the Cast-F32-to-F16
+      that is the first op inside `run_decode_ops_`. That insertion
+      point is in the middle of `forward_decode`, which Track E cannot
+      edit. Without that device-side add hook, the only correct option
+      is to wait for CP[N] before preparing Talker[N+1]'s input (i.e.,
+      straight serialization).
+  Following the contract's explicit fallback clause ("If it does
+  [break causality], fall back to straight serialization (no speedup
+  but correct) and note in §8"), M6.2 stays at the current 14.3 fps
+  and is marked `[~]`. The 22 fps throughput gate is NOT met by this
+  track.
+  **What the follow-up track needs to do** to hit 22+ fps:
+  (a) Split `TalkerCannEngine::forward_decode` into `decode_launch(pos)`
+      (queues all ops on `stream_`, no host sync) + `decode_fetch(pos,
+      hidden_out)` (syncs stream, downloads F32). Ditto for CpCannEngine
+      (`predict_group_launch(g)` / `predict_group_fetch(g, logits_out)`).
+      This is body-edit territory — Track A-prime or a new Track F.
+  (b) Add a device-side F32 add entry point to TalkerCannEngine so the
+      provisional input can be patched on-device after CP fetch —
+      `add_input_delta(float *delta_host)` that casts F32→F16 and adds
+      into `cur_dev_` pre-run_decode_ops_. Body edit.
+  (c) Wire an `aclrtEvent` fence: CP records on `stream_b_` after its
+      last group; Talker's `decode_launch` for N+1 waits on that event
+      (via `aclrtStreamWaitEvent`) before the host does its F32 delta
+      add, so the NPU-level dependency is explicit rather than a host
+      wall.
+  With (a)+(b)+(c) + the M6.1 plumbing already in place, the predicted
+  steady-state is ~25-30 fps (CP=22 ms and Talker=17 ms per step would
+  overlap to ~22 ms/step = 45 fps idealized, minus the non-overlapping
+  host work and the prefill amortization).
+  **Files touched (Track E only)**: `tools/qwen_tts/cp_cann_symbols.{h,cpp}`
+  (+~18 lines; 5 event symbols), `tools/qwen_tts/talker_cann_engine.{h,cpp}`
+  (+~25 lines in header, +~10 in cpp; `primary_stream_`, `stream_b_`,
+  `set_stream/get_stream*`, dtor cleanup), `tools/qwen_tts/cp_cann_engine.{h,cpp}`
+  (same shape as Talker). Zero edits to `forward_decode`, `forward_prefill`,
+  `run_decode_ops_`, `forward_one_token`, `predict_code_groups`, or
+  `TalkerLLM::generate`. The `stream_` field is now a runtime-swappable
+  pointer to one of the two owned streams (primary default), which is
+  the only required behavioral change to every call site that already
+  reads `stream_` — none of those bodies had to change.
 
 ## 9. Parallelism playbook
 
