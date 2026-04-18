@@ -411,8 +411,38 @@ File: `tools/qwen_tts/talker_cann_engine.{h,cpp}` — mirrors `CpCannEngine`.
   Gate: smoke (init + has_nz() + default-path ASR-equivalent
   duration check). Commit 2b0a2998.
 - [ ] 5.3 Switch matmul calls to `*WeightNz` variants.
+  **Attempted 2026-04-18 via Track F**: the "tag weight descriptors with
+  `ACL_FORMAT_FRACTAL_NZ` and keep calling plain `aclnnMm`" route from
+  Track D's M5.2 §8 hypothesis does NOT work on CANN 8.3. Every matmul
+  call site in `TalkerCannEngine::run_decode_ops_` (Q/K/V/O/gate/up/down,
+  7 per layer × 28 layers = 196 calls/step) and
+  `CpCannEngine::build_persistent_tensors_` (same 7 × 5 layers = 35
+  calls/step) now routes the weight tensor through a `tensor_2d_fmt`
+  helper that stamps `ACL_FORMAT_FRACTAL_NZ` when `nz_applied()` is
+  true; activation / output tensors stay `ACL_FORMAT_ND`. Build is
+  clean. With `TALKER_NZ_WEIGHTS=1` set the matmul call sites receive
+  the NZ-format-tagged weight descriptor, but plain `aclnnMm` still
+  produces scrambled numerics — every ON run hits `max_tokens=250`
+  without natural EOS and ASR transcribes as "哎呀！" (utt1),
+  "嗯嗯嗯嗯嗯嗯嗯嗯嗯" (utt2), repeated "哎呀！" filler (utt3), and
+  "嘿嘿嘿嘿嘿嘿…" filler (long). OFF path unchanged: ASR 4/4 verbatim
+  on utt1/utt2/utt3/long, OFF long = 21.8 fps. See §8 2026-04-18 Track
+  F entry for the full analysis and the two open-ended options that
+  remain (wait for CANN release exposing `aclnnMmWeightNz`, OR swap
+  `aclnnMm` → `aclnnMatMul` which has different op affinity rules).
 - [ ] 5.4 **Quality gate**: DTW unchanged vs M4 baseline.
+  Cannot evaluate until M5.3 passes correctness. With NZ off the
+  default path matches M4 eager output bit-for-bit (unchanged from
+  M3.4 baseline); with NZ on the audio is garbage so DTW is moot.
 - [ ] 5.5 **Throughput gate**: +15% matmul throughput measurable.
+  On the long utterance (74 frames natural EOS on the canonical
+  "Speech synthesis on neural processing units…" text, seed=42,
+  cp_groups=8), NZ-on hits a 250-frame cap at ~23.5 fps while NZ-off
+  hits 21.8 fps on the natural 74-frame run. The +~8% fps number is
+  misleading because NZ-on doesn't EOS naturally and steady-state
+  matmul-dominated throughput at later positions is higher (larger
+  KV cache → non-matmul cost shrinks relative to matmul). The M5.5
+  gate cannot be credibly scored until M5.3 produces correct audio.
 
 ### M6 — Multi-stream pipelining (1 week) — PARALLEL after M3
 
@@ -781,6 +811,86 @@ carrying a silent false claim.
   `tools/qwen_tts/test_prefill_diff.cpp` (real-input mode + scale
   sweep), `tools/qwen_tts/test_mm_diff.cpp` (real-dim enlargement),
   `tools/qwen_tts/CMakeLists.txt` (two new test-target entries).
+- **2026-04-18 Track F (M5.3 attempt — FRACTAL_NZ descriptor tagging fails
+  on CANN 8.3)**: Implemented the open-option (b) from Track D's M5.2 §8
+  entry — at every matmul call site, when `nz_applied()` is true, build
+  the weight `aclTensor` with `aclFormat = ACL_FORMAT_FRACTAL_NZ` (value
+  29) instead of `ACL_FORMAT_ND` (value 2). Activation tensors + output
+  tensors stay ND. Added a `tensor_2d_fmt(buf, d0, d1, dtype, fmt)` helper
+  in both `talker_cann_engine.cpp` and `cp_cann_engine.cpp` and wired it
+  into:
+  - `TalkerCannEngine::run_decode_ops_` — Q/K/V projections (line ~842),
+    O projection (line ~1000), gate/up/down FFN projections (line ~1045).
+    Matmul **call sites** in `forward_decode` all go through this helper.
+    `forward_prefill` body was explicitly NOT touched (Track A-prime
+    ownership per the task brief).
+  - `CpCannEngine::build_persistent_tensors_` — Q/K/V/O/gate/up/down
+    weight descriptors are built with `wfmt = nz_applied_ ?
+    ACL_FORMAT_FRACTAL_NZ : ACL_FORMAT_ND`. `forward_one_token` uses
+    these persistent handles directly (no per-call descriptor rebuild),
+    so stamping them at build time covers every matmul call site.
+  **Experiment result (canonical ellen_ref, seed=42, cp_groups=8,
+  max_tokens=250)**: the format-tag flip alone does NOT make plain
+  `aclnnMm` dispatch an NZ-aware kernel on CANN 8.3. NZ-on runs consume
+  the NZ-laid-out weight buffer as if it were still row-major, producing
+  scrambled numerics:
+  - ASR diff (targets vs transcripts, NZ **off** = baseline, NZ **on** =
+    `TALKER_NZ_WEIGHTS=1`):
+    - utt1: target "Good morning, how are you today." — OFF: "Good
+      morning. How are you today?" (edit-dist 2); ON: "哎呀！" (filler,
+      fail)
+    - utt2: target "The sun is shining brightly this afternoon." —
+      OFF: verbatim; ON: "嗯嗯嗯嗯嗯嗯嗯嗯嗯" (filler, fail)
+    - utt3: target "Please remember to turn off the lights." — OFF:
+      verbatim; ON: "哎呀！" × ~1000 repetitions (filler, fail)
+    - long: target "Speech synthesis on neural processing units is a
+      compelling application of modern deep learning." — OFF: verbatim;
+      ON: "嘿嘿嘿嘿…" (filler, fail)
+  - fps delta (long utterance, only meaningful comparison since NZ-on
+    never natural-EOS'd on any run): OFF = 21.8 fps on the natural 74-
+    frame run; ON = 23.5 fps on the 250-frame (capped) run. The +7.8%
+    isn't a clean throughput win because the two runs don't sample the
+    same steady state — OFF EOS'd at frame 74 where prefill + early
+    steps still dominate, ON ran 3.4× longer in matmul-only territory
+    where the per-step cost is lower regardless of kernel choice.
+    Correctness gate is what matters: ON fails.
+  **Interpretation**: `aclnnTransMatmulWeight` does really rewrite the
+  buffer in place (confirmed by M5.2's original observation: tagging
+  the transformed buffer as ND produces the same garbage we see now
+  when tagging as NZ, because `aclnnMm` on 8.3 appears to follow one
+  fixed layout convention regardless of the `aclFormat` hint passed in
+  the tensor descriptor). The op dispatcher simply does not branch on
+  the format field for the plain Mm family in this toolkit version.
+  This rules out the Track D §8 "option (b)" path for CANN 8.3 with
+  `aclnnMm`.
+  **M5.3 / M5.4 / M5.5 all remain `[ ]`.** M5.3 needs one of:
+  - (a) A future CANN release that ships `aclnnMmWeightNz` (or
+    equivalent) in `$ASCEND_TOOLKIT_HOME/include/aclnnop/`. As of
+    CANN 8.3.RC1 there is no such header (Track D audit confirmed).
+  - (b) Swap `aclnnMm` → `aclnnMatMul` and retry the descriptor-tag
+    trick. `aclnnMatMul` has a different affinity path in some
+    toolkit versions; worth one experiment but not a guaranteed fix.
+  - (c) Implement a manual pre-convert that shapes the data into a
+    `[N/16, M/16, 16, 16]` 4-D contiguous buffer and call the (absent)
+    NZ-aware matmul op when it becomes available. Dead end until
+    (a) lands.
+  **Files touched (Track F only)**: `tools/qwen_tts/
+  talker_cann_engine.cpp` (no diff vs 5fcd1445 — Track A's M2.5 commit
+  already bundled the `tensor_2d_fmt` helper + the per-site NZ tagging
+  at the same shape Track F needed, so the Track F work on Talker was
+  a no-op against HEAD); `tools/qwen_tts/cp_cann_engine.cpp` (+31 / -9;
+  `tensor_2d_fmt` helper + `make_tensor` format-param default + M5.3
+  tagging of persistent per-layer weight descriptors in
+  `build_persistent_tensors_`). Zero edits to `forward_decode`,
+  `forward_prefill`, `run_decode_ops_`, `forward_one_token`, or
+  `CMakeLists.txt`.
+  **Verified-by**: (a) build clean on Ascend 910B4 CANN 8.3.RC1
+  (`cmake --build . --target qwen_tts -j 8`, pre-existing unused-var
+  warnings only); (b) OFF wavs at `/tmp/m53_off/{utt1,utt2,utt3,long}.wav`
+  on Ascend, natural-EOS durations 2.16/3.12/2.40/5.92 s, ASR 4/4
+  verbatim (edit-dist 2 on utt1 for punctuation only); (c) ON wavs at
+  `/tmp/m53_on/{utt1,utt2,utt3,long}.wav`, every run hits max_tokens,
+  ASR all garbage. Gate: ASR content — M5.3 correctness FAIL.
 
 ## 9. Parallelism playbook
 

@@ -82,7 +82,8 @@ static aclScalar *make_f16_scalar(float value) {
 
 static aclTensor *make_tensor(void *buf, int64_t rank,
                               const int64_t *shape, const int64_t *strides,
-                              aclDataType dtype) {
+                              aclDataType dtype,
+                              aclFormat fmt = ACL_FORMAT_ND) {
     int64_t storage_len = 0;
     if (rank > 0) {
         int64_t n = 1;
@@ -90,7 +91,7 @@ static aclTensor *make_tensor(void *buf, int64_t rank,
         storage_len = n;
     }
     return g_cann.aclCreateTensor(shape, rank, dtype, strides, 0,
-                                   ACL_FORMAT_ND, &storage_len, 1, buf);
+                                   fmt, &storage_len, 1, buf);
 }
 
 static aclTensor *tensor_1d(void *buf, int64_t n,
@@ -105,6 +106,17 @@ static aclTensor *tensor_2d(void *buf, int64_t d0, int64_t d1,
     int64_t shape[2]   = {d0, d1};
     int64_t strides[2] = {d1, 1};
     return make_tensor(buf, 2, shape, strides, dtype);
+}
+
+// M5.3 — build a [d0, d1] weight tensor with the caller-selected aclFormat.
+// Use ACL_FORMAT_FRACTAL_NZ for buffers that have already been converted in
+// place via aclnnTransMatmulWeight so plain aclnnMm dispatches the NZ kernel
+// path; pass ACL_FORMAT_ND (or call plain tensor_2d) for activation tensors.
+static aclTensor *tensor_2d_fmt(void *buf, int64_t d0, int64_t d1,
+                                 aclDataType dtype, aclFormat fmt) {
+    int64_t shape[2]   = {d0, d1};
+    int64_t strides[2] = {d1, 1};
+    return make_tensor(buf, 2, shape, strides, dtype, fmt);
 }
 
 static aclTensor *tensor_strided(void *buf, int64_t rank,
@@ -301,20 +313,30 @@ void CpCannEngine::build_persistent_tensors_() {
                                        ACL_FLOAT);
     t_.normed_f32_flat    = tensor_1d(normed_f32_dev_, cp_hidden_, ACL_FLOAT);
 
+    // M5.3 — once aclnnTransMatmulWeight has refreshed each F16 matmul weight
+    // buffer to the NZ layout, tag the persistent weight descriptors with
+    // ACL_FORMAT_FRACTAL_NZ so plain aclnnMm picks the NZ kernel. Activation
+    // descriptors (normed_col / q_col / gate_col / ...) stay ND.
+    const aclFormat wfmt = nz_applied_ ? ACL_FORMAT_FRACTAL_NZ
+                                       : ACL_FORMAT_ND;
+    if (nz_applied_) {
+        printf("[cp_cann] matmul call sites tag weights with "
+               "ACL_FORMAT_FRACTAL_NZ (M5.3)\n");
+    }
     t_.layer.resize(n_layers_);
     for (int il = 0; il < n_layers_; ++il) {
         auto &lw = layer_w_[il];
         auto &lt = t_.layer[il];
-        lt.q_proj    = tensor_2d(lw.q_proj_w,    q_dim_,     cp_hidden_);
-        lt.k_proj    = tensor_2d(lw.k_proj_w,    kv_dim_,    cp_hidden_);
-        lt.v_proj    = tensor_2d(lw.v_proj_w,    kv_dim_,    cp_hidden_);
-        lt.o_proj    = tensor_2d(lw.o_proj_w,    cp_hidden_, q_dim_);
+        lt.q_proj    = tensor_2d_fmt(lw.q_proj_w,    q_dim_,     cp_hidden_, ACL_FLOAT16, wfmt);
+        lt.k_proj    = tensor_2d_fmt(lw.k_proj_w,    kv_dim_,    cp_hidden_, ACL_FLOAT16, wfmt);
+        lt.v_proj    = tensor_2d_fmt(lw.v_proj_w,    kv_dim_,    cp_hidden_, ACL_FLOAT16, wfmt);
+        lt.o_proj    = tensor_2d_fmt(lw.o_proj_w,    cp_hidden_, q_dim_,     ACL_FLOAT16, wfmt);
         // Norms kept F32 to match GGUF storage + aclnnRmsNorm SupportInfo[0].
         lt.q_norm    = tensor_1d(lw.q_norm_w,    head_dim_,  ACL_FLOAT);
         lt.k_norm    = tensor_1d(lw.k_norm_w,    head_dim_,  ACL_FLOAT);
-        lt.gate_proj = tensor_2d(lw.gate_proj_w, inter_,     cp_hidden_);
-        lt.up_proj   = tensor_2d(lw.up_proj_w,   inter_,     cp_hidden_);
-        lt.down_proj = tensor_2d(lw.down_proj_w, cp_hidden_, inter_);
+        lt.gate_proj = tensor_2d_fmt(lw.gate_proj_w, inter_,     cp_hidden_, ACL_FLOAT16, wfmt);
+        lt.up_proj   = tensor_2d_fmt(lw.up_proj_w,   inter_,     cp_hidden_, ACL_FLOAT16, wfmt);
+        lt.down_proj = tensor_2d_fmt(lw.down_proj_w, cp_hidden_, inter_,     ACL_FLOAT16, wfmt);
         lt.input_ln  = tensor_1d(lw.input_ln_w,  cp_hidden_, ACL_FLOAT);
         lt.post_ln   = tensor_1d(lw.post_ln_w,   cp_hidden_, ACL_FLOAT);
     }
