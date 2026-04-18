@@ -60,6 +60,26 @@ public:
     void forward_one_token(const float *input_talker_space, int pos,
                            float *hidden_out);
 
+    // ---- M6.2 async split of forward_one_token ----------------------------
+    // `_launch` uploads input and queues every CP op on `stream_` without
+    // syncing and without doing the final D2H. An optional `wait_event`
+    // (e.g. Talker's decode_done_event) is waited on by `stream_` before the
+    // first queued op. After queuing, records `forward_done_event_` on
+    // `stream_`.
+    //
+    // `_fetch` syncs the recorded event and downloads the F32 cp_hidden
+    // state to the host.
+    //
+    // The original `forward_one_token` is now `{ launch; fetch; }` for
+    // callers that don't want async.
+    void forward_one_token_launch(const float *input_talker_space, int pos,
+                                   aclrtEvent wait_event = nullptr);
+    void forward_one_token_fetch(float *hidden_out);
+
+    // Accessor for the event last recorded by `_launch` — lets an external
+    // orchestrator wait on CP's completion from a different stream.
+    aclrtEvent get_forward_done_event() const { return forward_done_event_; }
+
     // Reset KV cache for a new frame
     void reset_kv_cache();
 
@@ -114,6 +134,10 @@ private:
     aclrtStream stream_         = nullptr;
     aclrtStream primary_stream_ = nullptr;  // owned
     aclrtStream stream_b_       = nullptr;  // owned; used for M6 overlap
+
+    // ---- M6.2 async completion event --------------------------------------
+    // Recorded on `stream_` at the end of `forward_one_token_launch`.
+    aclrtEvent  forward_done_event_ = nullptr;  // owned
 
     // Model dimensions (cached from config)
     int talker_hidden_ = 0;  // 2048

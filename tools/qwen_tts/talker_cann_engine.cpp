@@ -301,6 +301,12 @@ TalkerCannEngine::~TalkerCannEngine() {
         one_scalar_f16_ = nullptr;
     }
 
+    // M6.2: destroy the decode-done event before the streams.
+    if (decode_done_event_ && g_cann.aclrtDestroyEvent) {
+        g_cann.aclrtDestroyEvent(decode_done_event_);
+        decode_done_event_ = nullptr;
+    }
+
     // stream_ may either be pointing at primary_stream_ (default) or at some
     // externally-owned stream handed in via set_stream() — in either case we
     // only destroy the two streams this engine owns.
@@ -477,6 +483,10 @@ bool TalkerCannEngine::init_from_gguf(const std::string &gguf_path,
     // pipeline two engines on two physical NPU streams can grab this via
     // get_stream_b() and hand it to the other engine's set_stream().
     ACL_CHECK_RET(g_cann.aclrtCreateStream(&stream_b_));
+    // M6.2: reusable event recorded at the end of forward_decode_launch.
+    if (g_cann.aclrtCreateEvent) {
+        ACL_CHECK_RET(g_cann.aclrtCreateEvent(&decode_done_event_));
+    }
 
     // Cache dims from config.
     n_embd_     = cfg.hidden_size;
@@ -1126,14 +1136,33 @@ void TalkerCannEngine::run_decode_ops_(int pos) {
 // eagerly — useful for debugging or comparing bit-for-bit output.
 // ============================================================================
 
-void TalkerCannEngine::forward_decode(const float *input_embed, int pos,
-                                       float *hidden_out) {
+// M6.2: `_launch` queues every op for pos `pos` on `stream_` asynchronously,
+// records `decode_done_event_` on the stream, and returns without syncing /
+// without the final D2H of the F32 hidden state. Callers must call
+// `forward_decode_fetch` (or `aclrtStreamWaitEvent` on the event from a
+// different stream) before using the output.
+//
+// `wait_event`, if non-null, is fenced at the start of `stream_` so the first
+// queued op waits for that event to complete. This lets Talker[N+1]'s launch
+// depend on CP[N]'s final group completion without a host round-trip.
+void TalkerCannEngine::forward_decode_launch(const float *input_embed, int pos,
+                                              aclrtEvent wait_event) {
     assert(ready_);
     assert(pos >= 0 && pos < MAX_SEQ);
 
-    // 1. Upload F32 input embedding (staging only — the F32->F16 Cast is the
-    //    first op inside run_decode_ops_ and therefore captured into the
-    //    graph). This H2D is synchronous and always runs outside capture.
+    // Optional cross-stream fence: make `stream_` wait for `wait_event` before
+    // issuing the first op below.
+    if (wait_event && g_cann.aclrtStreamWaitEvent) {
+        ACL_CHECK_RET(g_cann.aclrtStreamWaitEvent(stream_, wait_event));
+    }
+
+    // 1. Upload F32 input embedding. The runtime serializes this H2D behind
+    //    any in-flight work on `stream_` that happens to target the same
+    //    buffer, but we issue it as a blocking host->device memcpy (matches
+    //    the pre-split behaviour). The subsequent Cast op inside
+    //    run_decode_ops_ is what reads the staging buffer on `stream_`, so
+    //    no host-side barrier is needed beyond the one aclrtMemcpy already
+    //    provides.
     ACL_CHECK_RET(g_cann.aclrtMemcpy(
         input_stage_f32_dev_, (size_t)n_embd_ * sizeof(float),
         input_embed,          (size_t)n_embd_ * sizeof(float),
@@ -1144,8 +1173,6 @@ void TalkerCannEngine::forward_decode(const float *input_embed, int pos,
     bool replayed = false;
     if (graph_enabled_ && pos < (int)decode_graphs_.size() &&
         decode_graphs_[pos] != nullptr) {
-        // Replay path — captured graph encodes every kernel launch for this
-        // pos's decode step, including the initial Cast and final Cast.
         aclError err = g_cann.aclmdlRIExecuteAsync(decode_graphs_[pos], stream_);
         if (err != 0) {
             fprintf(stderr,
@@ -1153,8 +1180,6 @@ void TalkerCannEngine::forward_decode(const float *input_embed, int pos,
                     pos, err,
                     g_cann.aclGetRecentErrMsg
                         ? g_cann.aclGetRecentErrMsg() : "<n/a>");
-            // Drop the bad graph and fall back to eager for this call + all
-            // future calls at this pos.
             g_cann.aclmdlRIDestroy(decode_graphs_[pos]);
             decode_graphs_[pos] = nullptr;
         } else {
@@ -1163,25 +1188,17 @@ void TalkerCannEngine::forward_decode(const float *input_embed, int pos,
     }
 
     if (!replayed) {
-        // Eager execution (first call at this pos, or graph disabled / failed).
         run_decode_ops_(pos);
 
-        // If graphs are enabled and this slot is empty, capture now. Note the
-        // pre-warm above already grew workspace_dev_ to cover every op, so the
-        // capture block below issues zero device allocations — a hard
-        // requirement for aclmdlRICaptureBegin/End.
         if (graph_enabled_ && pos < (int)decode_graphs_.size() &&
             decode_graphs_[pos] == nullptr) {
-            // Synchronize before capture to be sure no in-flight work from
-            // the pre-warm lingers on the stream. The runtime requires the
-            // stream to be empty when CaptureBegin is called.
+            // Capture requires an empty stream — sync first, then re-issue
+            // the ops under a capture window. Graph capture is incompatible
+            // with the async launch/fetch split because the fetch-side sync
+            // would land inside the capture window; we disable it whenever
+            // graph_enabled_ is already OFF (the default in production).
             ACL_CHECK_RET(g_cann.aclrtSynchronizeStream(stream_));
 
-            // Use THREAD_LOCAL capture mode so unrelated streams (e.g., the
-            // CP engine running on its own stream) aren't affected by the
-            // capture window. GLOBAL mode was observed to serialize the CP
-            // stream's work while the Talker capture was open, roughly
-            // doubling end-to-end wall time.
             aclError beg_err = g_cann.aclmdlRICaptureBegin(
                 stream_, ACL_MODEL_RI_CAPTURE_MODE_THREAD_LOCAL);
             if (beg_err != 0) {
@@ -1193,13 +1210,7 @@ void TalkerCannEngine::forward_decode(const float *input_embed, int pos,
                             ? g_cann.aclGetRecentErrMsg() : "<n/a>");
                 graph_enabled_ = false;
             } else {
-                // Replay the same op sequence; these kernel launches go onto
-                // the stream and are recorded into the graph rather than
-                // executed. The GetWorkspaceSize calls are host-side and
-                // don't need to be captured (workspace is already allocated
-                // from the pre-warm run, so no malloc fires).
                 run_decode_ops_(pos);
-
                 aclmdlRI g = nullptr;
                 aclError end_err = g_cann.aclmdlRICaptureEnd(stream_, &g);
                 if (end_err != 0 || g == nullptr) {
@@ -1212,25 +1223,47 @@ void TalkerCannEngine::forward_decode(const float *input_embed, int pos,
                     if (g) g_cann.aclmdlRIDestroy(g);
                 } else {
                     decode_graphs_[pos] = g;
-                    // The op sequence also ran eagerly as part of capture
-                    // (ggml-cann pattern), so output_stage_f32_dev_ is now
-                    // up-to-date with this pos's result — no need to rerun.
                 }
             }
         }
     }
 
-    // 3. Sync + D2H download of the F32 hidden output (eager — memcpy is not
-    //    captured, same pattern ggml-cann uses for graph outputs).
-    ACL_CHECK_RET(g_cann.aclrtSynchronizeStream(stream_));
+    // 3. Record event so `forward_decode_fetch` (or another stream via
+    //    aclrtStreamWaitEvent) can fence against decode completion. If the
+    //    runtime lacks the event API, callers will fall back to sync-stream
+    //    inside `_fetch`.
+    if (decode_done_event_ && g_cann.aclrtRecordEvent) {
+        ACL_CHECK_RET(g_cann.aclrtRecordEvent(decode_done_event_, stream_));
+    }
+
+    // Advance cache length (caller doesn't track per-token position, but we
+    // expose `reset_kv_cache` so stateful callers can reset between
+    // utterances).
+    if (pos + 1 > kv_cache_len_) kv_cache_len_ = pos + 1;
+}
+
+void TalkerCannEngine::forward_decode_fetch(float *hidden_out) {
+    assert(ready_);
+
+    // Wait for the decode to finish. Prefer event sync (cheaper on some
+    // CANN versions; doesn't serialize the entire stream); fall back to
+    // stream sync if the event API wasn't resolved.
+    if (decode_done_event_ && g_cann.aclrtSynchronizeEvent) {
+        ACL_CHECK_RET(g_cann.aclrtSynchronizeEvent(decode_done_event_));
+    } else {
+        ACL_CHECK_RET(g_cann.aclrtSynchronizeStream(stream_));
+    }
+
     ACL_CHECK_RET(g_cann.aclrtMemcpy(
         hidden_out, (size_t)n_embd_ * sizeof(float),
         output_stage_f32_dev_, (size_t)n_embd_ * sizeof(float),
         ACL_MEMCPY_DEVICE_TO_HOST));
+}
 
-    // Advance cache length (caller doesn't track per-token position, but we
-    // expose `reset_kv_cache` so stateful callers can reset between utterances).
-    if (pos + 1 > kv_cache_len_) kv_cache_len_ = pos + 1;
+void TalkerCannEngine::forward_decode(const float *input_embed, int pos,
+                                       float *hidden_out) {
+    forward_decode_launch(input_embed, pos, nullptr);
+    forward_decode_fetch(hidden_out);
 }
 
 // ============================================================================

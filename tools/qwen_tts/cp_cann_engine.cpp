@@ -187,6 +187,12 @@ CpCannEngine::~CpCannEngine() {
     if (attn_scale_f16_) { g_cann.aclDestroyScalar(attn_scale_f16_); attn_scale_f16_ = nullptr; }
     if (one_scalar_)     { g_cann.aclDestroyScalar(one_scalar_);     one_scalar_     = nullptr; }
 
+    // M6.2: destroy the forward-done event before the streams.
+    if (forward_done_event_ && g_cann.aclrtDestroyEvent) {
+        g_cann.aclrtDestroyEvent(forward_done_event_);
+        forward_done_event_ = nullptr;
+    }
+
     // stream_ may be pointing at primary_stream_ (default) or at some
     // externally-owned stream handed in via set_stream() — only destroy the
     // two streams this engine owns.
@@ -539,6 +545,10 @@ bool CpCannEngine::init_from_safetensors(const std::string &path,
     ACL_CHECK_RET(g_cann.aclrtCreateStream(&primary_stream_));
     stream_ = primary_stream_;
     ACL_CHECK_RET(g_cann.aclrtCreateStream(&stream_b_));
+    // M6.2: reusable event recorded at the end of forward_one_token_launch.
+    if (g_cann.aclrtCreateEvent && !forward_done_event_) {
+        ACL_CHECK_RET(g_cann.aclrtCreateEvent(&forward_done_event_));
+    }
 
     // Helper: load one tensor by name, convert BF16 → F16 on host, upload.
     auto load_one_f16 = [&](const std::string &name, void *&dev,
@@ -759,6 +769,10 @@ bool CpCannEngine::init(const CpWeightsF32 &w, const CodePredictorConfig &cfg,
     ACL_CHECK_RET(g_cann.aclrtCreateStream(&primary_stream_));
     stream_ = primary_stream_;
     ACL_CHECK_RET(g_cann.aclrtCreateStream(&stream_b_));
+    // M6.2: reusable event recorded at the end of forward_one_token_launch.
+    if (g_cann.aclrtCreateEvent && !forward_done_event_) {
+        ACL_CHECK_RET(g_cann.aclrtCreateEvent(&forward_done_event_));
+    }
 
     talker_hidden_ = cfg.talker_hidden_size;
     cp_hidden_     = cfg.hidden_size;
@@ -942,9 +956,17 @@ void CpCannEngine::reset_kv_cache() {
 // forward_one_token — F16 end-to-end with F32 staging at the boundaries.
 // ============================================================================
 
-void CpCannEngine::forward_one_token(const float *input_talker_space,
-                                      int pos, float *hidden_out) {
+// M6.2: launch path queues every op for position `pos` on `stream_` and
+// returns without syncing or D2H. Records `forward_done_event_` so callers
+// can fence from another stream (Talker[N+1] waiting on CP[N] final group).
+void CpCannEngine::forward_one_token_launch(const float *input_talker_space,
+                                             int pos,
+                                             aclrtEvent wait_event) {
     assert(ready_);
+
+    if (wait_event && g_cann.aclrtStreamWaitEvent) {
+        ACL_CHECK_RET(g_cann.aclrtStreamWaitEvent(stream_, wait_event));
+    }
 
     // 1. Upload F32 input embedding to f32 stage buffer.
     ACL_CHECK_RET(g_cann.aclrtMemcpy(
@@ -1190,14 +1212,34 @@ void CpCannEngine::forward_one_token(const float *input_talker_space,
     CANN_OP(RmsNorm, t_.cur_row, t_.final_norm, (double)eps_,
             t_.normed_row, t_.rstd_11);
 
-    // Cast F16 hidden -> F32 staging, then download to host.
+    // Cast F16 hidden -> F32 staging (queued async; D2H + sync moved to _fetch).
     CANN_OP(Cast, t_.output_f16, ACL_FLOAT, t_.output_f32);
-    ACL_CHECK_RET(g_cann.aclrtSynchronizeStream(stream_));
+
+    // Record event so `forward_one_token_fetch` (or another stream via
+    // aclrtStreamWaitEvent) can fence against forward completion.
+    if (forward_done_event_ && g_cann.aclrtRecordEvent) {
+        ACL_CHECK_RET(g_cann.aclrtRecordEvent(forward_done_event_, stream_));
+    }
+
+    g_cann.aclDestroyTensor(t_cos);
+    g_cann.aclDestroyTensor(t_sin);
+}
+
+void CpCannEngine::forward_one_token_fetch(float *hidden_out) {
+    assert(ready_);
+    if (forward_done_event_ && g_cann.aclrtSynchronizeEvent) {
+        ACL_CHECK_RET(g_cann.aclrtSynchronizeEvent(forward_done_event_));
+    } else {
+        ACL_CHECK_RET(g_cann.aclrtSynchronizeStream(stream_));
+    }
     ACL_CHECK_RET(g_cann.aclrtMemcpy(
         hidden_out, cp_hidden_ * sizeof(float),
         output_stage_f32_dev_, cp_hidden_ * sizeof(float),
         ACL_MEMCPY_DEVICE_TO_HOST));
+}
 
-    g_cann.aclDestroyTensor(t_cos);
-    g_cann.aclDestroyTensor(t_sin);
+void CpCannEngine::forward_one_token(const float *input_talker_space,
+                                      int pos, float *hidden_out) {
+    forward_one_token_launch(input_talker_space, pos, nullptr);
+    forward_one_token_fetch(hidden_out);
 }

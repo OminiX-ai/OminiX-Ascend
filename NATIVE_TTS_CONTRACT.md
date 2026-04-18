@@ -476,27 +476,44 @@ File: `tools/qwen_tts/talker_cann_engine.{h,cpp}` — mirrors `CpCannEngine`.
   throughput or audio content. Gate = smoke.
 - [~] 6.2 Parallelize Talker decode (stream A) with CP decode of previous
   frame (stream B). Use `aclrtStreamWaitEvent` for sync.
-  **Blocked by the CP-body edit restriction** in the Track-E scope (file
-  ownership limited `cp_cann_engine.cpp` to adding `stream_b_` /
-  `set_stream` / `get_stream` only — forward body untouchable). The
-  contract-described provisional-embedding trick requires either
-  (a) splitting `TalkerCannEngine::forward_decode` so the F32 input
-  upload + Cast is separable from the rest of `run_decode_ops_`, so a
-  host-side "add-CP-delta-into-input_stage_f32_dev_" can be inserted
-  between the two phases, OR (b) making `CpCannEngine::forward_one_token`
-  non-blocking (remove the trailing `aclrtSynchronizeStream` +
-  `aclrtMemcpy D2H`) and exposing a separate finish/event API so the
-  host can queue all 15 CP groups' launches asynchronously. Both changes
-  edit bodies that Track E is not allowed to touch. The host-level code
-  in `talker.cpp` currently serializes: `sample → predict_code_groups
-  (blocks host on every group's D2H) → compute_next_embedding →
-  forward_decode`, and even with two independent streams at the engine
-  level, CP's per-group host syncs leave no window for Talker[N+1]
-  launch to overlap with CP[N]. Throughput on the canonical long
-  utterance stays at 14.3 fps (matches pre-M6.1 baseline of 14.5 fps).
-  **Decision**: M6.1 plumbing stays (zero-risk, enables future M6.3+
-  work), M6.2 marked `[~]` with the fps shortfall recorded here. Full
-  §8 note appended below.
+  **Partial — engine-level async launch/fetch split landed under Track G;
+  orchestrator-level pipelining still serial.** Track G (2026-04-19) split
+  both `TalkerCannEngine::forward_decode` and `CpCannEngine::forward_one_token`
+  into `_launch`+`_fetch` halves, added reusable `aclrtEvent` members
+  (`decode_done_event_`, `forward_done_event_`) recorded on the engine's
+  `stream_` at the tail of each launch, and exposed
+  `get_decode_done_event()` / `get_forward_done_event()` plus optional
+  `wait_event` parameters so two engines on different streams can fence
+  cross-stream without host round-trips. The original wrappers
+  (`forward_decode`, `forward_one_token`) now call `{launch; fetch;}` and
+  remain bit-identical for the current single-stream caller. Long-utterance
+  steady-state holds at **22.3 fps** (avg of 22.4/21.9/22.5 across three
+  runs; within noise of pre-split baseline 23.1 fps and the M2.5 stamp's
+  23.2 fps — the refactor is a no-op in the absence of an orchestrator
+  that actually interleaves launches). ASR 4/4 on utt1/utt2/utt3 + the long
+  tech sentence (edit-distance ≤ 1 per utt, details in §8 Track G note).
+  **What Track G explicitly did NOT land**: the host-level orchestrator
+  rewrite in `TalkerLLM::generate` that would redirect the CP engine onto
+  `stream_b_`, launch Talker[N+1] with a provisional `codec_embed(g0)`
+  embedding on stream A while CP[N] runs on stream B, and later patch the
+  group-1..15 delta into Talker's F16 residual via a new device-side
+  F32-add entry point on the Talker engine. That remaining work is
+  structurally correct but requires both (a) a new `add_input_delta`
+  hook on the Talker engine AND (b) enough measurement iterations on the
+  Ascend server to verify ASR/DTW doesn't regress across all five canonical
+  utterances. Track G landed the engine-level infrastructure so a
+  follow-up track (call it G-prime) can implement the provisional-embedding
+  orchestrator without re-touching the engine bodies. The 22 fps gate is
+  NOT met by this track; the projected 27-30 fps target from the
+  provisional-embedding path remains achievable with that follow-up.
+  **Verified-by:** (a) Track G engine-level split + event fences in commit
+  SHA pending (`tools/qwen_tts/{talker,cp}_cann_engine.{h,cpp}`);
+  (b) long-utt fps runs /tmp/m62_split.wav + two re-runs on the Ascend
+  server, measured 22.4/21.9/22.5 fps at cp_groups=8 seed=42 max_tokens=250;
+  (c) ASR gate via local mlx-whisper on four pulled wavs —
+  /tmp/m62_split_v2.wav (long) transcribed verbatim,
+  /tmp/m62_utt{1,2,3}.wav edit-distance ≤ 1 vs targets. Gate = ASR PASS
+  4/4, fps partial (22.3 vs 28 target → `[~]`).
 - [ ] 6.3 Pipeline encoder + tokenizer encoder in prefill path (already
   parallel via threads; move to NPU streams).
 - [ ] 6.4 Overlap codec decoder chunks with Talker/CP generation.
@@ -891,6 +908,96 @@ carrying a silent false claim.
   verbatim (edit-dist 2 on utt1 for punctuation only); (c) ON wavs at
   `/tmp/m53_on/{utt1,utt2,utt3,long}.wav`, every run hits max_tokens,
   ASR all garbage. Gate: ASR content — M5.3 correctness FAIL.
+- **2026-04-19 Track G (M6.2 partial — engine-level async split landed,
+  orchestrator pipelining deferred)**: Re-measured the long-utterance
+  baseline under the current HEAD and found the "14.3 fps" number cited
+  in Track E's §8 entry was stale (it predated the M2.5 batched-prefill
+  revert); with M2.5 + M6.1 in place the actual baseline is 23.1 fps at
+  seed=42, cp_groups=8, max_tokens=250 on the canonical "Speech synthesis
+  on neural processing units…" sentence (74 natural-EOS frames, 3.20 s
+  generate loop). Per-step timing breakdown: Talker decode 16.7 ms, CP
+  decode 23.4 ms, head/sample/emb ~2 ms — roughly serial on one stream
+  as expected.
+  **What landed**: asynchronous launch/fetch split for both engines.
+  `TalkerCannEngine` now exposes `forward_decode_launch(input_embed, pos,
+  wait_event=nullptr)` + `forward_decode_fetch(hidden_out)`;
+  `CpCannEngine` exposes the matching `forward_one_token_launch/_fetch`
+  pair. Each launch method uploads the F32 input, queues every compute
+  op on `stream_` without syncing and without D2H, optionally fences
+  against an externally-supplied `wait_event` at the front (via
+  `aclrtStreamWaitEvent`), and records an internal `aclrtEvent` at the
+  tail so a fetch (or another stream) can fence against completion. The
+  corresponding engines own a reusable `decode_done_event_` /
+  `forward_done_event_` allocated in init and destroyed in the dtor; two
+  new accessors `get_decode_done_event()` / `get_forward_done_event()`
+  let an orchestrator fence across streams without host round-trips.
+  The original entry points (`forward_decode`, `forward_one_token`) are
+  now `{launch; fetch;}` wrappers so every existing caller (prefill's
+  iterative fallback, `TalkerLLM::predict_code_groups`, `generate`) stays
+  bit-identical in behaviour.
+  **Why the orchestrator rewrite didn't land in this track**: the
+  correct pipelined loop requires launching Talker[N+1] with a
+  **provisional** input embedding `codec_embed_talker[g0[N]] + trailing`
+  (i.e., sum of just the group-0 codec embedding, not all 16) on
+  stream A while CP[N] is still running groups 1..15 on stream B; when
+  CP[N]'s final group lands, the host has to patch the delta
+  `sum_{g=1..15}(codec_embed_cp[g][token_g])` into Talker's already-
+  queued input. The queue ordering for this correction has two valid
+  shapes — (i) a new device-side `TalkerCannEngine::add_input_delta`
+  hook that casts F32→F16 and in-place-adds into `cur_dev_` before
+  `run_decode_ops_` consumes it, or (ii) abandon the provisional and
+  fall back to k=1 straight-pipeline (Talker[N] || CP[N-1]) which
+  eliminates the drift concern but also eliminates the win because
+  Talker[N+1]'s input strictly depends on CP[N] completing. Shape (i)
+  is the right answer per §5 M6.2 but it needs enough measurement
+  iterations on the Ascend server to confirm ASR/DTW doesn't regress
+  across all five canonical utterances (the delta can only be added
+  *after* Talker's initial F32→F16 Cast, so the op graph has to be
+  split as `Cast → wait_event → InplaceAdd → run_decode_ops_[rest]`).
+  Track G landed the engine-level split and event plumbing so this
+  follow-up can be implemented purely in `TalkerLLM::generate`'s ICL
+  loop plus one new method on Talker — no re-touching of already-shipped
+  engine bodies.
+  **Measured post-Track-G** long-utt fps, seed=42, cp_groups=8,
+  max_tokens=250: 22.4 / 21.9 / 22.5 fps across three consecutive runs,
+  mean 22.3 fps. Pre-split baseline on the same build machine was
+  23.1 fps — the 0.8 fps delta is within run-to-run jitter (the refactor
+  adds one extra event-sync per step versus a stream-sync; both should
+  be on the order of microseconds but the wall-clock variance is ±1 fps
+  at this scale). ASR gate via local mlx-whisper on four pulled wavs:
+  utt1 → "Good morning, how are you today?" (target uses "." — edit-dist
+  1, punctuation), utt2 → "The sun is shining brightly this afternoon."
+  (verbatim), utt3 → "Please remember to turn off the light." (target
+  uses "lights." — edit-dist 1, singular/plural), long → "Speech
+  synthesis on neural processing units is a compelling application of
+  modern deep learning." (verbatim). All four pass the ≤2 edit-distance
+  gate. Artifacts: `/tmp/m62_{split,utt1,utt2,utt3}.wav` on Ascend;
+  pulled copies at `/tmp/m62_split_v2.wav` + `/tmp/m62_utt{1,2,3}.wav`
+  on the build machine.
+  **Files touched (Track G only)**:
+  `tools/qwen_tts/talker_cann_engine.h` (+~25 lines — `_launch`/`_fetch`
+  decls, `decode_done_event_` member, `get_decode_done_event()`),
+  `tools/qwen_tts/talker_cann_engine.cpp` (+~80 lines — event create/
+  destroy, `forward_decode_launch` split out of original body including
+  the graph capture/replay logic, `forward_decode_fetch` with event-sync
+  preference, `forward_decode` as wrapper), matching shape on
+  `cp_cann_engine.{h,cpp}`. Zero edits to `run_decode_ops_`,
+  `forward_prefill`, `build_persistent_tensors_`, `predict_code_groups`,
+  `TalkerLLM::generate`, `cp_cann_symbols.{h,cpp}`, or `main.cpp`.
+  **Follow-up track (G-prime) required to close M6.2 to `[x]`**:
+  (i) add `TalkerCannEngine::add_input_delta(float *delta_host)` that
+  uploads F32 delta on stream A and queues an InplaceAdd in F32 against
+  `input_stage_f32_dev_` — this only works if `forward_decode_launch`
+  is split one step further to "upload input, return" vs "run ops", so
+  the orchestrator can sandwich the delta between them; (ii) rewrite
+  the ICL loop at `talker.cpp:~1955` to
+  `sample g0 → launch Talker[N+1] provisional on stream A → launch CP[N]
+  on stream B → compute delta after CP fetch → add_input_delta → fetch
+  Talker[N+1]`; (iii) redirect CP engine onto `talker_engine->stream_b_`
+  at generate-start via `cp_engine->set_stream(...)` so the two streams
+  are distinct physical NPU streams. With those three landed, the
+  predicted steady-state is max(Talker=16.7, CP=23.4) ≈ 24 ms/step →
+  ~40 fps idealized, realistically 28-30 fps after host overhead.
 
 ## 9. Parallelism playbook
 

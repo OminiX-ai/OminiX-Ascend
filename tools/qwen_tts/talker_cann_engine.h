@@ -46,6 +46,25 @@ public:
     //   hidden_out:  [n_embd] F32 on HOST (post final RmsNorm)
     void forward_decode(const float *input_embed, int pos, float *hidden_out);
 
+    // ---- M6.2 async split of forward_decode -------------------------------
+    // `_launch` uploads the F32 input embedding and queues every kernel launch
+    // for the 28-layer decode path onto `stream_`, without syncing and without
+    // doing the final D2H of `output_stage_f32_dev_`. An optional `wait_event`
+    // is waited on by `stream_` before the first queued op — use this to make
+    // Talker[N+1]'s launch depend on CP[N]'s completion when pipelining on
+    // two streams. After queuing, it records `decode_done_event_` on
+    // `stream_` so another stream can fence against Talker's hidden output.
+    //
+    // `_fetch` syncs the recorded event and downloads the F32 hidden state to
+    // the host. It's safe to call `_fetch` from any thread once `_launch`
+    // returned; the event ordering is the only synchronization required.
+    //
+    // The original `forward_decode` is now `{ launch; fetch; }` internally
+    // so callers that don't want async get the same behaviour as before.
+    void forward_decode_launch(const float *input_embed, int pos,
+                                aclrtEvent wait_event = nullptr);
+    void forward_decode_fetch(float *hidden_out);
+
     // Batched prefill (S>1). Appends `seq_len` tokens to the KV cache
     // starting at `start_pos`. Only the LAST position's hidden state is
     // returned (TalkerLLM only needs that for next-token sampling).
@@ -94,6 +113,9 @@ public:
         stream_ = (s != nullptr) ? s : primary_stream_;
     }
 
+    // Accessor for the event last recorded by `forward_decode_launch`.
+    aclrtEvent get_decode_done_event() const { return decode_done_event_; }
+
     bool is_ready() const { return ready_; }
 
 private:
@@ -106,6 +128,14 @@ private:
     aclrtStream stream_         = nullptr;
     aclrtStream primary_stream_ = nullptr;  // owned
     aclrtStream stream_b_       = nullptr;  // owned; used for multi-stream overlap
+
+    // ---- M6.2 async decode event ------------------------------------------
+    // Recorded on `stream_` by `forward_decode_launch` after the final Cast
+    // op. `forward_decode_fetch` waits on this event before issuing the D2H
+    // copy. Other engines can also `aclrtStreamWaitEvent` on this handle to
+    // make their stream's next op depend on Talker's hidden output being
+    // ready, without round-tripping through the host.
+    aclrtEvent  decode_done_event_ = nullptr;  // owned
 
     // Model dimensions (cached from config)
     int n_embd_   = 0;   // 2048
