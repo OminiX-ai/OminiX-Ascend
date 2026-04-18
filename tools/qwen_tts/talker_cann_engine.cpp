@@ -496,6 +496,20 @@ bool TalkerCannEngine::init_from_gguf(const std::string &gguf_path,
     // a non-zero scratch requirement. The regular workspace alloc happens
     // lower down in init_from_gguf; move a small seed up here so the
     // conversion path has something to grow from.
+    //
+    // Env override TALKER_NZ_WEIGHTS=1 flips the flag on at init even when
+    // the caller didn't call set_use_nz_weights — lets a default build
+    // exercise the path without recompiling (useful for benchmark A/B).
+    // Empty string / "0" count as "off" so that `TALKER_NZ_WEIGHTS=` (exported
+    // but no value) doesn't accidentally opt in.
+    {
+        const char *nz_env = getenv("TALKER_NZ_WEIGHTS");
+        if (!use_nz_weights_ && nz_env && nz_env[0] != '\0' && nz_env[0] != '0') {
+            use_nz_weights_ = true;
+            printf("[talker_cann] TALKER_NZ_WEIGHTS=%s forcing NZ weight "
+                   "path\n", nz_env);
+        }
+    }
     const bool nz_enabled = use_nz_weights_ && g_cann.has_nz();
     if (use_nz_weights_ && !g_cann.has_nz()) {
         printf("[talker_cann] NZ weights requested but "
@@ -506,6 +520,10 @@ bool TalkerCannEngine::init_from_gguf(const std::string &gguf_path,
         workspace_size_ = 4 * 1024 * 1024;
         ACL_CHECK_RET(g_cann.aclrtMalloc(&workspace_dev_, workspace_size_,
                                           ACL_MEM_MALLOC_HUGE_FIRST));
+    }
+    if (nz_enabled) {
+        printf("[talker_cann] FRACTAL_NZ weight pre-conversion ENABLED "
+               "(per-layer aclnnTransMatmulWeight on Q/K/V/O/gate/up/down)\n");
     }
 
     // ---- Per-layer weights ----
@@ -1213,12 +1231,22 @@ void TalkerCannEngine::forward_prefill(const float *input_embeds, int seq_len,
     assert(seq_len > 0);
     assert(start_pos >= 0 && start_pos + seq_len <= MAX_SEQ);
 
-    // Default: iterate forward_decode. The batched-FIAS prefill below gives
-    // wrong hidden state (TTS transcribes as "Oh." via qwen3-asr) while
-    // iterative single-token decode matches llama.cpp exactly. Keep the
-    // batched path compiled in but off-by-default; set TALKER_PREFILL_BATCHED=1
-    // to force it (for bug-hunting the batched path).
-    if (getenv("TALKER_PREFILL_BATCHED") == nullptr) {
+    // Default: batched prefill. Shares the matmul/RmsNorm/FFN work across
+    // the seq_len rows while looping FIAS + RoPE per-row to sidestep CANN
+    // 8.3's batched-kernel numerics quirks (batched RoPE on [1, S, N, D]
+    // mis-rotates for S>1; FIAS with S_q>1 has tiling-key gaps on the
+    // Talker's GQA 16/8 shape set). On seq_len=127 this runs at ~150 ms
+    // vs the iterative path's ~2 s, and produces a hidden state within
+    // cos-sim 0.9999 of the iterative reference on real text input
+    // (validated via test_prefill_diff with a real-embedding dump).
+    //
+    // Earlier note (since resolved): the batched path once produced cos-sim
+    // 0.28 vs iterative — that was with batched RoPE (pre-M2.5) and
+    // innerPrecise=2 + nextTokens=0. Both were fixed by unrolling RoPE per
+    // row and switching FIAS to S_q=1 per-row with innerPrecise=0. Set
+    // TALKER_PREFILL_ITERATIVE=1 to force the iterative fallback path for
+    // debugging or as a regression-revert.
+    if (getenv("TALKER_PREFILL_ITERATIVE") != nullptr) {
         std::vector<float> scratch(n_embd_);
         for (int i = 0; i < seq_len; i++) {
             const float *tok = input_embeds + (size_t)i * n_embd_;

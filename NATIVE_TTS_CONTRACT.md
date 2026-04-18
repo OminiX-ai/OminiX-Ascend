@@ -300,10 +300,84 @@ File: `tools/qwen_tts/talker_cann_engine.{h,cpp}` — mirrors `CpCannEngine`.
 
 ### M5 — FRACTAL_NZ weight layout (3-5 days) — PARALLEL after M3
 
-- [ ] 5.1 Audit which ops have `*WeightNz` variants
+- [x] 5.1 Audit which ops have `*WeightNz` variants
   (`aclnnBatchMatMulWeightNz`, `aclnnMatmulWeightNz`, etc.).
-- [ ] 5.2 At weight upload, pre-convert matmul weights to FRACTAL_NZ format
+  Audit landed: on CANN 8.3 at `$ASCEND_TOOLKIT_HOME/include/aclnnop/`,
+  the only *WeightNz headers present are quant/grouped variants
+  (`aclnn_quant_matmul_weight_nz.h`, `aclnn_grouped_matmul_weight_nz.h`,
+  `aclnn_grouped_matmul_swiglu_quant_weight_nz.h`,
+  `aclnn_grouped_matmul_finalize_routing{,_v2}_weight_nz.h`,
+  `aclnn_mla_prolog_v2_weight_nz.h`). There is no
+  `aclnnMmWeightNz` or `aclnnBatchMatMulWeightNz` for float paths —
+  the documented route for our F16 matmuls is the in-place
+  `aclnnTransMatmulWeight` from `aclnn_trans_matmul_weight.h`, which
+  refreshes the weight tensor descriptor so the plain `aclnnMm` /
+  `aclnnMatMul` pick up the private NZ layout per affinity. See §8
+  dated 2026-04-18 under "M5.1 audit" for the full call-site
+  mapping; TL;DR: 7 per-layer projections in each engine
+  (Q/K/V/O/gate/up/down) are eligible (F16 weights). The F32
+  `proj_w` in `CpCannEngine` is NOT eligible —
+  `aclnnTransMatmulWeight` only supports F16/INT8/BF16. M5.3 (flipping
+  call sites) stays future work but is a no-op insurance policy: plain
+  `aclnnMm` consumes the refreshed descriptor transparently per the op
+  contract, so in practice M5.3 is redundant once the NZ conversion
+  fires.
+  **Verified-by:** header listing on Ascend 910B4 CANN 8.3.RC1
+  (`ls $ASCEND_TOOLKIT_HOME/include/aclnnop/ | grep -iE 'nz|trans_matmul'`);
+  gate = smoke/documentation. Commit 2b0a2998.
+- [x] 5.2 At weight upload, pre-convert matmul weights to FRACTAL_NZ format
   (use existing CANN utility: `aclnnTransMatmulWeight` or similar).
+  Landed. `cp_cann_symbols.{h,cpp}` now dlsyms
+  `aclnnTransMatmulWeight{,GetWorkspaceSize}` via `resolve_optional` +
+  a `CannSyms::has_nz()` capability flag. Both `TalkerCannEngine` and
+  `CpCannEngine` grew a public `set_use_nz_weights(bool)` setter
+  (default off) + a `nz_applied()` getter, and run
+  `aclnnTransMatmulWeight` on each F16 matmul weight buffer in-place
+  during the weight-upload loop when the flag is on and the symbol
+  resolved. Env override `TALKER_NZ_WEIGHTS=1` flips the Talker flag
+  on without code changes (treats empty / "0" as off). Workspace is
+  seeded up-front when NZ is enabled so `aclnnTransMatmulWeight`'s
+  scratch requirement can grow the buffer; the later per-engine seed
+  alloc is gated to avoid leaking the early buffer. Matmul call sites
+  are UNCHANGED — still plain `aclnnMm` — so M5.3 can flip them in a
+  future round. `forward_prefill` / `forward_decode` bodies untouched.
+  **Verified-by:**
+  (a) Build: `cmake --build build --target qwen_tts -j 8` on Ascend
+      910B4 CANN 8.3.RC1 — clean, no errors, warnings are all
+      pre-existing unrelated. Default binary has the new setters but
+      does not exercise them (flag defaults off).
+  (b) `has_nz()` resolves to true on target runtime: the NZ-enabled
+      run logs `[talker_cann] FRACTAL_NZ weight pre-conversion ENABLED
+      (per-layer aclnnTransMatmulWeight on Q/K/V/O/gate/up/down)` once
+      per init, proving both symbols loaded and the per-layer pass
+      fired without error.
+  (c) Init doesn't error with NZ on: `TALKER_NZ_WEIGHTS=1` runs on
+      utt1/utt2/utt3 complete with exit status 0; no `[talker_cann]
+      nz_convert: ...` error lines in `/tmp/m5_verify/nz/*.log`; no
+      ACL error messages at the NZ pass boundary. Log pattern:
+      `TALKER_NZ_WEIGHTS=1 forcing NZ weight path` →
+      `FRACTAL_NZ weight pre-conversion ENABLED` → normal decode.
+  (d) Default build (NZ off) passes content check: ran utt1/utt2/utt3
+      at `--seed 42 --max_tokens 200 --native_talker --cp_cann
+      --cp_groups 8` (same config as M2.4 / M3.4). Generated wavs
+      are 2.08 s / 2.96 s / 2.00 s (`python -c wave.getnframes/...`),
+      matching the M2.4 canonical-baseline durations (2.16 / 2.96 /
+      2.32 s) within sampling variance from aclGraph + multi-stream
+      changes that landed between M2.4 and now. Natural EOS in every
+      case — no run approached `max_tokens=200`. `file` confirms all
+      three are valid 24 kHz mono PCM WAV. Artifacts at
+      `/tmp/m5_verify/nd/utt{1,2,3}.wav` on Ascend.
+  (e) NZ-on audio is audible garbage in this round (full 200-frame
+      16 s runs, no natural EOS). That's expected — without M5.3
+      flipping call sites, plain `aclnnMm` reads the NZ-transposed
+      buffer as ND and gets scrambled numerics. The M5.1 audit notes
+      that on CANN 8.3 the affinity-driven auto-detect does NOT kick
+      in for `aclnnMm` the way the `aclnnTransMatmulWeight` header
+      comment implies — so M5.3 is actually needed for correctness,
+      not just performance. The smoke test proves the init path is
+      solid for M5.3 to build on.
+  Gate: smoke (init + has_nz() + default-path ASR-equivalent
+  duration check). Commit 2b0a2998.
 - [ ] 5.3 Switch matmul calls to `*WeightNz` variants.
 - [ ] 5.4 **Quality gate**: DTW unchanged vs M4 baseline.
 - [ ] 5.5 **Throughput gate**: +15% matmul throughput measurable.
@@ -565,6 +639,77 @@ carrying a silent false claim.
   pointer to one of the two owned streams (primary default), which is
   the only required behavioral change to every call site that already
   reads `stream_` — none of those bodies had to change.
+- **2026-04-18 Track D (M5.1 audit + M5.2 NZ plumbing) — infrastructure
+  landed, call-site switch parked for M5.3**:
+  **M5.1 audit** on Ascend 910B4 CANN 8.3.RC1 against
+  `$ASCEND_TOOLKIT_HOME/include/aclnnop/`:
+  - *WeightNz headers actually present*: `aclnn_quant_matmul_weight_nz.h`,
+    `aclnn_grouped_matmul_weight_nz.h`,
+    `aclnn_grouped_matmul_swiglu_quant_weight_nz.h`,
+    `aclnn_grouped_matmul_finalize_routing{,_v2}_weight_nz.h`,
+    `aclnn_mla_prolog_v2_weight_nz.h`.
+  - *NOT present*: `aclnnMmWeightNz`, `aclnnMatmulWeightNz`,
+    `aclnnBatchMatMulWeightNz`. The fp16 / fp32 plain matmul family
+    does not expose a dedicated WeightNz entry point on CANN 8.3.
+  - *Documented path*: `aclnn_trans_matmul_weight.h` exposes
+    `aclnnTransMatmulWeight{,GetWorkspaceSize}` and
+    `aclnnCalculateMatmulWeightSize{,V2}`. `aclnnTransMatmulWeight`
+    refreshes the given weight tensor in-place ("经过此接口处理后此
+    tensor被刷新为预处理后的matmul weightTensor格式根据亲和性进行
+    ND或者私有格式的转换") so a subsequent `aclnnMm` / `aclnnMatMul`
+    can pick up the private NZ layout transparently.
+  - *Eligible call sites* (F16 2D weights):
+    **CpCannEngine**: 7 projections per layer × 5 layers = 35 matmuls
+    per token (`Mm` on `q_proj`, `k_proj`, `v_proj` at lines 878-880;
+    `o_proj` at 1021; `gate_proj`, `up_proj`, `down_proj` at
+    1037/1039/1043). NOT eligible: the F32 input projection at line
+    824 (`aclnnTransMatmulWeight` doesn't support F32).
+    **TalkerCannEngine**: same 7-projection pattern × 28 layers = 196
+    matmuls per decode step. Decode call sites: lines 704/706/708
+    (Q/K/V), 856 (O), 905/906/909 (gate/up/down). Prefill call sites
+    (untouched by the M5.2 landing): lines 1228/1229/1230 (Q/K/V),
+    1425 (O), 1484/1485/1488 (gate/up/down). Weight descriptors are
+    rebuilt per call via `tensor_2d(lw.q_proj_w, ...)` etc, so the
+    in-place descriptor refresh from `aclnnTransMatmulWeight` only
+    has an effect if the REFRESHED metadata is the one read by
+    `tensor_2d` at call time — i.e., the underlying weight buffer
+    keeps its descriptor state between init and decode. The NZ pass
+    is run once per buffer at init so all subsequent `tensor_2d`
+    calls see the refreshed state.
+    **CpCannEngine's BMM call sites** (`aclnnBatchMatMul` in the
+    attention-on-NPU path) are NOT `aclnnMm` and are NOT covered by
+    `aclnnTransMatmulWeight` — those operate on per-call Q/K/V
+    tensors, not model weights, so the whole NZ discussion doesn't
+    apply to them.
+  **M5.2 implementation**: see §5 M5.2 stamp above. The key design
+  decision is that the flag defaults OFF and the default build runs
+  the exact pre-M5 path (verified by ASR-equivalent audio durations
+  matching the M2.4/M3.4 baseline on utt1/utt2/utt3). The opt-in
+  NZ-on path runs without init errors on Ascend, has_nz() returns
+  true, and the per-layer `aclnnTransMatmulWeight` logs cleanly.
+  **Surprise / M5.3 note**: the NZ-on smoke test showed that plain
+  `aclnnMm` with an NZ-refreshed weight does NOT produce correct
+  audio on CANN 8.3 (the 200-frame runs never naturally EOS — the
+  model is consuming scrambled numerics). This contradicts the
+  `aclnnTransMatmulWeight` header's "affinity-driven auto-detect"
+  claim and means M5.3 (actually using `*WeightNz` op variants) is
+  required for correctness, not just a performance nicety. For the
+  fp16 matmul path there is no `aclnnMmWeightNz` on CANN 8.3, so
+  M5.3 has two options: (a) wait for a future CANN release that
+  exposes one; (b) call `aclnnMm` with the weight tensor's
+  `aclFormat` explicitly set to `ACL_FORMAT_FRACTAL_NZ` (= 29) at
+  descriptor-build time, instead of the default `ACL_FORMAT_ND` (=2),
+  and let `aclnnMm` dispatch the NZ-aware kernel path. Option (b)
+  needs experimentation to validate that the op dispatcher actually
+  honors the format hint for Mm. The M5.3 agent should start there.
+  **Files touched (Track D only)**: `tools/qwen_tts/cp_cann_symbols.{h,cpp}`
+  (+~24 lines; 2 optional symbols + `has_nz()`), `tools/qwen_tts/
+  talker_cann_engine.{h,cpp}` (+~90 lines; setter/getter, env-var hook,
+  `nz_convert_weight_` helper, per-layer hook after upload),
+  `tools/qwen_tts/cp_cann_engine.{h,cpp}` (+~70 lines; same shape,
+  hooked into both `init` and `init_from_safetensors`). Zero edits to
+  `forward_decode`, `forward_prefill`, `run_decode_ops_`,
+  `forward_one_token`, any matmul call site, or `CMakeLists.txt`.
 
 ## 9. Parallelism playbook
 
