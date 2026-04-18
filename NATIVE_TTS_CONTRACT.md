@@ -566,6 +566,26 @@ carrying a silent false claim.
 
 ## 8. Decision log (live — append when deviating)
 
+- **2026-04-19 CANN 8.5.1 partial install, blocked**:
+  The `aclnnMmWeightNz` path that §8 Track F left as the follow-up for
+  correctness-correct NZ matmul is not shipped in either CANN 8.3.RC1
+  or CANN 8.5.1's toolkit `include/aclnnop/`. Inventoried 8.5.1:
+  3 headers, no `*weight_nz*` variants, no `aclnnMatMul*WeightNz`
+  symbols, no `aclnnTransMatmulWeight` at all. (8.3 had the quant-only
+  Nz family; 8.5.1 toolkit-only doesn't even ship those.) Tried to
+  download `Ascend-cann-kernels-910b_8.5.1_linux-aarch64.run` from the
+  public OBS mirror — 403 across 9 filename variants. Kernels require
+  a Huawei developer-portal login.
+  **Current state**: toolkit-only install at
+  `/root/autodl-tmp/Ascend/cann-8.5.1` on AutoDL (13797) — useful only
+  for header inspection, not runtime. Existing 8.1.RC1 install on the
+  same box untouched. Host driver 23.0.6 is unaltered (container-level
+  install, firmware stays on host).
+  **Unblock path**: user logs in to hiascend.com developer portal,
+  downloads the 8.5.1 kernels `.run`, `scp`s to `/root/autodl-tmp/`;
+  then re-run Track F against 8.5. Until then, M5.3/M5.4/M5.5 stay
+  `[ ]`. Session left `/root` perms 711 (restored from the 755 temp
+  chmod needed by the installer's parent-dir check).
 - **2026-04-17 Design**: Chose native-full over ggml-cann fork because AI
   portability removes the rewrite tax, eager NPU model doesn't map cleanly
   onto ggml's graph abstraction, and GGUF quantization advantage doesn't
