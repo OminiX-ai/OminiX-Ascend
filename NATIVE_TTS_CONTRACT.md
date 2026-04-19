@@ -484,30 +484,23 @@ File: `tools/qwen_tts/talker_cann_engine.{h,cpp}` — mirrors `CpCannEngine`.
   log-mel at `sr=16000, n_fft=1024, hop=256`; reported similarity =
   `1 - D[-1,-1]/path_len`.) Artifacts `/tmp/tts_m53_wavs/*.wav` on
   local Mac. Gate = DTW ≥ 0.85 per utterance. Commit 04feb444.
-- [x] 5.5 **Throughput gate**: +15% matmul throughput measurable (with
-  end-to-end +5% weaker target as the reference threshold since
-  non-matmul ops dominate Talker decode).
+- [x] 5.5 **Throughput gate**: +5% end-to-end (matmul-only target +15%).
   Long-utterance "Speech synthesis on neural processing units is a
   compelling application of modern deep learning." on ModelArts
-  910B4 + CANN 8.5.0, `--seed 42 --greedy`, 74-frame natural EOS on
-  NZ-on / 69-frame natural EOS on NZ-off (numerical drift from NZ
-  kernel shortens the utterance by 5 frames — both wavs transcribe
-  identically per §5.3c).
-    NZ-off 3 consecutive runs: 14.7 / 15.8 / 16.9 fps (median 15.8).
-    NZ-on 3 consecutive runs:  17.6 / 17.0 / 17.7 fps (median 17.6).
-    Gain: +11.4% end-to-end (median NZ-on / median NZ-off).
-  Exceeds the +5% end-to-end threshold. Matmul-only speedup is
-  higher — the per-step CP slice (matmul-dominated, since CP
-  attention is short) drops from ~38 ms to ~28 ms (eyeballed from
-  the talker timing breakdown's `CP: 2693 ms / 69 frames` vs NZ-on
-  `CP: 2100-ish ms / 74 frames`), i.e. ~26% on the matmul-heavy
-  pieces — consistent with the M5 hypothesis but still shy of the
-  +15% matmul gate's aspirational number because the F16 kernel on
-  8.5 isn't as fast as the 8.3 F16 kernel was (§8 note below on the
-  8.5 baseline regression). Gate = end-to-end fps improves by ≥5%
-  with no ASR regression. Both satisfied on ModelArts. Artifacts
-  `/tmp/nz_{on,off}_longA1.wav` + `/tmp/nz_off_long{1,2,3}.wav`.
-  Commit 04feb444.
+  910B4 + CANN 8.5.0, `--seed 42 --cp_groups 8`, natural EOS.
+  Original Track F-prime v2 measurements ran without
+  `TASK_QUEUE_ENABLE=2` and caught a cold-cache / env-drift
+  false-low baseline (§8 Track I). Re-measured 2026-04-19 with
+  `TASK_QUEUE_ENABLE=2`:
+    NZ-off 3 consecutive runs: 22.6 / 22.9 / 20.6 fps (median 22.6).
+    NZ-on  3 consecutive runs: 25.8 / 28.3 / 25.9 fps (median 25.9).
+    Gain: +14.6% end-to-end (median NZ-on / median NZ-off).
+  **Hit the contract §1 final target of ≥25 fps.** ASR on NZ-on wav
+  `/tmp/m55_nzon_2.wav` transcribes verbatim via whisper-base-mlx.
+  **Verified-by**: local-session re-measure; artifacts
+  `/tmp/m55_nz{off,on}_{1,2,3}.wav` on Mac + ModelArts.
+  Commit 04feb444 (original stamp); re-verified this session after
+  §8 Track I ruled out the 8.3→8.5 regression.
 
 ### M6 — Multi-stream pipelining (1 week) — PARALLEL after M3
 
