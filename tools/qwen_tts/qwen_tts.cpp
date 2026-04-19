@@ -726,8 +726,17 @@ bool QwenTTS::generate(const QwenTTSParams& params, std::vector<float>& audio_ou
     // (matches Python: cut = int(ref_len / total_len * wav.shape[0]))
     int total_frames = n_ref_frames + n_gen_frames;
     int cut = (int)((long long)n_ref_frames * (long long)full_audio.size() / std::max(total_frames, 1));
-    printf("  Cutting first %d samples (%.2f sec) -- ref audio portion\n",
-           cut, cut / 24000.0f);
+    // Shift the cut forward past the decoder's ref→target boundary transient.
+    // The decoder's conv receptive field straddles the ref/gen codec seam;
+    // the first ~150 ms post-boundary carry a settle ripple that earlier
+    // fade-based mitigations (50/120/200 ms cubic) could attenuate but not
+    // eliminate. Speech onset in practice lands ~170-250 ms post-boundary,
+    // so dropping 150 ms of the lead-in discards the transient without
+    // clipping the first consonant.
+    const int transient_margin = 3600;  // 150 ms at 24 kHz
+    cut += transient_margin;
+    printf("  Cutting first %d samples (%.2f sec) -- ref portion + %d ms boundary margin\n",
+           cut, cut / 24000.0f, transient_margin * 1000 / 24000);
     if (getenv("QWEN_TTS_KEEP_REF") != nullptr) {
         printf("  QWEN_TTS_KEEP_REF set — emitting full decoded audio "
                "(ref + target), for decoder round-trip check.\n");
@@ -736,25 +745,6 @@ bool QwenTTS::generate(const QwenTTSParams& params, std::vector<float>& audio_ou
         audio_out.assign(full_audio.begin() + cut, full_audio.end());
     } else {
         audio_out = std::move(full_audio);
-    }
-
-    // Fade-in mask for the decoder boundary artifact at the ref/target cut
-    // point. Originally landed as e6eb3929 (50 ms linear); later restored
-    // at 120 ms linear (1b88df98). User still reported a prefix click —
-    // waveform analysis showed a noise burst at 50-100 ms that a 120 ms
-    // linear fade only attenuates to ~0.6×. Cubic fade over 200 ms knocks
-    // the first 100 ms down to 0.125× (inaudible) while still reaching full
-    // amplitude by 200 ms (speech onset usually starts around 180-250 ms
-    // post-cut, so the audible onset is not softened).
-    {
-        int fade_ms = 200;
-        int fade_samples = std::min(
-            (int)(fade_ms * 24 /* samples per ms at 24kHz */),
-            (int)audio_out.size());
-        for (int i = 0; i < fade_samples; i++) {
-            float t = (float)i / fade_samples;   // 0..1
-            audio_out[i] *= t * t * t;            // cubic ease-in
-        }
     }
 
     auto total_t1 = std::chrono::high_resolution_clock::now();
@@ -839,17 +829,13 @@ bool QwenTTS::generate_xvec(const QwenTTSParams& params, std::vector<float>& aud
         return false;
     }
 
-    // No ref audio to cut (x-vector mode doesn't include ref in codec)
-    audio_out = std::move(full_audio);
-    // Cubic 200 ms fade-in at the decoder boundary (same as ICL path).
-    // x-vector mode starts from a cold decoder state, so the first ~100 ms
-    // still carries a noise burst that a linear fade leaves audible.
-    {
-        int fade_samples = std::min((int)(200 * 24), (int)audio_out.size());
-        for (int i = 0; i < fade_samples; i++) {
-            float t = (float)i / fade_samples;
-            audio_out[i] *= t * t * t;
-        }
+    // x-vector mode starts from a cold decoder state; the first ~150 ms
+    // carry the same settle ripple we trim on the ICL ref/gen boundary.
+    const int cold_start_trim = 3600;  // 150 ms at 24 kHz
+    if ((int)full_audio.size() > cold_start_trim) {
+        audio_out.assign(full_audio.begin() + cold_start_trim, full_audio.end());
+    } else {
+        audio_out = std::move(full_audio);
     }
     printf("  Output: %zu samples (%.2f sec at 24kHz)\n",
            audio_out.size(), audio_out.size() / 24000.0f);
@@ -895,14 +881,12 @@ bool QwenTTS::generate_customvoice(const QwenTTSParams& params, std::vector<floa
         return false;
     }
 
-    audio_out = std::move(full_audio);
-    // Cubic 200 ms fade-in at the decoder boundary (see ICL + xvec notes).
-    {
-        int fade_samples = std::min((int)(200 * 24), (int)audio_out.size());
-        for (int i = 0; i < fade_samples; i++) {
-            float t = (float)i / fade_samples;
-            audio_out[i] *= t * t * t;
-        }
+    // Cold-start decoder settle — same 150 ms trim as xvec (see ICL notes).
+    const int cold_start_trim = 3600;
+    if ((int)full_audio.size() > cold_start_trim) {
+        audio_out.assign(full_audio.begin() + cold_start_trim, full_audio.end());
+    } else {
+        audio_out = std::move(full_audio);
     }
     printf("  Output: %zu samples (%.2f sec at 24kHz)\n",
            audio_out.size(), audio_out.size() / 24000.0f);
