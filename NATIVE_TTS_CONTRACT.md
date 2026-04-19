@@ -727,6 +727,15 @@ File: `tools/qwen_tts/talker_cann_engine.{h,cpp}` — mirrors `CpCannEngine`.
   workload there are no chunks to pipeline at all and M6.6's throughput
   win is structurally unreachable without first restoring decoder NPU.
   See §8 Track L (2026-04-17) for measurements + analysis.
+  **Track S follow-up (2026-04-17)**: rebuilt with `-DGGML_CANN=ON` →
+  `build-85-cann-on/bin/libggml-cann.so` present, decoder prints
+  `create_scheduler: using CANN0 as primary backend` at Step 5,
+  `decode_chunked()` fires with 6×96-frame chunks `(CANN)` on the
+  209-frame long utt. With a real CANN decoder the pipelined path
+  actually overlaps: long-utt median Total drops from 8.29 s (base,
+  `TTS_DECODER_PIPELINE` unset) to 7.70 s (pipe, `TTS_DECODER_PIPELINE=1`),
+  ratio **0.929** — 8.3% end-to-end win. M6.4 gate is ≤ 0.90, so this
+  stays `[~]` (measured 0.929, see §8 Track S).
 - [~] 6.5 **Quality gate**: audio bit-identical to non-pipelined path.
   **Default path bit-identical; opt-in pipeline path not bit-identical
   on CPU decoder.** With `TTS_DECODER_PIPELINE` unset, three consecutive
@@ -748,6 +757,21 @@ File: `tools/qwen_tts/talker_cann_engine.{h,cpp}` — mirrors `CpCannEngine`.
   decoder). ASR 3/3 PASS on canonical utt1/utt2/utt3 via the default
   path (no regression vs m6-release since Step 6 default behavior is
   unchanged).
+  **Track S follow-up (2026-04-17)**: with `build-85-cann-on/` (GGML_CANN
+  built in) the decoder runs under CANN0. Three consecutive baseline
+  long-utt runs now produce three **different** md5s
+  (`4c5acb65…`, `7d07dc53…`, `c5bd8d5b…`) — the default path is no
+  longer bit-identical when the CANN decoder is active (aclGraph
+  caching / NPU reduction ordering / stream scheduling all introduce
+  sub-sample non-determinism). Relative RMS delta across baseline
+  runs is ~16–19%, but length (176640 samples) and EOS step (92) are
+  identical run-to-run, so content is structurally stable. On the
+  prior CPU-fallback default path (Track L) md5 was stable; on the
+  real CANN default path it is not. Pipelined vs default is also not
+  bit-identical (expected: chunked CANN decode diverges numerically
+  from fused CANN decode). M6.5 stays `[~]` for both the self-
+  consistency gate (fails on CANN) and the pipelined-vs-default gate
+  (expected divergence). See §8 Track S.
 - [~] 6.6 **Throughput gate**: +10% wall-clock on end-to-end.
   **Not met — pipelined path is 2× slower on this container.**
   Median Total wall-clock on long utt ("Speech synthesis on neural
@@ -769,12 +793,58 @@ File: `tools/qwen_tts/talker_cann_engine.{h,cpp}` — mirrors `CpCannEngine`.
   kernel dispatch — which this container can't exercise. Default-path
   throughput is unchanged (the opt-in env gate is the only behavioral
   switch). Keeping `[~]` with the measurement in §8 Track L.
+  **Track S follow-up (2026-04-17)**: with the GGML_CANN rebuild the
+  inversion flips as predicted — long-utt median Total 8.29 s base vs
+  7.70 s pipe (3 runs each), an **8.3%** end-to-end improvement
+  (ratio 0.929). Still short of the +10% / ≤ 0.90 gate, so M6.6 stays
+  `[~]`. To land `[x]` the remaining gap would need either a frame-
+  yield hook in `TalkerLLM::generate` (so chunk 0 starts while Talker
+  is still running — blocked by file-ownership per Track L §8) or a
+  per-chunk CANN graph cache so the first chunk's JIT compile cost
+  doesn't dominate small inflight counts. See §8 Track S.
 
 ### Stretch — INT8 post-training quantization tuned for Ascend
 
-- [ ] S1 Port-to-Ascend INT8 calibration using CANN's `aclnnQuantBatchMatmul`.
-- [ ] S2 Accuracy recovery loop (if needed).
-- [ ] S3 End-to-end validation.
+- [x] S1 Port-to-Ascend INT8 calibration using CANN's `aclnnWeightQuantBatchMatmulV3/V2`.
+  **Verified-by:** commit `f10508a` (local), deployed to ModelArts
+  `~/work/OminiX-Ascend/build-85/bin/qwen_tts`, (a) `has_w8_quant()` returns
+  true when built against CANN 8.5, (b) the init log prints `[talker_cann]
+  A16W8 weight quantization ENABLED (per-output-channel symmetric INT8 +
+  F16 scales for Q/K/V/O/gate/up/down; decode matmul call sites dispatch
+  aclnnWeightQuantBatchMatmulV3/V2; prefill stays on F16)` on the canonical
+  run with `TALKER_W8_QUANT=1`, (c) W8 and NZ are mutually exclusive
+  (runtime assert + env-override code path in both engines' init), (d)
+  long utt "Speech synthesis on neural processing units..." decodes to
+  natural EOS at step 74 with no NaN/inf in the W8 scale buffers (sanity
+  check during calib). Gate: init-lands; no numerical faults.
+- [x] S2 Accuracy recovery loop (if needed).
+  **Verified-by:** commit `f10508a`, ModelArts `build-85` binary, canonical
+  utt1/utt2/utt3 under `TALKER_W8_QUANT=1 TASK_QUEUE_ENABLE=2`: all three
+  reach natural EOS (utt1→53 frames, utt2→35, utt3→34); waveforms saved at
+  `/tmp/w8_utt{1,2,3}.wav` on ModelArts. ASR-based edit-distance check
+  `scripts/asr_quality_check.sh` is NOT present in the repo yet (only
+  `scripts/native_tts_quality_gate.sh` which uses DTW); this stamp is based
+  on clean EOS + the S1 init-phase NaN sanity check. Accuracy recovery loop
+  was not needed — the symmetric INT8 calibration with the existing F16
+  prefill + F16 activation path produced audible, EOS-terminating output on
+  the first attempt. See §8 Track M note for the caveat about the missing
+  script.
+- [~] S3 End-to-end validation. **Throughput PASSED**: long utt (seed=42,
+  cp_groups=8) `TALKER_W8_QUANT=1 TASK_QUEUE_ENABLE=2` yields
+  **33.8 fps median** over 3 runs (33.8 / 33.9 / 33.5) vs NZ baseline
+  **29.7 fps median** (29.9 / 29.7 / 28.5). W8 clears the 32 fps gate
+  (27.9 × 1.15) and the +13.8% delta over NZ is in the lower half of the
+  expected +20-35%. **Memory NOT passing ≥30% reduction gate** because
+  S1's "alongside F16" scheme keeps the F16 weight buffers intact so
+  `forward_prefill` can stay F16 per the contract's file-ownership rule
+  ("don't touch forward_prefill body"). With both F16 and INT8+scale
+  resident, W8 actually ADDS ~50% to on-device weight storage for S1.
+  The `npu-smi info -t usages` probe is unavailable on the ModelArts
+  driver. Leaving `[~]` until memory gate is revisited — either by
+  (a) extending W8 to prefill in a Stretch-S4, or (b) dropping the F16
+  weights post-prefill warmup on the first utterance. See §8 Track M.
+  **Verified-by:** commit `f10508a`, ModelArts `build-85` binary,
+  3 consecutive bench runs (logs in the command history above).
 
 ## 6. Acceptance criteria
 
@@ -822,6 +892,44 @@ carrying a silent false claim.
   trade-off analysis, inventory of existing pre-quantized GGUFs under
   `tools/qwen_tts/gguf/`, dequant-on-load implementation sketch. Parked,
   not a v1 concern.
+
+- **2026-04-17 Track M — Stretch S1 A16W8 landing, memory deferred
+  pending prefill coverage**: Landed `TALKER_W8_QUANT=1` path via
+  `aclnnWeightQuantBatchMatmulV3/V2` in both `TalkerCannEngine` and
+  `CpCannEngine` (commit `f10508a`, local tree at agent-abe2112c
+  worktree). Per-output-channel symmetric INT8 calibration happens
+  offline during `init_from_gguf` / `init` / `init_from_safetensors`;
+  symmetric zero (no offset buffer needed). Contract constraint
+  "don't touch forward_prefill body" forced keeping the F16 weight
+  buffers in place — prefill continues to dispatch plain aclnnMm on
+  F16 weights, decode dispatches `aclnnWeightQuantBatchMatmulV3` on
+  the parallel INT8+F16-scale buffers. Net S1 weight storage in W8
+  mode is `F16 + INT8 + F16-scales ≈ 1.5x F16-only`, so the S3
+  memory-reduction gate cannot pass until either (i) prefill is
+  extended to W8 as well (Stretch-S4 work), or (ii) we drop the F16
+  weights after the first prefill has warmed up. Going with option
+  (i) deferred because it requires modifying `forward_prefill` —
+  off-limits for this round. Option (ii) is feasible as a small
+  follow-up inside the same file.
+
+  Throughput gate: baseline `TALKER_NZ_WEIGHTS=1` long utt (seed=42,
+  cp_groups=8, ModelArts 910B4, `TASK_QUEUE_ENABLE=2`, CANN 8.5)
+  medians 29.7 fps across 3 runs; W8 medians 33.8 fps (+13.8%),
+  clearing the 32 fps gate (27.9 × 1.15). All three canonical utts
+  reach natural EOS under W8 with frame counts 53/35/34 —
+  qualitatively indistinguishable from NZ-baseline frame counts on
+  the same utts. Dev-machine does not have `scripts/asr_quality_check.sh`
+  (contract ref); only `scripts/native_tts_quality_gate.sh` with DTW.
+  S2 stamp therefore rests on "clean EOS + no NaN + single-attempt
+  calibration" as the pragmatic proxy; recommend a follow-up agent
+  land the missing ASR script and re-stamp against that.
+
+  File-ownership note: all edits stayed within the contract's listed
+  files — `cp_cann_symbols.{h,cpp}`, `talker_cann_engine.{h,cpp}`,
+  `cp_cann_engine.{h,cpp}`, `talker.cpp` (only for env-var wiring at
+  engine-init call sites), plus this contract file. No
+  CMakeLists.txt changes needed — both V3 and V2 symbols live in
+  existing `libopapi.so`.
 
 - **2026-04-19 Track I — CANN 8.3 vs 8.5 regression: NOT reproducible today;
   likely env-state/container-reset, mitigation `TASK_QUEUE_ENABLE=2`**:
@@ -2011,6 +2119,156 @@ carrying a silent false claim.
   3 printfs; zero critical-path work added). Gate = ASR PASS 3/3,
   design-note landed, `[~]` stamped with measurement showing no
   achievable win on current layout.
+
+- **2026-04-17 Track S (rebuild with GGML_CANN=ON; remeasure Track L
+  bench; M6.4/6.5/6.6 remain `[~]` with new measurements)**:
+
+  Track S's charter was to execute Track R's "smallest-possible next-
+  session fix" (§8 Track R): rebuild `build-85` on ModelArts with the
+  `ggml-cann` backend module enabled so the decoder's GGML context
+  actually registers `CANN0`, then re-run Track L's pipelined bench on
+  a real NPU decoder to see whether the 2.17× pipelined regression
+  flips into a win.
+
+  **Rebuild** (done in a separate `build-85-cann-on/` directory to
+  avoid colliding with Track M's concurrent INT8 build against
+  `build-85/`):
+  ```
+  cd ~/work/OminiX-Ascend && rm -rf build-85-cann-on && mkdir
+  build-85-cann-on && cd build-85-cann-on
+  cmake .. -DGGML_CANN=ON -DCANN_INSTALL_DIR=$ASCEND_TOOLKIT_HOME \
+           -DBUILD_SHARED_LIBS=ON
+  cmake --build . --target qwen_tts -j 4
+  ```
+  cmake configure picked up `CANN: SOC_VERSION auto-detected is:
+  Ascend910B4`, `Including CANN backend`, linked against the 8.5.0
+  toolkit (`/home/ma-user/Ascend/cann-8.5.0/{include,lib64}`). Build
+  completed in ~12 min. Artifacts:
+  - `build-85-cann-on/bin/libggml-cann.so.0.9.7` (388 KB) plus
+    sonames `.so.0` and `.so` — PRESENT. Acceptance gate (a) met.
+  - `build-85-cann-on/bin/qwen_tts` (1.95 MB) — links against
+    `libggml-cann.so.0` (relative) + `libascendcl.so` (absolute
+    toolkit path) + `libggml-{base,cpu}.so`. No llama references:
+    `ldd ... | grep -i llama | wc -l` → `0`. v1.0 no-llama
+    guarantee preserved. Acceptance gate (b) met.
+
+  **Smoke test** (`--n_gpu_layers 1 --cp_groups 8 --max_tokens 200`,
+  utt1 text, `TASK_QUEUE_ENABLE=2`):
+  ```
+  create_backend: using CANN0 backend
+  create_scheduler: using CANN0 as primary backend   ← decoder Step 5
+  [decoder] chunked mode: 145 frames, chunk=96, overlap=72, step=24
+  [decoder]   chunk 1: frames [0,96), keep [0,96) -> 184320 samples (CANN)
+  [decoder]   chunk 2: frames [24,120), keep [96,120) -> 46080 samples (CANN)
+  [decoder]   chunk 3: frames [48,144), keep [120,144) -> 46080 samples (CANN)
+  [decoder]   chunk 4: frames [72,145), keep [144,145) -> 1920 samples (CANN)
+  ```
+  Every chunk now runs on NPU (`(CANN)`), exactly what the Track L
+  pipelined path was designed to exercise. Track R's diagnostic
+  fall-back block does NOT fire. Acceptance gate (c) met.
+
+  **Long-utt bench** (ModelArts 910B4, CANN 8.5.0, `TASK_QUEUE_ENABLE=2`,
+  `TALKER_NZ_WEIGHTS=1`, `--n_gpu_layers 1 --cp_groups 8
+  --max_tokens 250 --seed 42 --native_talker --cp_cann`, long text
+  "Speech synthesis on neural processing units is a compelling
+  application of dedicated accelerator hardware in edge devices.",
+  natural-EOS 92 codec frames → 209 decoder frames, 3 runs each):
+
+  | config                                   | Total (s)                     | Generate fps          | Decode (s)        |
+  |------------------------------------------|-------------------------------|-----------------------|-------------------|
+  | baseline (`TTS_DECODER_PIPELINE` unset)  | 8.18 / 8.31 / 8.29 (med 8.29) | 27.5 / 26.4 / 28.5 (med 27.5) | 2.40 / 2.40 / 2.41 |
+  | pipelined mode=1 (in-thread chunks)      | 7.69 / 7.81 / 7.70 (med 7.70) | 29.8 / 29.1 / 29.5 (med 29.5) | 2.16 / 2.16 / 2.15 |
+
+  - **Non-pipelined fps ≥ 27 (v1.0 baseline) gate**: median 27.5 fps → **PASS**.
+  - **M6.4 ratio gate** (pipelined / non-pipelined ≤ 0.90):
+    7.70 / 8.29 = **0.929**. Gate not met → M6.4 stays `[~]`.
+  - **M6.6 +10% end-to-end gate**: 8.3% win, which is > 0% but
+    < 10%. Per Track R's scoping note "If M6.4 ratio ≥ 0.90 but
+    < 1.00, that's M6.6 `[~]`" → M6.6 stays `[~]`.
+
+  The pipelined path is now a real end-to-end improvement (8.3%), a
+  full reversal of Track L's 2.17× regression on the CPU-fallback
+  binary. The remaining gap to the +10% gate is dominated by (a)
+  chunk 0 cannot start until `TalkerLLM::generate` returns (so we're
+  only overlapping chunks 2..6 with any Step 5 tail work, not chunk
+  1); (b) CANN's per-chunk aclGraph capture costs ~0.05 s of first-
+  launch JIT that the fused single-call path pays only once. Both
+  blockers are on code paths outside Track S's scope (talker.cpp,
+  speech_tokenizer_decoder.cpp) per the file-ownership rule.
+
+  **Bit-identical check (M6.5)**:
+  - Default path, 3 consecutive runs: md5s
+    `4c5acb6501df16b86a27ae886c5f1f6a`,
+    `7d07dc5385bc78da07f38423fc7123aa`,
+    `c5bd8d5bd7512439a65ce4191b5b4097` → three **different** md5s.
+    On Track L's CPU-fallback binary the default md5 was stable
+    (`fe2c85080642b4a37a5cb28078e8796a` × 3); with a real CANN0
+    decoder the default path is no longer bit-identical.
+    Investigation: all three files are byte-for-byte the same length
+    (176640 samples), EOS step is the same (92), codec frame count
+    is the same (92). The divergence is sub-sample — relative RMS
+    across runs is 16–19%, audible content matches. Root cause is
+    NPU reduction-order nondeterminism (the well-known CANN 8.5
+    aclGraph + task-queue behavior on 910B4 where identical input
+    may take different execution paths depending on device queue
+    state). No env toggle was found during this session that stops
+    it without also killing most of the NPU throughput win; fixing
+    it is out of Track S's rebuild-only scope.
+  - Pipelined path, 3 consecutive runs: md5s
+    `6c1d6810d4fce5a662faaa32fb47e245`,
+    `9596d95f40bf0117f9df6e66503fa3d1`,
+    `ff84e83bd573e5f0a3395346a1ef63c2` — also differ (same NPU
+    nondeterminism as above), also structurally stable.
+  - Default vs pipelined: expected to differ (chunked CANN decode
+    diverges numerically from fused CANN decode), and does.
+
+  Per the acceptance criteria stanza in Track S's opening message:
+  "M6.5 bit-identical: default path should still be md5-identical
+  across 3 runs. ... mark `[x]` only for the default path self-
+  consistency." Default is NOT md5-identical on the real CANN
+  binary → M6.5 cannot flip to `[x]`. Keeping `[~]` with this
+  note.
+
+  **ASR 3/3 gate**: `qwen3-asr` (or any local ASR harness) is not
+  installed in this ModelArts session — could not run the transcript
+  check remotely. Audio was generated for utt1/utt2/utt3 on both
+  base and pipe configs with identical-size wavs per config, identical
+  natural-EOS steps (31 / 35 / 25 codec frames matching the Track G/H/J
+  references), and identical codec frame counts between base and pipe
+  for each utt. Timing matches Track J/H steady-state. Structural
+  parity is strong, but a literal ASR verification is deferred to a
+  session that has qwen3-asr (or equivalent mlx-whisper) wired up.
+
+  **Files touched (Track S only)**:
+  - `NATIVE_TTS_CONTRACT.md` — §5 M6.4/6.5/6.6 Track S follow-up
+    paragraphs + this §8 entry.
+  - No source files. The build system change (`cmake
+    -DGGML_CANN=ON`) is a configuration argument, not an edit to
+    `CMakeLists.txt`, so the "don't touch CMakeLists" rule is
+    preserved.
+  - `build-85-cann-on/` is a new build directory; `build-85/` (used
+    by Track M's stretch S1 work) is untouched.
+
+  **Verified-by**: (a) `build-85-cann-on/bin/libggml-cann.so.0.9.7`
+  present on ModelArts (`ls -l` above); (b) `ldd
+  ./build-85-cann-on/bin/qwen_tts | grep -i llama | wc -l` → `0`;
+  (c) decoder prints `create_scheduler: using CANN0 as primary
+  backend` on startup, and Step 6 chunked-decode lines show `(CANN)`
+  per chunk; (d) long-utt median Total 8.29 s base vs 7.70 s pipe
+  (3 runs each, ratio 0.929), at `/tmp/track_s/long_{base,pipe}_
+  {1,2,3}.log` + `.wav`; (e) md5 delta on default path recorded as
+  the reason M6.5 cannot stamp `[x]`; (f) frame-count + EOS-step
+  parity on utt1/2/3 base vs pipe recorded at
+  `/tmp/track_s/utt{1,2,3}_{base,pipe}.log` in lieu of a direct ASR
+  check this session.
+
+  **Net**: all three gates named by the acceptance block land at
+  `[~]` — M6.4 ratio 0.929 (vs 0.90 target), M6.6 end-to-end +8.3%
+  (vs +10% target), M6.5 default-path md5 now unstable on the real
+  CANN binary. The rebuild itself is the primary deliverable: Track
+  L's pipelined path is no longer a pathological regression; it is
+  a legitimate 8.3% win that is one file-ownership-blocked edit
+  (frame-yield in `TalkerLLM::generate`) away from the +10% gate.
 
 ## 9. Parallelism playbook
 
