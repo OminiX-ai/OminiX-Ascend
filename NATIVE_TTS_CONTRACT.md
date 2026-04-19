@@ -2275,6 +2275,32 @@ carrying a silent false claim.
   a legitimate 8.3% win that is one file-ownership-blocked edit
   (frame-yield in `TalkerLLM::generate`) away from the +10% gate.
 
+- **2026-04-19 Post-v1 unification direction** (PM, architectural):
+  Three stacks exist today — OminiX-MLX (Rust, mlx-rs, Apple
+  Silicon), OminiX-Ascend (C/C++, llama.cpp fork, CANN), OminiX-API
+  (Rust/Salvo, calls MLX only). The split tracks the vendor SDKs
+  (MLX is C++ with a Rust binding, CANN is a C API with no mature
+  Rust binding), not a choice we can cheaply reverse.
+
+  **Decided post-v1 direction**:
+
+  1. **Land**: wire OminiX-API to call `libqwen_tts_api.so` on
+     Ascend hosts via `bindgen` + a shared Rust trait that hides
+     the backend diff from request handlers. ~1 week of work,
+     doesn't touch native TTS delivery, directly visible to users
+     (one HTTP surface across Apple + Ascend).
+  2. **Research track (keep separate)**: CannFusion —
+     Rust-DSL-→-AscendC kernel path (https://gitcode.com/Rust4CANN/CannFusion.git).
+     Only plausible route to "write each model once, run on both
+     hardwares." Long-horizon, no user-visible win on its own.
+  3. **Rejected**: merging Ascend C++ model code with MLX Rust
+     model code. Multi-quarter rewrite, re-expresses FFI we
+     already wrote in C++, no user-visible win.
+
+  **Rule for agents**: stay on the current C++ native TTS track
+  until the §1 goal + §6 acceptance criteria close. Do not
+  proactively start Rust/trait work mid-contract.
+
 ## 9. Parallelism playbook
 
 When an agent is assigned a milestone item:
