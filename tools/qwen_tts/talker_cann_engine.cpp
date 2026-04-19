@@ -307,6 +307,9 @@ TalkerCannEngine::~TalkerCannEngine() {
     free_dev(workspace_dev_);
     free_dev(input_stage_f32_dev_);
     free_dev(output_stage_f32_dev_);
+    // M6.2 Track J: speculative delta-add staging buffers.
+    free_dev(delta_stage_f32_dev_);
+    free_dev(delta_stage_f16_dev_);
 
     if (one_scalar_f16_) {
         g_cann.aclDestroyScalar(one_scalar_f16_);
@@ -685,6 +688,12 @@ bool TalkerCannEngine::init_from_gguf(const std::string &gguf_path,
                     (size_t)MAX_PREFILL * n_embd_ * sizeof(float));
         alloc_dev_(&output_stage_f32_dev_,
                     (size_t)n_embd_ * sizeof(float));
+        // M6.2 Track J: per-step delta staging for add_input_delta_f32.
+        // Sized for a single-token delta [n_embd] (prefill never uses this).
+        alloc_dev_(&delta_stage_f32_dev_,
+                    (size_t)n_embd_ * sizeof(float));
+        alloc_dev_(&delta_stage_f16_dev_,
+                    (size_t)n_embd_ * E);
 
         // RoPE tables (F16, [MAX_SEQ, head_dim] with halves duplicated)
         alloc_dev_(&rope_cos_dev_, (size_t)MAX_SEQ * head_dim_ * E);
@@ -794,7 +803,40 @@ void TalkerCannEngine::set_rope_speed_factor(float factor) {
 // same `pos`.
 // ============================================================================
 
+void TalkerCannEngine::cast_input_f32_to_f16_() {
+    // Initial Cast F32 staging -> F16 cur. Capture-safe: input_stage_f32_dev_
+    // is already populated by the synchronous H2D the caller issued above.
+    aclTensor *t_in_f32 = tensor_2d(input_stage_f32_dev_,
+                                     1, n_embd_, ACL_FLOAT);
+    aclTensor *t_cur_f16 = tensor_2d(cur_dev_, 1, n_embd_, ACL_FLOAT16);
+    CANN_OP(Cast, t_in_f32, ACL_FLOAT16, t_cur_f16);
+    g_cann.aclDestroyTensor(t_in_f32);
+    g_cann.aclDestroyTensor(t_cur_f16);
+}
+
 void TalkerCannEngine::run_decode_ops_(int pos) {
+    // Captures-safe variant: initial Cast + body, kept together so aclGraph
+    // capture records the whole eager sequence in one window.
+    cast_input_f32_to_f16_();
+    {
+        const bool dbg = getenv("TALKER_CANN_DEBUG") != nullptr;
+        if (dbg) {
+            aclError s = g_cann.aclrtSynchronizeStream(stream_);
+            fprintf(stderr, "[talker_cann][layer -1] initial Cast sync=%d\n", s);
+        }
+    }
+    run_decode_body_(pos);
+}
+
+// ============================================================================
+// run_decode_body_ — exactly the same kernel sequence as run_decode_ops_,
+// minus the initial F32->F16 Cast. Used by the speculative split path, which
+// does the cast in forward_decode_launch_cast and then inserts an
+// aclnnInplaceAdd of the CP[N] group-1..15 delta onto cur_dev_ before this
+// body runs.
+// ============================================================================
+
+void TalkerCannEngine::run_decode_body_(int pos) {
     // Optional per-op sync probe — stays behind an env var so it's free in
     // production but helps triangulate which op is the first to misbehave
     // during bringup on new CANN toolkit versions.
@@ -804,18 +846,6 @@ void TalkerCannEngine::run_decode_ops_(int pos) {
         aclError s = g_cann.aclrtSynchronizeStream(stream_);
         fprintf(stderr, "[talker_cann][layer %d] %s sync=%d\n", il, tag, s);
     };
-
-    // Initial Cast F32 staging -> F16 cur (capture-safe: input_stage_f32_dev_
-    // is already populated by the synchronous H2D above the capture block).
-    {
-        aclTensor *t_in_f32 = tensor_2d(input_stage_f32_dev_,
-                                         1, n_embd_, ACL_FLOAT);
-        aclTensor *t_cur_f16 = tensor_2d(cur_dev_, 1, n_embd_, ACL_FLOAT16);
-        CANN_OP(Cast, t_in_f32, ACL_FLOAT16, t_cur_f16);
-        g_cann.aclDestroyTensor(t_in_f32);
-        g_cann.aclDestroyTensor(t_cur_f16);
-    }
-    dbg_sync(-1, "initial Cast");
 
     // RoPE cos/sin row views for this position.
     uint16_t *cos_pos = (uint16_t *)rope_cos_dev_ + (size_t)pos * head_dim_;
@@ -1354,6 +1384,102 @@ void TalkerCannEngine::forward_decode(const float *input_embed, int pos,
                                        float *hidden_out) {
     forward_decode_launch(input_embed, pos, nullptr);
     forward_decode_fetch(hidden_out);
+}
+
+// ============================================================================
+// M6.2 Track J: speculative-embedding split.
+//
+// `_launch_cast` uploads the F32 input embedding and queues the F32->F16
+// Cast into `cur_dev_` on `stream_`. Graph capture is incompatible with this
+// path (a subsequent delta-add would invalidate the captured body), so we
+// always run eagerly here.
+//
+// `add_input_delta_f32` fences `stream_` on `wait_event` (typically the
+// sibling stream's CP forward_done_event_), H2D-uploads the F32 delta,
+// casts to F16, and InplaceAdd's onto `cur_dev_`.
+//
+// `_launch_layers` runs the 28-layer transformer body + final norm + cast
+// back to F32, then records `decode_done_event_`.
+// ============================================================================
+
+void TalkerCannEngine::forward_decode_launch_cast(const float *input_embed,
+                                                   int pos,
+                                                   aclrtEvent wait_event) {
+    assert(ready_);
+    assert(pos >= 0 && pos < MAX_SEQ);
+    (void)pos;  // only consumed inside _launch_layers for RoPE indexing.
+
+    if (wait_event && g_cann.aclrtStreamWaitEvent) {
+        ACL_CHECK_RET(g_cann.aclrtStreamWaitEvent(stream_, wait_event));
+    }
+
+    // H2D upload: F32 provisional embedding into staging.
+    ACL_CHECK_RET(g_cann.aclrtMemcpy(
+        input_stage_f32_dev_, (size_t)n_embd_ * sizeof(float),
+        input_embed,          (size_t)n_embd_ * sizeof(float),
+        ACL_MEMCPY_HOST_TO_DEVICE));
+
+    // F32 -> F16 cast on stream_ into cur_dev_.
+    cast_input_f32_to_f16_();
+}
+
+void TalkerCannEngine::add_input_delta_f32(const float *delta,
+                                            aclrtEvent wait_event) {
+    assert(ready_);
+
+    // Optional cross-stream fence (e.g. wait for CP[N]'s forward_done_event_
+    // from the sibling stream before consuming the host's delta).
+    if (wait_event && g_cann.aclrtStreamWaitEvent) {
+        ACL_CHECK_RET(g_cann.aclrtStreamWaitEvent(stream_, wait_event));
+    }
+
+    // H2D upload F32 delta. Blocking memcpy is fine here — by the time the
+    // caller built `delta` host-side, CP[N]'s fetch has already drained on
+    // stream B and `wait_event` (above) only serialises the device-side
+    // ordering. The host memcpy is sequential with the prior queue, so the
+    // subsequent Cast+Add ops see the uploaded bytes in stream order.
+    ACL_CHECK_RET(g_cann.aclrtMemcpy(
+        delta_stage_f32_dev_, (size_t)n_embd_ * sizeof(float),
+        delta,                (size_t)n_embd_ * sizeof(float),
+        ACL_MEMCPY_HOST_TO_DEVICE));
+
+    // Cast delta F32 -> F16 into dedicated scratch.
+    {
+        aclTensor *t_in_f32 = tensor_2d(delta_stage_f32_dev_,
+                                         1, n_embd_, ACL_FLOAT);
+        aclTensor *t_in_f16 = tensor_2d(delta_stage_f16_dev_,
+                                         1, n_embd_, ACL_FLOAT16);
+        CANN_OP(Cast, t_in_f32, ACL_FLOAT16, t_in_f16);
+        g_cann.aclDestroyTensor(t_in_f32);
+        g_cann.aclDestroyTensor(t_in_f16);
+    }
+
+    // InplaceAdd: cur_dev_ += delta_stage_f16_dev_ (F16). aclnnInplaceAdd's
+    // signature is (selfRef, other, alpha) — `self` is modified in place.
+    {
+        aclTensor *t_cur   = tensor_1d(cur_dev_, n_embd_, ACL_FLOAT16);
+        aclTensor *t_delta = tensor_1d(delta_stage_f16_dev_, n_embd_,
+                                        ACL_FLOAT16);
+        CANN_OP(InplaceAdd, t_cur, t_delta, one_scalar_f16_);
+        g_cann.aclDestroyTensor(t_cur);
+        g_cann.aclDestroyTensor(t_delta);
+    }
+}
+
+void TalkerCannEngine::forward_decode_launch_layers(int pos) {
+    assert(ready_);
+    assert(pos >= 0 && pos < MAX_SEQ);
+
+    // Graph capture is skipped on the split path. The recorded graph at `pos`
+    // would assume the original (un-delta'd) cur_dev_ contents, which is no
+    // longer a function of just pos when delta-add runs in between.
+    run_decode_body_(pos);
+
+    if (decode_done_event_ && g_cann.aclrtRecordEvent) {
+        ACL_CHECK_RET(g_cann.aclrtRecordEvent(decode_done_event_, stream_));
+    }
+
+    if (pos + 1 > kv_cache_len_) kv_cache_len_ = pos + 1;
 }
 
 // ============================================================================

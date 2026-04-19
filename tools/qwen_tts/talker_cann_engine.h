@@ -65,6 +65,37 @@ public:
                                 aclrtEvent wait_event = nullptr);
     void forward_decode_fetch(float *hidden_out);
 
+    // ---- M6.2 Track J: speculative-embedding split ------------------------
+    // `_launch_cast` uploads the F32 input embedding and queues the initial
+    // F32->F16 Cast into `cur_dev_` on `stream_`. Disables aclGraph capture
+    // for the caller's session because graph capture spans the entire decode
+    // body; the split halves are incompatible with a single captured block.
+    // Returns immediately (async on `stream_`).
+    //
+    // `add_input_delta_f32` uploads a host F32 `[n_embd]` delta, casts it to
+    // F16, and issues an in-flight `aclnnInplaceAdd` onto `cur_dev_`. When
+    // `wait_event` is non-null, `stream_` fences on it BEFORE the upload
+    // (so the caller can stall the delta-add until e.g. CP[N] on a sibling
+    // stream finishes and its last group's contribution is known on host).
+    //
+    // `_launch_layers` runs the 28-layer transformer body + final RmsNorm +
+    // Cast-to-F32 on `stream_`, then records `decode_done_event_` as before.
+    // `forward_decode_fetch` stays unchanged — D2H the F32 hidden.
+    //
+    // Callers that want the un-split behaviour keep calling
+    // `forward_decode_launch` (still in place as a convenience that calls
+    // cast + layers back-to-back).
+    //
+    // Precondition on `add_input_delta_f32`: must be called between a
+    // `_launch_cast` and its paired `_launch_layers` on the same `pos`. The
+    // delta buffer on the host is read synchronously inside the H2D memcpy
+    // so the caller may free/rewrite it as soon as the call returns.
+    void forward_decode_launch_cast(const float *input_embed, int pos,
+                                     aclrtEvent wait_event = nullptr);
+    void add_input_delta_f32(const float *delta,
+                              aclrtEvent wait_event = nullptr);
+    void forward_decode_launch_layers(int pos);
+
     // Batched prefill (S>1). Appends `seq_len` tokens to the KV cache
     // starting at `start_pos`. Only the LAST position's hidden state is
     // returned (TalkerLLM only needs that for next-token sampling).
@@ -228,6 +259,13 @@ private:
     void *input_stage_f32_dev_  = nullptr;  // F32 [MAX_PREFILL * n_embd]
     void *output_stage_f32_dev_ = nullptr;  // F32 [n_embd]
 
+    // M6.2 Track J: F16 staging for the speculative delta-add path.
+    // `add_input_delta_f32` uploads an F32 delta here (host->device), then
+    // issues a Cast to F16 into `delta_stage_f16_dev_` and an InplaceAdd
+    // onto `cur_dev_` — all on `stream_`.
+    void *delta_stage_f32_dev_ = nullptr;   // F32 [n_embd]
+    void *delta_stage_f16_dev_ = nullptr;   // F16 [n_embd]
+
     // Scalars
     aclScalar *one_scalar_f16_ = nullptr;   // F16 1.0 (for F16 Add alpha)
 
@@ -293,4 +331,17 @@ private:
     // holds the F16 input and leaves the final (post-norm) result in
     // `normed_dev_` ready to be cast to F32 and downloaded.
     void run_decode_ops_(int pos);
+
+    // Same as run_decode_ops_ but WITHOUT the initial F32->F16 Cast at the
+    // top. Used by the speculative split path (`_launch_cast` does the cast
+    // explicitly, then `add_input_delta_f32` mutates cur_dev_, then
+    // `_launch_layers` calls this to run the 28-layer body). Keeping
+    // `run_decode_ops_` separate preserves the aclGraph capture contract on
+    // the non-speculative path.
+    void run_decode_body_(int pos);
+
+    // Internal: F32 cast of input_stage_f32_dev_ -> cur_dev_ (F16) on stream_.
+    // Factored out so `_launch_cast` and `run_decode_ops_` share the same
+    // op call site.
+    void cast_input_f32_to_f16_();
 };

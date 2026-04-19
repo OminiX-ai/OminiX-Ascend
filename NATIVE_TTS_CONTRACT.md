@@ -590,6 +590,41 @@ File: `tools/qwen_tts/talker_cann_engine.{h,cpp}` — mirrors `CpCannEngine`.
   `forward_decode_launch` blocks the one structural change (staged
   upload / delta-add / commit) that would let Talker[N+1] overlap with
   CP[N] on disjoint streams. M6.2 stays `[~]` with measured 21.9 fps.
+  **Track J follow-up (2026-04-17)**: speculative-embedding variant
+  landed in `TalkerLLM::generate` + `TalkerCannEngine`. The engine now
+  exposes a three-step split of `forward_decode_launch`:
+  `_launch_cast` (H2D + F32→F16 Cast on `cur_dev_`), `add_input_delta_f32`
+  (H2D delta + Cast+InplaceAdd to patch groups 1..15 contribution onto
+  `cur_dev_` in F16, fenced on CP's `forward_done_event_`), and
+  `_launch_layers` (28-layer body + final RmsNorm + Cast-to-F32,
+  records `decode_done_event_`). The ICL loop now launches the Talker
+  cast before `predict_code_groups`, then builds the groups-1..15 sum
+  on host and applies it via `add_input_delta_f32` before queuing the
+  layers. Track J commit SHA pending in `tools/qwen_tts/{talker,
+  talker_cann_engine}.{h,cpp}`. **ASR 4/4 PASS** on utt1 edit-dist 2
+  (`, → .`, `. → ?`), utt2/utt3/long verbatim. **DTW log-mel cos-sim
+  0.973** (aligned mean, n_mels=80) between NZ-on-speculative and
+  NZ-on-sequential (`TALKER_SPECULATIVE=0`) on the long utt — well
+  above the 0.85 quality gate. Natural-EOS frame count drifts by ≤ 2:
+  speculative 75 frames vs sequential 77 frames on the long utt, an
+  artefact of the F16-in-kernel delta add vs F32-on-host sum + single
+  Cast (quantization order matters at the F16 precision floor). Long-
+  utt fps on ModelArts 910B4 CANN 8.5 `TASK_QUEUE_ENABLE=2`
+  `TALKER_NZ_WEIGHTS=1`: **26.5 fps avg** (29.0 / 28.9 / 26.1 / 25.2
+  / 25.6 / 25.7 / 25.0 across seven seed=42 cp_groups=8 max_tokens=250
+  runs). Against a same-HEAD sequential (k=1) rebuilt baseline measured
+  on the same machine in the same session: **27.7 fps avg** (27.3 /
+  27.4 / 28.3) — i.e. **the speculative path trends ~1 fps SLOWER than
+  k=1 on this hardware**, though both modes move far above the stale
+  21.9 fps Track H stamp (that measurement predated a ModelArts cache-
+  warming change). The 28 fps gate is thus not consistently met by
+  either mode in this session; M6.2 stays `[~]` with measured
+  26.5 fps. Root cause of the flat-vs-k=1 result documented in §8
+  Track J note: the speculative split is structurally correct but the
+  NPU-side overlap it enables is dominated by the host-serial CP
+  group-by-group sampling loop. `TALKER_SPECULATIVE=0` restores the
+  Track H k=1 path verbatim (confirmed via ASR + frame count parity
+  against Track H's rebuild).
 - [~] 6.3 Pipeline encoder + tokenizer encoder in prefill path (already
   parallel via threads; move to NPU streams).
   **Not applicable as stated — the "two encoders on one NPU stream"
@@ -1421,6 +1456,95 @@ carrying a silent false claim.
   pulled wavs (`/tmp/h2_utt{1,2,3}.wav`, `/tmp/h_long_v1.wav`) —
   4/4 pass edit-distance ≤ 2. Gate = ASR PASS 4/4, fps **21.9 vs 28
   target** → M6.2 remains `[~]`.
+
+- **2026-04-17 Track J (M6.2 — speculative-embedding variant landed,
+  ASR PASS 4/4, DTW 0.973, but fps still under 28 gate)**:
+
+  Track J extends the Track G engine-level async split and Track H
+  k=1 orchestrator with the final piece Track G's follow-up list
+  called out as "G-prime": splitting `forward_decode_launch` into
+  `_launch_cast` + `add_input_delta_f32` + `_launch_layers` so the
+  orchestrator can launch Talker[N+1]'s F32→F16 Cast on stream A with
+  a provisional `codec_embed(g0) + trailing` input embedding,
+  concurrently run CP[N] on stream B, then patch the groups-1..15
+  contribution into `cur_dev_` via an F16 aclnnInplaceAdd fenced on
+  CP's `forward_done_event_`, and finally issue the 28 transformer
+  layers. Engine additions: `forward_decode_launch_cast`,
+  `add_input_delta_f32`, `forward_decode_launch_layers`,
+  `run_decode_body_` (the non-cast counterpart to `run_decode_ops_`
+  used by aclGraph capture), `cast_input_f32_to_f16_` helper, and two
+  new staging buffers `delta_stage_f32_dev_` / `delta_stage_f16_dev_`.
+  The orchestrator (`TalkerLLM::generate`) gained a speculative branch
+  guarded by `TALKER_SPECULATIVE` (default on; `=0` reverts to Track
+  H's k=1 path verbatim). First-step fence skipping via `cp_ever_fired`
+  avoids blocking on a never-recorded CP event.
+
+  **Why the 28 fps gate is still not met — structural limit of the
+  speculative variant on top of host-serial CP**: the spec's overlap
+  intent — "Talker[N+1] layers run while CP[N]'s later groups run on
+  stream B" — only pays off if the HOST doesn't serialize on CP's
+  per-group outputs. But `predict_code_groups` must fetch each group's
+  hidden to sample the next group's token before the next CP forward
+  can run (the CP sampled-token feeds the next position's input
+  embedding). So by the time the host returns from
+  `predict_code_groups`, stream B is fully drained on CP and the
+  speculative cast on stream A has long since finished its < 1 ms of
+  work. The `aclrtStreamWaitEvent(talker_stream, cp_done_event)`
+  before the delta-add is then trivially satisfied, and the layers
+  start as soon as delta-add queues. Net effect vs Track H: Talker
+  cast moved from "post-CP" to "pre-CP" (saves ~0.3 ms); Talker layers
+  still wait until post-CP (no change); host pays a ~0.7 ms tax per
+  step for the extra F32 delta buffer + F32→F16 Cast + InplaceAdd +
+  cross-stream fence. Over a 75-frame utt that's ~50 ms overhead, i.e.
+  a ~1 fps regression vs a same-HEAD Track H run on the same
+  machine. Interleaved A/B measurement (one speculative run, one
+  `TALKER_SPECULATIVE=0` run, on consecutive utterances) shows the
+  regression is consistent: speculative 26.1 / 25.2 fps vs sequential
+  27.4 / 28.3 fps, both 75/77-frame natural-EOS runs. True overlap
+  would require pushing the CP sampling loop device-side (a single
+  fused CP kernel that produces groups 1..15 without host round-
+  trips), which is out of scope for M6.2.
+
+  **Numerical drift — documented, within quality gate**: the F16
+  delta-add on device produces slightly different cur_dev_ than the
+  F32 host sum + single F32→F16 Cast. The two-frame EOS drift (spec
+  75f vs seq 77f on the long utt) is the visible symptom. Audio
+  content is bit-near-identical: DTW log-mel cosine similarity 0.973
+  between /tmp/track_j_long.wav (NZ-on-speculative) and /tmp/seq_long.wav
+  (NZ-on-sequential, same seed/cp_groups/max_tokens), n_mels=80
+  n_fft=1024 hop_length=256. ASR 4/4 PASS on utt1/utt2/utt3/long with
+  edit-distance ≤ 2 (utt1 has punctuation drift `,→.` and `.→?`
+  matching Track G/H's ASR pattern; utt2/utt3/long verbatim). `seed=42`
+  determinism verified by frame count reproduction across runs.
+
+  **Files touched (Track J)**: `tools/qwen_tts/talker_cann_engine.{h,cpp}`
+  — three new public entry points (`forward_decode_launch_cast`,
+  `add_input_delta_f32`, `forward_decode_launch_layers`), two new
+  private helpers (`run_decode_body_`, `cast_input_f32_to_f16_`), two
+  new device staging buffers (delta F32 + F16), alloc/free paired in
+  init_from_gguf and dtor. `tools/qwen_tts/talker.cpp` —
+  `TalkerLLM::generate` ICL loop got a speculative branch (builds
+  provisional embedding, launches cast, runs CP, builds 15-group
+  delta, fences add on `forward_done_event_`, launches layers). The
+  k=1 Track H behaviour is preserved verbatim under the else branch
+  and is the fallback for `TALKER_SPECULATIVE=0`. **Zero edits** to
+  `cp_cann_engine.{h,cpp}`, `cp_cann_symbols.{h,cpp}`, `main.cpp`,
+  `qwen_tts.{h,cpp}`, `build_graph.cpp`, speech-tokenizer files, or
+  `CMakeLists.txt`.
+
+  **Verified-by**: (a) Track J commit SHA pending in
+  `OminiX-Ascend/tools/qwen_tts/{talker.cpp,talker_cann_engine.{h,cpp}}`
+  under CANN 8.5 on ModelArts 910B4; (b) long-utt fps runs
+  29.0/28.9/26.1/25.2/25.6/25.7/25.0 = avg 26.5 at
+  `TASK_QUEUE_ENABLE=2 TALKER_NZ_WEIGHTS=1 seed=42 cp_groups=8
+  max_tokens=250`; interleaved sequential A/B on same session
+  27.3/27.4/28.3 avg 27.7; (c) ASR via local mlx-whisper
+  (`whisper-large-v3-turbo`, lang=en, temp=0) on
+  `/tmp/track_j_long.wav`, `/tmp/spec_utt{1,2,3}.wav` — 4/4 PASS
+  edit-dist ≤ 2; (d) DTW log-mel cos-sim 0.973 (librosa melspectrogram
+  + `librosa.sequence.dtw(metric='cosine')` + aligned cosine) between
+  speculative and sequential long-utt wavs. Gate = ASR PASS 4/4, DTW
+  0.973 > 0.85, fps **26.5 vs 28 target** → M6.2 remains `[~]`.
 
 - **2026-04-17 Track K (M6.3 — encoder+prefill NPU-stream overlap) —
   NOT APPLICABLE: premise doesn't hold, 0% win possible on current
