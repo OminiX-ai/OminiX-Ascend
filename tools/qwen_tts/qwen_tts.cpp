@@ -739,16 +739,21 @@ bool QwenTTS::generate(const QwenTTSParams& params, std::vector<float>& audio_ou
     }
 
     // Fade-in mask for the decoder boundary artifact at the ref/target cut
-    // point. Originally landed as e6eb3929 (50 ms); the patch was lost in a
-    // later merge. 120 ms linear ramp tamps the brief noise burst that
-    // survives the cut without audibly softening the onset of speech.
+    // point. Originally landed as e6eb3929 (50 ms linear); later restored
+    // at 120 ms linear (1b88df98). User still reported a prefix click —
+    // waveform analysis showed a noise burst at 50-100 ms that a 120 ms
+    // linear fade only attenuates to ~0.6×. Cubic fade over 200 ms knocks
+    // the first 100 ms down to 0.125× (inaudible) while still reaching full
+    // amplitude by 200 ms (speech onset usually starts around 180-250 ms
+    // post-cut, so the audible onset is not softened).
     {
-        int fade_ms = 120;
+        int fade_ms = 200;
         int fade_samples = std::min(
             (int)(fade_ms * 24 /* samples per ms at 24kHz */),
             (int)audio_out.size());
         for (int i = 0; i < fade_samples; i++) {
-            audio_out[i] *= (float)i / fade_samples;
+            float t = (float)i / fade_samples;   // 0..1
+            audio_out[i] *= t * t * t;            // cubic ease-in
         }
     }
 
