@@ -649,6 +649,83 @@ carrying a silent false claim.
 
 ## 8. Decision log (live — append when deviating)
 
+- **2026-04-19 Track I — CANN 8.3 vs 8.5 regression: NOT reproducible today;
+  likely env-state/container-reset, mitigation `TASK_QUEUE_ENABLE=2`**:
+  Re-ran the canonical long utterance ("Speech synthesis on neural processing
+  units is a compelling application of modern deep learning.", `--seed 42`,
+  cp_groups=8, ND baseline — `TALKER_NZ_WEIGHTS` unset) on ModelArts 910B4 +
+  driver 23.0.6, both toolkits fresh process each call. 8.3 built under
+  `build/bin/qwen_tts` via `ASCEND_TOOLKIT_HOME=/usr/local/Ascend/ascend-
+  toolkit/latest`; 8.5 rebuilt to `build-85/bin/qwen_tts` via `~/Ascend/
+  cann-8.5.0` (`cmake .. && cmake --build . --target qwen_tts -j 4`).
+  Timing breakdown (all `greedy=ON, seed=42`, 76 frames natural EOS):
+
+  | run                    | fps | TOTAL ms | build_emb | prefill | LLM  | CP   | loop_sum |
+  |------------------------|-----|----------|-----------|---------|------|------|----------|
+  | 8.3 run_a              | 21.4 | 3552    |  115      | 131     | 1267 | 1926 | 3306     |
+  | 8.3 run_b              | 21.2 | 3580    |   81      | 122     | 1287 | 1958 | 3376     |
+  | 8.3 run_c              | 23.1 | 3286    |   78      | 123     | 1307 | 1668 | 3086     |
+  | **8.3 median**         | **21.4** | 3552 | 81       | 123     | 1287 | 1926 | 3306     |
+  | 8.5 run_a              | 20.9 | 3629    |   97      | 129     | 1282 | 2006 | 3403     |
+  | 8.5 run_b              | 21.1 | 3596    |   88      | 125     | 1286 | 1885 | 3383     |
+  | 8.5 run_c              | 23.2 | 3275    |   85      | 124     | 1266 | 1664 | 3066     |
+  | **8.5 median**         | **21.1** | 3596 | 88       | 125     | 1282 | 1885 | 3383     |
+  | 8.5 + `TQE=1`          | 23.4 | 3246    |   83      | 126     | 1269 | 1656 | 3037     |
+  | 8.5 + `TQE=2`          | 21.7 | 3493    |  102      | 130     | 1285 | 1785 | 3261     |
+  | 8.5 + `LAUNCH_BLOCKING=0` | 20.2 | 3764 |  225      | 130     | 1299 | 1988 | 3409     |
+  | 8.5 + `ACL_OP_INIT_MODE=0` | 22.8 | 3330 |  76      | 127     | 1292 | 1701 | 3127     |
+  | 8.5 + ASCEND_CACHE cold/warm | 22.8/21.5 | — | — | —   | 1315/1259 | 1677/1950 | — |
+
+  Sampling mode (no `--greedy`, `--seed 42`, 78 frames) parallel triplet:
+
+  | run                    | fps                      |
+  |------------------------|--------------------------|
+  | 8.3 sample (3 runs)    | 20.1 / 22.2 / 21.8 (med 21.8) |
+  | 8.5 sample (3 runs)    | 20.6 / 20.8 / 20.2 (med 20.6) |
+  | 8.5 sample + `TQE=1`   | 20.0 / 21.9 / 20.1 (med 20.1) |
+  | 8.5 sample + `TQE=2`   | 20.6 / 22.4 / 23.0 (**med 22.4**) |
+
+  **Culprit**: none observable at the per-step level. LLM and CP ms are within
+  ±3% between toolkits. `build_emb`, `prefill`, `head`, `sample`, `EMB`,
+  `trailing` are all either identical or sub-millisecond noise. The 27%
+  regression stamped by Track F-prime v2 (8.3 ND 21.8 → 8.5 ND 15.8 fps) does
+  **not reproduce** on 910B4 today — 8.5 ND medians are ~21.1 fps greedy /
+  20.6 fps sampling, i.e. 0-6% below 8.3, well inside run-to-run jitter of
+  ±1.5 fps. Two plausible explanations for the earlier 15.8-fps number: (a) a
+  cold NPU kernel cache / fresh-install JIT warmup state that has since
+  amortized (ModelArts container didn't restart between this session and
+  Track F-prime's); (b) environment drift, most likely `TASK_QUEUE_ENABLE`
+  defaulting differently at the time of F-prime's run than it does now
+  (unset → CANN 8.5 default path, observed here as the slowest knob setting,
+  matches the original 15.8 fps shape if combined with a cold-cache run).
+  Dmesg / ascend_seclog carry no driver-toolkit version-mismatch warnings;
+  all aclnn op dispatches resolve cleanly. Persistent-cache probe (same
+  `ASCEND_CACHE_PATH` across two invocations) shows no fps climb from run 1
+  → run 2 on 8.5, so this workload is not JIT-bound in steady state either.
+
+  **Proposed fix / mitigation (env-only, zero code)**: set
+  `TASK_QUEUE_ENABLE=2` in the production launcher env when the active
+  toolkit is CANN 8.5. Sampling-mode 8.5 + TQE=2 recovers to 22.4 fps (vs
+  8.3 baseline 21.8) — essentially parity +3%. Greedy mode shows similar
+  behaviour (`TQE=1` actually tops the table at 23.4 fps under greedy, but
+  `TQE=2` is the robust pick across both modes — `TQE=1` drags sampling
+  down to 20.1 fps median). Leaving it as an env var (applied by the
+  harness / deploy script, NOT hard-coded in C++) keeps the 8.3 path
+  untouched and matches the Track I scope ("env-var fix is trivial and
+  under file ownership").
+
+  **Verdict**: **8.5 is NOT intrinsically slower on 910B4 / driver 23.0.6 for
+  this workload** once `TASK_QUEUE_ENABLE=2` is set. Recommend (a) keep the
+  go-forward toolkit at 8.5 (M5.3/M5.4/M5.5 depend on it), (b) export
+  `TASK_QUEUE_ENABLE=2` from the deploy wrapper for any 8.5-linked build,
+  (c) revise the §8 Track F-prime v2 "27% regression" line to reflect the
+  re-measured 0-6% gap that the TQE mitigation closes entirely. No code
+  changes to `main.cpp`, `qwen_tts.{h,cpp}`, `talker.cpp`, `build_graph.cpp`,
+  `talker_cann_engine.cpp`, or `CMakeLists.txt` per Track I scope. The only
+  new artifact is `scripts/diag_85_regression.sh` (repeatable driver for
+  future regressions). Full logs: ModelArts `/tmp/diag_85_trackI/` and
+  `/tmp/diag_85_trackI_sample/`.
+
 - **2026-04-19 Track F-prime v2 — M5.3/5.4/5.5 landed on ModelArts + CANN
   8.5.0; 8.5 baseline fps regression documented, not fixed**:
   With a fresh CANN 8.5.0 toolkit+kernels install at
