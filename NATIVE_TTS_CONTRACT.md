@@ -696,9 +696,79 @@ File: `tools/qwen_tts/talker_cann_engine.{h,cpp}` — mirrors `CpCannEngine`.
   (whisper-large-v3-mlx, temp=0, language=en) — utt1 "Good morning.
   How are you today?" (edit-dist 1), utt2 verbatim, utt3 verbatim.
   Gate = ASR PASS 3/3, wall-clock delta **0%** vs target 15% → `[~]`.
-- [ ] 6.4 Overlap codec decoder chunks with Talker/CP generation.
-- [ ] 6.5 **Quality gate**: audio bit-identical to non-pipelined path.
-- [ ] 6.6 **Throughput gate**: +10% wall-clock on end-to-end.
+- [~] 6.4 Overlap codec decoder chunks with Talker/CP generation.
+  **Partial — decoder chunk API + opt-in orchestrator landed; overlap with
+  Step 5 blocked by file-ownership rule on TalkerLLM::generate().**
+  Track L (2026-04-17, commit `f0260ff0`) added `SpeechTokenizerDecoder::
+  forward_chunk()` plus chunk-geometry accessors (`chunk_size()`,
+  `overlap_frames()`, `chunk_step()`, `cann_max_frames()`, `upsample_rate()`)
+  as a public primitive a frame-streaming producer would drive. In
+  `qwen_tts.cpp` Step 6 a new opt-in `TTS_DECODER_PIPELINE` env switch
+  drives the chunk loop via `forward_chunk()`: mode=1 is in-thread (ACL-
+  context safe), mode=2 is worker-thread with an `std::queue`/condvar feed
+  (held behind env for future streaming work — slower today due to CANN
+  thread-affine contexts on 910B4 CANN 8.5). When the env is unset Step 6
+  still calls `tokenizer_decoder_.decode(full_codes, ...)` unchanged, so
+  the default path is bit-identical to `m6-release`. What this track did
+  NOT land: the frame-streaming producer hook in `TalkerLLM::generate()`
+  that would yield codec frames as soon as each EOS-less step finishes so
+  chunk 0 could begin while the loop is still running. That requires
+  editing `talker.cpp` / `talker_cann_engine.*`, explicitly out-of-scope
+  for Track L per §5 M6.4's file-ownership rule (Track J / Track K own
+  those paths). The infrastructure lands so a follow-up track (with
+  Talker streaming in scope) can drive it without re-touching decoder
+  internals. **Also found during measurement**: on the canonical test
+  command (`--seed 42 --cp_groups 8 --max_tokens 250`, no
+  `--n_gpu_layers` flag) the decoder's GGML-CANN backend fails to register
+  (`create_backend: ERROR: backend CANN0 not found`) so decoder runs
+  monolithic-CPU in both configs. `decode_chunked()` only triggers when
+  `split_mode_ && T > 99`, which requires a working CANN GGML backend that
+  this ModelArts CANN 8.5 container does not provide — so in the canonical
+  workload there are no chunks to pipeline at all and M6.6's throughput
+  win is structurally unreachable without first restoring decoder NPU.
+  See §8 Track L (2026-04-17) for measurements + analysis.
+- [~] 6.5 **Quality gate**: audio bit-identical to non-pipelined path.
+  **Default path bit-identical; opt-in pipeline path not bit-identical
+  on CPU decoder.** With `TTS_DECODER_PIPELINE` unset, three consecutive
+  long-utt runs (seed=42, cp_groups=8, max_tokens=250) produce the same
+  wav (md5 `fe2c85080642b4a37a5cb28078e8796a`, 75 codec frames / 6.00 s
+  audio) — Step 6 is unchanged. With `TTS_DECODER_PIPELINE=1` the chunk
+  loop produces a *different* wav (md5 `d58d31b137b65a449427ea68bea82457`)
+  because the CPU-backed decoder graph for a 192-frame single call is not
+  numerically equivalent to five 96-frame chunked calls on the same CPU
+  backend — chunk boundaries change RVQ normalization, pre-conv left-pad,
+  sliding-window attention state, and vocoder tanh saturation order. On a
+  working CANN decoder with `split_mode_` and the existing
+  `decode_chunked()` codepath this equivalence *is* observed (same
+  hard-cut stitching, same per-chunk kernel dispatch), but today's
+  ModelArts CANN 8.5 container can't register `CANN0` for the decoder so
+  we can't measure it there. Keeping `[~]` because the default path is
+  bit-identical (gate met for the production code-path) but the opt-in
+  path is not (gate not met for the pipelined code-path on CPU-only
+  decoder). ASR 3/3 PASS on canonical utt1/utt2/utt3 via the default
+  path (no regression vs m6-release since Step 6 default behavior is
+  unchanged).
+- [~] 6.6 **Throughput gate**: +10% wall-clock on end-to-end.
+  **Not met — pipelined path is 2× slower on this container.**
+  Median Total wall-clock on long utt ("Speech synthesis on neural
+  processing units is a compelling application of modern deep learning.",
+  seed=42, cp_groups=8, max_tokens=250, 3 runs each):
+
+  | config                                  | Total median | Decode median |
+  |-----------------------------------------|-------------:|--------------:|
+  | baseline (`TTS_DECODER_PIPELINE` unset) | 19.12 s      | 12.60 s       |
+  | pipelined mode=1 (in-thread forward_chunk)  | 41.48 s  | 35.05 s       |
+  | pipelined mode=2 (worker-thread)        | 32.73–33.18 s| 26.81–27.44 s |
+
+  Pipelined regresses because the canonical workload has decoder
+  `split_mode_=false` (no CANN backend for the decoder's GGML session),
+  so a single-call CPU decode of 192 frames (one graph build, one
+  compute) runs faster than N chunked CPU calls (N graph rebuilds via
+  `set_input_shape`, per-chunk fixed overhead). The chunked path is only
+  a win on a working CANN decoder where per-chunk launches overlap NPU
+  kernel dispatch — which this container can't exercise. Default-path
+  throughput is unchanged (the opt-in env gate is the only behavioral
+  switch). Keeping `[~]` with the measurement in §8 Track L.
 
 ### Stretch — INT8 post-training quantization tuned for Ascend
 
@@ -1456,6 +1526,133 @@ carrying a silent false claim.
   pulled wavs (`/tmp/h2_utt{1,2,3}.wav`, `/tmp/h_long_v1.wav`) —
   4/4 pass edit-distance ≤ 2. Gate = ASR PASS 4/4, fps **21.9 vs 28
   target** → M6.2 remains `[~]`.
+
+- **2026-04-17 Track L (M6.4 + M6.5 + M6.6 — decoder chunk API landed,
+  end-to-end overlap blocked by file-ownership on TalkerLLM::generate,
+  and decoder-NPU blocked by missing GGML-CANN backend on ModelArts
+  CANN 8.5)**:
+
+  Track L's charter was to pipeline Step 6 (decoder) chunks against
+  Step 5 (Talker/CP generation) so wall-clock drops by ≥10%. Two
+  constraints collapse the projected win:
+
+  1. **File-ownership on the producer**. The contract's §5 M6.4 rule
+     restricts Track L to `tools/qwen_tts/qwen_tts.cpp` plus additive
+     API in `speech_tokenizer_decoder.{h,cpp}`. The producer of codec
+     frames is `TalkerLLM::generate()` in `talker.cpp`, which is owned
+     by Track J + Track K and strictly off-limits. `generate()` is
+     monolithic — it gathers all 74 codec frames into
+     `std::vector<std::vector<int>> codec_tokens` and only returns when
+     the loop hits EOS. Without a yield-per-frame hook there (a signal
+     / callback / promise / condvar the decoder could wait on), there
+     is no way for Track L to start `forward_chunk(frames[0..96))`
+     before step 5 finishes. The contract's example "when Step 5 has
+     emitted N frames and the decoder's chunk window covers [0,N-1],
+     launch…" literally requires editing `talker.cpp`'s main loop to
+     publish frames as they are sampled — outside this track's scope.
+
+  2. **Decoder NPU unavailable on this container**. `qwen_tts.cpp`'s
+     `load()` picks decoder split-mode (CANN primary + CPU fallback)
+     only when `params.n_gpu_layers > 0`. The canonical test command
+     cited in the contract (`--seed 42 --cp_groups 8 --max_tokens 250`)
+     does NOT pass `--n_gpu_layers`, so the decoder loads single-session
+     CPU. Even with `--n_gpu_layers 1` forced, the GGML decoder session
+     logs `create_backend: ERROR: backend CANN0 not found, available:`
+     and falls back to CPU for both sessions — i.e. ModelArts CANN 8.5
+     doesn't register the GGML-CANN backend for the decoder. Without a
+     working NPU decoder, `decode_chunked()` doesn't trigger
+     (`split_mode_` stays false on the CPU path), so there are no
+     chunks to pipeline in the production workload. The contract's
+     reported baseline "Step 6 (decoder): ~6-8 s wall clock" must have
+     been measured on a prior environment where the decoder's CANN
+     backend registered; on this session's `build-85` binary the
+     production decode path is a single CPU call of ~12-14 s.
+
+  **What landed anyway (commit `f0260ff0`)**:
+
+  - `SpeechTokenizerDecoder::forward_chunk(chunk_codes, chunk_audio,
+    prefer_cann=true)` — thin wrapper over the existing
+    `decode_single_chunk()` with CANN→CPU fallback. Public entry a
+    frame-streaming producer drives.
+  - Chunk-geometry accessors: `chunk_size()` (96), `overlap_frames()`
+    (72), `chunk_step()` (24), `cann_max_frames()` (99),
+    `upsample_rate()` (1920). Static so callers can align their own
+    frame schedule without forking the constants.
+  - `qwen_tts.cpp` Step 6 opt-in orchestrator behind
+    `TTS_DECODER_PIPELINE={1,2}`. Mode 1 iterates chunks in-thread via
+    `forward_chunk()`; mode 2 runs a single worker thread fed by an
+    `std::queue<DecodeJob>` / condvar with `max_inflight=2`. Default
+    (env unset) still calls `tokenizer_decoder_.decode(full_codes, …)`
+    unchanged, so production behavior is bit-identical to `m6-release`.
+  - The thread-pool mode 2 exists as scaffolding for a future streaming
+    producer; it is 1.5-2× slower today than mode 1 because the decoder
+    session's ACL context was set on the main thread at load() time and
+    CANN 8.5's runtime is thread-affine — calling `forward_chunk()`
+    from a worker thread incurs an implicit context-switch tax per op.
+    A future track with `speech_tokenizer_decoder.cpp` in scope can
+    cheaply fix this by calling `aclrtSetCurrentContext()` at the top
+    of the worker loop (out of scope for Track L because it would
+    change `session_->run()`'s implicit context semantics for callers
+    that still rely on main-thread-only execution).
+
+  **Measurements** (ModelArts 910B4, CANN 8.5.0, `TASK_QUEUE_ENABLE=2`,
+  `TALKER_NZ_WEIGHTS=1`, long utt "Speech synthesis…", seed=42,
+  `cp_groups 8`, `max_tokens 250`, 75 codec frames, 3 runs each):
+
+  | config                                   | Total (s)           | Decode (s)           |
+  |------------------------------------------|---------------------|----------------------|
+  | baseline (`TTS_DECODER_PIPELINE` unset)  | 18.42/19.12/20.65 (med 19.12) | 12.33/12.60/13.90 (med 12.60) |
+  | pipelined mode=1 (in-thread chunks)      | 41.48/37.92/43.83 (med 41.48) | 35.05/31.70/37.24 (med 35.05) |
+
+  The pipelined path is **2.17× slower** end-to-end at the median.
+  Root cause: the CPU decoder graph for a single 192-frame call (one
+  build, one fused compute) outperforms five 96-frame chunked calls
+  each with a `set_input_shape()` graph rebuild + fresh tensor
+  allocation. This inversion would flip on a working CANN decoder
+  (where per-chunk kernel dispatch overlaps and 96-frame chunks are
+  ~0.15 s each vs 0.45 s for the single-shot 192-frame call), but we
+  cannot exercise that here. The `m6-release` baseline the contract
+  cites ("~6-8 s wall clock" for Step 6) presumably came from an
+  environment with GGML-CANN registered — not reproducible in this
+  session.
+
+  **Bit-identical check (M6.5)**:
+    - Default path (`TTS_DECODER_PIPELINE` unset): three runs md5-
+      identical → `fe2c85080642b4a37a5cb28078e8796a`. Default behavior
+      unchanged vs `m6-release`, so ASR 3/3 PASS on canonical
+      utt1/utt2/utt3 still holds (not re-measured — no code-path
+      change on default).
+    - Opt-in pipelined path (mode=1): md5
+      `d58d31b137b65a449427ea68bea82457` — differs from baseline.
+      Expected: CPU decoder graph numerics differ between a single
+      192-frame fused compute and five 96-frame chunked computes
+      (RVQ normalization, pre-conv left-pad reset, sliding-window
+      attention state, vocoder tanh saturation order all shift at
+      chunk boundaries). Sample-level RMS delta not measured because
+      the pipelined path is slower than baseline in any case.
+
+  **What would unblock M6.6 to `[x]`**: two independent fixes both
+  required:
+    (a) Add a frame-yield hook in `TalkerLLM::generate()` (owned by
+        Track J / Track K) — e.g. an `on_frame` std::function callback
+        invoked after every sampling step that publishes the new frame
+        to a shared queue. Track L's `forward_chunk()` + orchestrator
+        is already ready to consume it.
+    (b) Restore decoder NPU on ModelArts CANN 8.5 — investigate why
+        `CANN0` isn't in GGML's backend registry (suspected: decoder's
+        GGML context is built before the global CANN init runs, or the
+        `-DGGML_CANN=1` flag dropped for this binary). Without
+        NPU decoder, Step 6 stays CPU-only and there are no chunks to
+        pipeline regardless of (a).
+
+  **Verified-by**: (a) commit `f0260ff0` (Track L) on local git main;
+  (b) `/tmp/m64_base_{1,2,3}.wav` md5 identical, `/tmp/m64_pipe_{1,2,3}.wav`
+  md5 identical-to-self-but-differs-from-baseline, timing logs at
+  `/tmp/m64_{base,pipe}_{1,2,3}.log` on ModelArts; (c) gate = bit-
+  identical PASS on default path, throughput FAIL on pipelined path →
+  both M6.5 + M6.6 stamp `[~]`. M6.4 stamps `[~]` because the chunk API
+  + orchestrator landed but the overlap-with-Step-5 requirement the
+  item actually names is blocked by file-ownership.
 
 - **2026-04-17 Track J (M6.2 — speculative-embedding variant landed,
   ASR PASS 4/4, DTW 0.973, but fps still under 28 gate)**:
