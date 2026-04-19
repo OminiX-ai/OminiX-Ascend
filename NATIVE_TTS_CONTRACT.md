@@ -469,7 +469,8 @@ File: `tools/qwen_tts/talker_cann_engine.{h,cpp}` — mirrors `CpCannEngine`.
       bit-for-bit verbatim on the same 3 utts, confirming the swap
       didn't regress the ND fallback.
   Gate = ASR content (3/3 edit-distance ≤ 2). Artifacts on ModelArts
-  `/tmp/nz_on_utt{1,2,3}.wav` + local `/tmp/tts_m53_wavs/`.
+  `/tmp/nz_on_utt{1,2,3}.wav` + local `/tmp/tts_m53_wavs/`. Commit
+  04feb444.
 - [x] 5.4 **Quality gate**: DTW unchanged vs M4 baseline.
   Log-mel DTW cosine-similarity between NZ-on and NZ-off wavs produced
   by the same 8.5 binary at `--seed 42 --greedy`:
@@ -482,7 +483,7 @@ File: `tools/qwen_tts/talker_cann_engine.{h,cpp}` — mirrors `CpCannEngine`.
   `librosa.sequence.dtw` with `metric='cosine'` over 80-channel
   log-mel at `sr=16000, n_fft=1024, hop=256`; reported similarity =
   `1 - D[-1,-1]/path_len`.) Artifacts `/tmp/tts_m53_wavs/*.wav` on
-  local Mac. Gate = DTW ≥ 0.85 per utterance.
+  local Mac. Gate = DTW ≥ 0.85 per utterance. Commit 04feb444.
 - [x] 5.5 **Throughput gate**: +15% matmul throughput measurable (with
   end-to-end +5% weaker target as the reference threshold since
   non-matmul ops dominate Talker decode).
@@ -506,6 +507,7 @@ File: `tools/qwen_tts/talker_cann_engine.{h,cpp}` — mirrors `CpCannEngine`.
   8.5 baseline regression). Gate = end-to-end fps improves by ≥5%
   with no ASR regression. Both satisfied on ModelArts. Artifacts
   `/tmp/nz_{on,off}_longA1.wav` + `/tmp/nz_off_long{1,2,3}.wav`.
+  Commit 04feb444.
 
 ### M6 — Multi-stream pipelining (1 week) — PARALLEL after M3
 
