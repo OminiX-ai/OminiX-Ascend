@@ -834,17 +834,22 @@ File: `tools/qwen_tts/talker_cann_engine.{h,cpp}` — mirrors `CpCannEngine`.
   **33.8 fps median** over 3 runs (33.8 / 33.9 / 33.5) vs NZ baseline
   **29.7 fps median** (29.9 / 29.7 / 28.5). W8 clears the 32 fps gate
   (27.9 × 1.15) and the +13.8% delta over NZ is in the lower half of the
-  expected +20-35%. **Memory NOT passing ≥30% reduction gate** because
-  S1's "alongside F16" scheme keeps the F16 weight buffers intact so
-  `forward_prefill` can stay F16 per the contract's file-ownership rule
-  ("don't touch forward_prefill body"). With both F16 and INT8+scale
-  resident, W8 actually ADDS ~50% to on-device weight storage for S1.
-  The `npu-smi info -t usages` probe is unavailable on the ModelArts
-  driver. Leaving `[~]` until memory gate is revisited — either by
-  (a) extending W8 to prefill in a Stretch-S4, or (b) dropping the F16
-  weights post-prefill warmup on the first utterance. See §8 Track M.
+  expected +20-35% range. **Memory FAILED**: peak HBM during the same
+  long utt measured via `npu-smi info -t usages -i 2` at 0.5 s polling:
+  NZ = **6881 MB (21%)** vs W8 = **8847 MB (27%)** — W8 uses
+  **+28% more memory**, not less. Root cause: S1's "alongside F16"
+  scheme keeps the F16 weight buffers intact so `forward_prefill` can
+  stay F16 per the contract's file-ownership rule ("don't touch
+  forward_prefill body"). With F16 and INT8+scale co-resident, total
+  weight storage grows ~1.5x. To hit the ≥30% reduction gate, a
+  follow-up needs either (a) extending W8 to prefill (a Stretch-S4
+  track that CAN touch `forward_prefill`), or (b) dropping F16 weights
+  after the first prefill warmup on each utterance (safer — stays
+  inside the current file ownership but requires a one-time-per-utterance
+  hot-patch of the weight pointers). See §8 Track M. Leaving `[~]` with
+  the 33.8 fps / 8847 MB numbers recorded here.
   **Verified-by:** commit `f10508a`, ModelArts `build-85` binary,
-  3 consecutive bench runs (logs in the command history above).
+  3 consecutive bench runs + `npu-smi -t usages -i 2` peak sampling.
 
 ## 6. Acceptance criteria
 

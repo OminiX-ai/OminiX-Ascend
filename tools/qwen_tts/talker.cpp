@@ -598,6 +598,18 @@ bool TalkerLLM::load_model(const std::string &talker_llama_path,
     if (use_cp_cann) {
         init_cp_f32_weights();
         cp_cann_engine_ = new CpCannEngine();
+        // Stretch S1: TALKER_W8_QUANT=1 env toggles A16W8 INT8 weight matmul
+        // in the CP engine. Mirrors the existing TALKER_NZ_WEIGHTS pattern
+        // inside CpCannEngine::init — we call the setter here so the flag is
+        // live before init() runs (init re-checks the env and honours either
+        // path). Empty / "0" values count as "off" to match the engine-side
+        // gating.
+        {
+            const char *w8_env = getenv("TALKER_W8_QUANT");
+            if (w8_env && w8_env[0] != '\0' && w8_env[0] != '0') {
+                cp_cann_engine_->set_use_w8_weights(true);
+            }
+        }
         // CpWeightsF32 mirrors TalkerLLM::CPWeightsF32 field-for-field; this
         // avoids a deep copy but relies on the two structs staying in sync.
         const CpWeightsF32 &cp_view =
@@ -638,6 +650,16 @@ bool TalkerLLM::load_model(const std::string &talker_llama_path,
 #if defined(QWEN_TTS_HAS_CP_CANN)
     if (use_talker_cann) {
         talker_cann_engine_ = new TalkerCannEngine();
+        // Stretch S1: TALKER_W8_QUANT=1 env toggles A16W8 INT8 weight matmul
+        // in the Talker backbone. Engine's init_from_gguf reads the same env
+        // var internally; calling the setter here makes the opt-in explicit
+        // at the call site for readability. Same empty/"0" = "off" semantics.
+        {
+            const char *w8_env = getenv("TALKER_W8_QUANT");
+            if (w8_env && w8_env[0] != '\0' && w8_env[0] != '0') {
+                talker_cann_engine_->set_use_w8_weights(true);
+            }
+        }
         if (talker_cann_engine_->init_from_gguf(talker_llama_path,
                                                   talker_config_, 0)) {
             talker_use_cann_ = true;

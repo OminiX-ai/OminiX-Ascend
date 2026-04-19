@@ -195,6 +195,20 @@ bool load_once() {
     resolve_optional(h_op, "aclnnBatchMatMulWeightNz",
                      g_cann.aclnnBatchMatMulWeightNz);
 
+    // Optional: aclnnWeightQuantBatchMatmulV3/V2 (Stretch S1, CANN 8.5+).
+    // Both variants live in libopapi.so. Either can land null on older
+    // toolkits — has_w8_quant() gates both; callers dispatch V3 when present
+    // and fall back to V2 otherwise. Absence of both means "W8 quant
+    // unavailable" and callers keep the F16 path.
+    resolve_optional(h_op, "aclnnWeightQuantBatchMatmulV3GetWorkspaceSize",
+                     g_cann.aclnnWeightQuantBatchMatmulV3GetWorkspaceSize);
+    resolve_optional(h_op, "aclnnWeightQuantBatchMatmulV3",
+                     g_cann.aclnnWeightQuantBatchMatmulV3);
+    resolve_optional(h_op, "aclnnWeightQuantBatchMatmulV2GetWorkspaceSize",
+                     g_cann.aclnnWeightQuantBatchMatmulV2GetWorkspaceSize);
+    resolve_optional(h_op, "aclnnWeightQuantBatchMatmulV2",
+                     g_cann.aclnnWeightQuantBatchMatmulV2);
+
     if (!ok) {
         // Wipe partial state so is_ready() reports false.
         g_cann = {};

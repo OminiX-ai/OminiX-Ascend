@@ -107,6 +107,20 @@ public:
     // True once the NZ pre-conversion actually ran on the weight buffers.
     bool nz_applied() const { return nz_applied_; }
 
+    // ---- A16W8 weight quantization (Stretch S1) ---------------------------
+    // Opt-in toggle. When true AND g_cann.has_w8_quant() at init AND
+    // use_nz_weights_ is NOT set, init / init_from_safetensors calibrates
+    // each F16 matmul weight to per-output-channel symmetric INT8 and stores
+    // the INT8 weight + F16 scale buffers alongside the existing F16 weight
+    // (F16 retained because forward_prefill stays on F16 this round).
+    // forward_one_token then dispatches aclnnWeightQuantBatchMatmulV3/V2 at
+    // decode matmul call sites. The F32 input projection (proj_w) remains
+    // F32 — it's outside the matmul-quant scope. Mutually exclusive with
+    // NZ (W8 wins if both env flags set).
+    void set_use_w8_weights(bool enable) { use_w8_weights_ = enable; }
+    bool use_w8_weights() const { return use_w8_weights_; }
+    bool w8_applied() const { return w8_applied_; }
+
     // ---- Multi-stream pipelining (M6.1) -----------------------------------
     // Engine owns two aclrtStream handles — `primary_stream_` (default) and
     // `stream_b_` (spare for multi-stream overlap). set_stream(s) swaps
@@ -170,6 +184,23 @@ private:
         void *down_proj_w = nullptr;  // [cp_hidden, inter]
         void *input_ln_w = nullptr;   // [cp_hidden]
         void *post_ln_w = nullptr;    // [cp_hidden]
+
+        // A16W8 (Stretch S1): INT8 [out, in] + F16 per-output-channel scale,
+        // allocated alongside the F16 buffers when w8_applied_. Null otherwise.
+        void *q_proj_w_i8    = nullptr;
+        void *k_proj_w_i8    = nullptr;
+        void *v_proj_w_i8    = nullptr;
+        void *o_proj_w_i8    = nullptr;
+        void *gate_proj_w_i8 = nullptr;
+        void *up_proj_w_i8   = nullptr;
+        void *down_proj_w_i8 = nullptr;
+        void *q_proj_scale    = nullptr;
+        void *k_proj_scale    = nullptr;
+        void *v_proj_scale    = nullptr;
+        void *o_proj_scale    = nullptr;
+        void *gate_proj_scale = nullptr;
+        void *up_proj_scale   = nullptr;
+        void *down_proj_scale = nullptr;
     };
     std::vector<LayerWeights> layer_w_;
     void *final_norm_w_dev_ = nullptr;  // [cp_hidden]
@@ -289,6 +320,10 @@ private:
     bool use_nz_weights_ = false;
     bool nz_applied_     = false;
 
+    // ---- A16W8 weight quantization state (Stretch S1) -----------------------
+    bool use_w8_weights_ = false;
+    bool w8_applied_     = false;
+
     // ---- Internal helpers ----
     void alloc_dev(void **ptr, size_t bytes);
     void upload(void *dev, const float *host, size_t n_floats);
@@ -298,6 +333,18 @@ private:
     // or if use_nz_weights_ is false. See header comment on
     // set_use_nz_weights() for the full semantics.
     void nz_convert_weight_(void *weight_dev, int64_t rows, int64_t cols);
+
+    // A16W8 calibration (Stretch S1). Allocates NEW device buffers for the
+    // INT8 weight + F16 scale. Caller retains whatever F16 buffer exists —
+    // prefill still uses it. Returns true on success; outputs untouched on
+    // failure.
+    bool w8_calibrate_weight_(const float *host_w, int64_t rows, int64_t cols,
+                               void *&weight_i8_dev, void *&scale_dev);
+
+    // A16W8 matmul dispatch. Prefers V3, falls back to V2. See the
+    // TalkerCannEngine equivalent for the full shape contract.
+    void w8_matmul_(const aclTensor *x, void *weight_dev, void *scale_dev,
+                     int64_t out_n, int64_t in_k, const aclTensor *y);
 
     // Create all persistent aclTensor descriptors after weights + buffers
     // have been allocated. Called once at the end of init().

@@ -70,6 +70,12 @@ static inline uint16_t fp32_to_fp16(float x) {
     return out;
 }
 
+static inline float fp16_to_fp32(uint16_t bits) {
+    __fp16 h;
+    std::memcpy(&h, &bits, sizeof(h));
+    return (float)h;
+}
+
 static aclScalar *make_f16_scalar(float value) {
     uint16_t bits = fp32_to_fp16(value);
     return g_cann.aclCreateScalar(&bits, ACL_FLOAT16);
@@ -153,6 +159,20 @@ CpCannEngine::~CpCannEngine() {
         free_dev(lw.down_proj_w);
         free_dev(lw.input_ln_w);
         free_dev(lw.post_ln_w);
+        free_dev(lw.q_proj_w_i8);
+        free_dev(lw.k_proj_w_i8);
+        free_dev(lw.v_proj_w_i8);
+        free_dev(lw.o_proj_w_i8);
+        free_dev(lw.gate_proj_w_i8);
+        free_dev(lw.up_proj_w_i8);
+        free_dev(lw.down_proj_w_i8);
+        free_dev(lw.q_proj_scale);
+        free_dev(lw.k_proj_scale);
+        free_dev(lw.v_proj_scale);
+        free_dev(lw.o_proj_scale);
+        free_dev(lw.gate_proj_scale);
+        free_dev(lw.up_proj_scale);
+        free_dev(lw.down_proj_scale);
     }
     free_dev(final_norm_w_dev_);
 
@@ -288,6 +308,150 @@ void CpCannEngine::nz_convert_weight_(void *weight_dev,
     }
     ACL_CHECK_RET(g_cann.aclrtSynchronizeStream(stream_));
     g_cann.aclDestroyTensor(t);
+}
+
+// ============================================================================
+// A16W8 calibration (Stretch S1). See TalkerCannEngine::w8_calibrate_weight_
+// for algorithmic details — same per-output-channel symmetric INT8 scheme.
+// ============================================================================
+
+bool CpCannEngine::w8_calibrate_weight_(const float *host_w,
+                                         int64_t rows, int64_t cols,
+                                         void *&weight_i8_dev,
+                                         void *&scale_dev) {
+    if (!host_w || rows <= 0 || cols <= 0) return false;
+
+    std::vector<int8_t>   w_i8((size_t)rows * cols);
+    std::vector<uint16_t> scales_f16((size_t)rows);
+
+    for (int64_t r = 0; r < rows; ++r) {
+        const float *row_src = host_w + (size_t)r * cols;
+        float max_abs = 0.0f;
+        for (int64_t j = 0; j < cols; ++j) {
+            float v = std::fabs(row_src[j]);
+            if (v > max_abs) max_abs = v;
+        }
+        float scale = (max_abs > 0.0f) ? (max_abs / 127.0f) : 1.0f;
+        float inv_scale = 1.0f / scale;
+        int8_t *row_dst = w_i8.data() + (size_t)r * cols;
+        for (int64_t j = 0; j < cols; ++j) {
+            int ir = (int)std::rint(row_src[j] * inv_scale);
+            if (ir >  127) ir =  127;
+            if (ir < -127) ir = -127;
+            row_dst[j] = (int8_t)ir;
+        }
+        scales_f16[(size_t)r] = fp32_to_fp16(scale);
+    }
+    for (int64_t r = 0; r < rows; ++r) {
+        if (!std::isfinite(fp16_to_fp32(scales_f16[(size_t)r]))) {
+            fprintf(stderr, "[cp_cann] w8 calib: non-finite scale row %lld\n",
+                    (long long)r);
+            return false;
+        }
+    }
+
+    void *new_w = nullptr;
+    aclError err = g_cann.aclrtMalloc(&new_w, (size_t)rows * cols * sizeof(int8_t),
+                                       ACL_MEM_MALLOC_HUGE_FIRST);
+    if (err != 0 || !new_w) return false;
+    ACL_CHECK_RET(g_cann.aclrtMemcpy(
+        new_w, (size_t)rows * cols * sizeof(int8_t),
+        w_i8.data(), (size_t)rows * cols * sizeof(int8_t),
+        ACL_MEMCPY_HOST_TO_DEVICE));
+
+    void *new_s = nullptr;
+    err = g_cann.aclrtMalloc(&new_s, (size_t)rows * sizeof(uint16_t),
+                              ACL_MEM_MALLOC_HUGE_FIRST);
+    if (err != 0 || !new_s) {
+        g_cann.aclrtFree(new_w);
+        return false;
+    }
+    ACL_CHECK_RET(g_cann.aclrtMemcpy(
+        new_s, (size_t)rows * sizeof(uint16_t),
+        scales_f16.data(), (size_t)rows * sizeof(uint16_t),
+        ACL_MEMCPY_HOST_TO_DEVICE));
+    weight_i8_dev = new_w;
+    scale_dev     = new_s;
+    return true;
+}
+
+// ============================================================================
+// A16W8 matmul dispatch. Same contract as the Talker version.
+// ============================================================================
+
+void CpCannEngine::w8_matmul_(const aclTensor *x,
+                                void *weight_dev, void *scale_dev,
+                                int64_t out_n, int64_t in_k,
+                                const aclTensor *y) {
+    int64_t w_shape[2]   = {in_k, out_n};
+    int64_t w_strides[2] = {1, in_k};
+    int64_t w_storage    = out_n * in_k;
+    aclTensor *t_w = g_cann.aclCreateTensor(
+        w_shape, 2, ACL_INT8, w_strides, 0, ACL_FORMAT_ND,
+        &w_storage, 1, weight_dev);
+
+    int64_t s_shape[1]   = {out_n};
+    int64_t s_strides[1] = {1};
+    int64_t s_storage    = out_n;
+    aclTensor *t_scale = g_cann.aclCreateTensor(
+        s_shape, 1, ACL_FLOAT16, s_strides, 0, ACL_FORMAT_ND,
+        &s_storage, 1, scale_dev);
+
+    uint64_t ws_needed = 0;
+    aclOpExecutor *exec = nullptr;
+    aclnnStatus s = 0;
+    bool used_v3 = false;
+    if (g_cann.aclnnWeightQuantBatchMatmulV3GetWorkspaceSize &&
+        g_cann.aclnnWeightQuantBatchMatmulV3) {
+        s = g_cann.aclnnWeightQuantBatchMatmulV3GetWorkspaceSize(
+            x, t_w, t_scale,
+            /*antiquantOffset*/ nullptr,
+            /*quantScale*/      nullptr,
+            /*quantOffset*/     nullptr,
+            /*bias*/            nullptr,
+            /*antiquantGroupSize*/ 0,
+            /*innerPrecise*/       1,
+            y, &ws_needed, &exec);
+        if (s == 0) used_v3 = true;
+    }
+    if (!used_v3) {
+        if (!g_cann.aclnnWeightQuantBatchMatmulV2GetWorkspaceSize ||
+            !g_cann.aclnnWeightQuantBatchMatmulV2) {
+            fprintf(stderr, "[cp_cann] w8_matmul: no V3/V2 symbol resolved\n");
+            g_cann.aclDestroyTensor(t_w);
+            g_cann.aclDestroyTensor(t_scale);
+            return;
+        }
+        s = g_cann.aclnnWeightQuantBatchMatmulV2GetWorkspaceSize(
+            x, t_w, t_scale, nullptr, nullptr, nullptr, nullptr,
+            /*antiquantGroupSize*/ 0, y, &ws_needed, &exec);
+        if (s != 0) {
+            fprintf(stderr,
+                    "[cp_cann] w8_matmul V2 GetWorkspaceSize status=%d\n",
+                    (int)s);
+            g_cann.aclDestroyTensor(t_w);
+            g_cann.aclDestroyTensor(t_scale);
+            return;
+        }
+    }
+    if (ws_needed > workspace_size_) {
+        if (workspace_dev_) g_cann.aclrtFree(workspace_dev_);
+        ACL_CHECK_RET(g_cann.aclrtMalloc(&workspace_dev_, ws_needed,
+                                          ACL_MEM_MALLOC_HUGE_FIRST));
+        workspace_size_ = ws_needed;
+    }
+    void *ws = ws_needed > 0 ? workspace_dev_ : nullptr;
+    if (used_v3) {
+        s = g_cann.aclnnWeightQuantBatchMatmulV3(ws, ws_needed, exec, stream_);
+    } else {
+        s = g_cann.aclnnWeightQuantBatchMatmulV2(ws, ws_needed, exec, stream_);
+    }
+    if (s != 0) {
+        fprintf(stderr, "[cp_cann] w8_matmul %s launch status=%d\n",
+                used_v3 ? "V3" : "V2", (int)s);
+    }
+    g_cann.aclDestroyTensor(t_w);
+    g_cann.aclDestroyTensor(t_scale);
 }
 
 // ============================================================================
@@ -620,17 +784,61 @@ bool CpCannEngine::init_from_safetensors(const std::string &path,
     if (!load_one_f32(pfx + "small_to_mtp_projection.bias",   proj_b_dev_,
                       cp_hidden_)) return false;
 
-    // ---- FRACTAL_NZ gating (M5.2) ------------------------------------------
-    const bool nz_enabled = use_nz_weights_ && g_cann.has_nz();
+    // ---- FRACTAL_NZ / A16W8 gating (M5.2 / Stretch S1) ----------------------
+    // Env override TALKER_CP_W8_QUANT / TALKER_W8_QUANT — same semantics as
+    // the Talker engine. W8 wins over NZ if both are set.
+    {
+        const char *w8_env = getenv("TALKER_W8_QUANT");
+        if (!use_w8_weights_ && w8_env && w8_env[0] != '\0' && w8_env[0] != '0') {
+            use_w8_weights_ = true;
+            printf("[cp_cann] TALKER_W8_QUANT=%s forcing A16W8 weight path\n",
+                   w8_env);
+        }
+    }
+    if (use_w8_weights_ && use_nz_weights_) {
+        printf("[cp_cann] W8 and NZ are mutually exclusive in S1; "
+               "disabling NZ in favour of W8\n");
+        use_nz_weights_ = false;
+    }
+    const bool w8_enabled = use_w8_weights_ && g_cann.has_w8_quant() &&
+                             !use_nz_weights_;
+    if (use_w8_weights_ && !g_cann.has_w8_quant()) {
+        printf("[cp_cann] W8 quant requested but "
+               "aclnnWeightQuantBatchMatmulV3/V2 unresolved — "
+               "falling back to F16\n");
+    }
+    const bool nz_enabled = use_nz_weights_ && g_cann.has_nz() && !w8_enabled;
     if (use_nz_weights_ && !g_cann.has_nz()) {
         printf("[cp_cann] NZ weights requested but "
                "aclnnTransMatmulWeight unresolved — falling back to ND\n");
     }
-    if (nz_enabled && workspace_dev_ == nullptr) {
+    if ((nz_enabled || w8_enabled) && workspace_dev_ == nullptr) {
         workspace_size_ = 4 * 1024 * 1024;
         ACL_CHECK_RET(g_cann.aclrtMalloc(&workspace_dev_, workspace_size_,
                                           ACL_MEM_MALLOC_HUGE_FIRST));
     }
+
+    // Helper for W8 calibration in the safetensors path. We already have the
+    // BF16 host buffer inline — reload as F32 for the scale computation.
+    auto calibrate_w8 = [&](const std::string &tname,
+                             int64_t rows, int64_t cols,
+                             void *&w_i8_dev, void *&scale_dev) -> bool {
+        StEntry e;
+        if (!st_lookup(header, tname, e)) return false;
+        size_t n = (size_t)rows * cols;
+        if (e.data_end - e.data_start != n * 2) return false;
+        std::vector<uint16_t> bf16_buf(n);
+        f.seekg(data_base + (std::streamoff)e.data_start);
+        f.read(reinterpret_cast<char *>(bf16_buf.data()), n * 2);
+        std::vector<float> f32(n);
+        for (size_t i = 0; i < n; ++i) {
+            union { uint32_t u; float f; } v;
+            v.u = ((uint32_t)bf16_buf[i]) << 16;
+            f32[i] = v.f;
+        }
+        return w8_calibrate_weight_(f32.data(), rows, cols,
+                                     w_i8_dev, scale_dev);
+    };
 
     // Per-layer weights.
     layer_w_.resize(n_layers_);
@@ -659,6 +867,31 @@ bool CpCannEngine::init_from_safetensors(const std::string &path,
             nz_convert_weight_(dst.gate_proj_w, inter_,     cp_hidden_);
             nz_convert_weight_(dst.up_proj_w,   inter_,     cp_hidden_);
             nz_convert_weight_(dst.down_proj_w, cp_hidden_, inter_);
+        }
+        if (w8_enabled) {
+            if (!calibrate_w8(lp + "self_attn.q_proj.weight",
+                               q_dim_, cp_hidden_,
+                               dst.q_proj_w_i8, dst.q_proj_scale)) return false;
+            if (!calibrate_w8(lp + "self_attn.k_proj.weight",
+                               kv_dim_, cp_hidden_,
+                               dst.k_proj_w_i8, dst.k_proj_scale)) return false;
+            if (!calibrate_w8(lp + "self_attn.v_proj.weight",
+                               kv_dim_, cp_hidden_,
+                               dst.v_proj_w_i8, dst.v_proj_scale)) return false;
+            if (!calibrate_w8(lp + "self_attn.o_proj.weight",
+                               cp_hidden_, q_dim_,
+                               dst.o_proj_w_i8, dst.o_proj_scale)) return false;
+            if (!calibrate_w8(lp + "mlp.gate_proj.weight",
+                               inter_, cp_hidden_,
+                               dst.gate_proj_w_i8, dst.gate_proj_scale))
+                return false;
+            if (!calibrate_w8(lp + "mlp.up_proj.weight",
+                               inter_, cp_hidden_,
+                               dst.up_proj_w_i8, dst.up_proj_scale)) return false;
+            if (!calibrate_w8(lp + "mlp.down_proj.weight",
+                               cp_hidden_, inter_,
+                               dst.down_proj_w_i8, dst.down_proj_scale))
+                return false;
         }
         // Norms kept F32 (matches the F32 norm path in v9/v11).
         if (!load_one_f32(lp + "self_attn.q_norm.weight", dst.q_norm_w,
@@ -744,6 +977,12 @@ bool CpCannEngine::init_from_safetensors(const std::string &path,
                                           ACL_MEM_MALLOC_HUGE_FIRST));
     }
     nz_applied_ = nz_enabled;
+    w8_applied_ = w8_enabled;
+    assert(!(w8_applied_ && nz_applied_));
+    if (w8_applied_) {
+        printf("[cp_cann] A16W8 weight quantization ENABLED (decode matmuls "
+               "dispatch aclnnWeightQuantBatchMatmulV3/V2)\n");
+    }
 
     build_persistent_tensors_();
 
@@ -803,14 +1042,32 @@ bool CpCannEngine::init(const CpWeightsF32 &w, const CodePredictorConfig &cfg,
     alloc_dev(&proj_b_dev_, cp_hidden_ * sizeof(float));
     upload(proj_b_dev_, w.proj_b.data(), cp_hidden_);
 
-    // ---- FRACTAL_NZ gating (M5.2) ------------------------------------------
-    const bool nz_enabled = use_nz_weights_ && g_cann.has_nz();
+    // ---- FRACTAL_NZ / A16W8 gating (M5.2 / Stretch S1) ----------------------
+    {
+        const char *w8_env = getenv("TALKER_W8_QUANT");
+        if (!use_w8_weights_ && w8_env && w8_env[0] != '\0' && w8_env[0] != '0') {
+            use_w8_weights_ = true;
+            printf("[cp_cann] TALKER_W8_QUANT=%s forcing A16W8 weight path\n",
+                   w8_env);
+        }
+    }
+    if (use_w8_weights_ && use_nz_weights_) {
+        printf("[cp_cann] W8 and NZ mutually exclusive in S1; disabling NZ\n");
+        use_nz_weights_ = false;
+    }
+    const bool w8_enabled = use_w8_weights_ && g_cann.has_w8_quant() &&
+                             !use_nz_weights_;
+    if (use_w8_weights_ && !g_cann.has_w8_quant()) {
+        printf("[cp_cann] W8 quant requested but unresolved — falling back "
+               "to F16\n");
+    }
+    const bool nz_enabled = use_nz_weights_ && g_cann.has_nz() && !w8_enabled;
     if (use_nz_weights_ && !g_cann.has_nz()) {
         printf("[cp_cann] NZ weights requested but "
                "aclnnTransMatmulWeight unresolved — falling back to ND\n");
     }
-    // Seed workspace early so nz_convert_weight_ has scratch to grow from.
-    if (nz_enabled && workspace_dev_ == nullptr) {
+    // Seed workspace early so nz_convert_weight_ / w8 calib have scratch.
+    if ((nz_enabled || w8_enabled) && workspace_dev_ == nullptr) {
         workspace_size_ = 4 * 1024 * 1024;
         ACL_CHECK_RET(g_cann.aclrtMalloc(&workspace_dev_, workspace_size_,
                                           ACL_MEM_MALLOC_HUGE_FIRST));
@@ -842,6 +1099,29 @@ bool CpCannEngine::init(const CpWeightsF32 &w, const CodePredictorConfig &cfg,
             nz_convert_weight_(dst.gate_proj_w, inter_,     cp_hidden_);
             nz_convert_weight_(dst.up_proj_w,   inter_,     cp_hidden_);
             nz_convert_weight_(dst.down_proj_w, cp_hidden_, inter_);
+        }
+        if (w8_enabled) {
+            if (!w8_calibrate_weight_(src.q_proj_w.data(), q_dim_, cp_hidden_,
+                                       dst.q_proj_w_i8, dst.q_proj_scale))
+                return false;
+            if (!w8_calibrate_weight_(src.k_proj_w.data(), kv_dim_, cp_hidden_,
+                                       dst.k_proj_w_i8, dst.k_proj_scale))
+                return false;
+            if (!w8_calibrate_weight_(src.v_proj_w.data(), kv_dim_, cp_hidden_,
+                                       dst.v_proj_w_i8, dst.v_proj_scale))
+                return false;
+            if (!w8_calibrate_weight_(src.o_proj_w.data(), cp_hidden_, q_dim_,
+                                       dst.o_proj_w_i8, dst.o_proj_scale))
+                return false;
+            if (!w8_calibrate_weight_(src.gate_proj_w.data(), inter_, cp_hidden_,
+                                       dst.gate_proj_w_i8, dst.gate_proj_scale))
+                return false;
+            if (!w8_calibrate_weight_(src.up_proj_w.data(), inter_, cp_hidden_,
+                                       dst.up_proj_w_i8, dst.up_proj_scale))
+                return false;
+            if (!w8_calibrate_weight_(src.down_proj_w.data(), cp_hidden_, inter_,
+                                       dst.down_proj_w_i8, dst.down_proj_scale))
+                return false;
         }
         // RMSNorm gammas are stored as F32 in the GGUF and aclnnRmsNorm
         // natively accepts F32 gamma with F16 input (SupportInfo[0]).
@@ -940,6 +1220,12 @@ bool CpCannEngine::init(const CpWeightsF32 &w, const CodePredictorConfig &cfg,
                                           ACL_MEM_MALLOC_HUGE_FIRST));
     }
     nz_applied_ = nz_enabled;
+    w8_applied_ = w8_enabled;
+    assert(!(w8_applied_ && nz_applied_));
+    if (w8_applied_) {
+        printf("[cp_cann] A16W8 weight quantization ENABLED (decode matmuls "
+               "dispatch aclnnWeightQuantBatchMatmulV3/V2)\n");
+    }
 
     build_persistent_tensors_();
 
@@ -1038,11 +1324,23 @@ void CpCannEngine::forward_one_token_launch(const float *input_talker_space,
         CANN_OP(RmsNorm, t_.cur_row, lt.input_ln, (double)eps_,
                 t_.normed_row, t_.rstd_11);
 
-        // M5.3: Q/K/V projections. NZ path swaps operands to satisfy
-        // aclnnMatmulWeightNz's self:ND / mat2:NZ contract. Semantically
-        // identical to the ND path: [out,1] = W[out,in] @ x[in,1]  ≡
-        //                            [1,out] = x^T[1,in] @ W^T[in,out].
-        if (nz_applied_) {
+        // Three-way split: W8 (Stretch S1) > NZ (M5.3) > ND (default).
+        if (w8_applied_) {
+            aclTensor *t_n_row = tensor_2d(normed_dev_, 1, cp_hidden_, ACL_FLOAT16);
+            aclTensor *t_q_row = tensor_2d(q_dev_, 1, q_dim_, ACL_FLOAT16);
+            aclTensor *t_k_row = tensor_2d(k_dev_, 1, kv_dim_, ACL_FLOAT16);
+            aclTensor *t_v_row = tensor_2d(v_dev_, 1, kv_dim_, ACL_FLOAT16);
+            w8_matmul_(t_n_row, layer_w_[il].q_proj_w_i8,
+                        layer_w_[il].q_proj_scale, q_dim_, cp_hidden_, t_q_row);
+            w8_matmul_(t_n_row, layer_w_[il].k_proj_w_i8,
+                        layer_w_[il].k_proj_scale, kv_dim_, cp_hidden_, t_k_row);
+            w8_matmul_(t_n_row, layer_w_[il].v_proj_w_i8,
+                        layer_w_[il].v_proj_scale, kv_dim_, cp_hidden_, t_v_row);
+            g_cann.aclDestroyTensor(t_n_row);
+            g_cann.aclDestroyTensor(t_q_row);
+            g_cann.aclDestroyTensor(t_k_row);
+            g_cann.aclDestroyTensor(t_v_row);
+        } else if (nz_applied_) {
             auto wT_nz = [&](void *buf, int64_t rows, int64_t cols) {
                 int64_t shape[2]   = {cols, rows};
                 int64_t strides[2] = {1, cols};
@@ -1211,8 +1509,15 @@ void CpCannEngine::forward_one_token_launch(const float *input_talker_space,
         g_cann.aclDestroyTensor(t_attn_out_bsnd);
         // t_k_bsnd / t_v_bsnd are owned by the destroyed lists — no free here.
 
-        // M5.3: O projection. NZ path swaps operands.
-        if (nz_applied_) {
+        // O projection: W8 > NZ > ND.
+        if (w8_applied_) {
+            aclTensor *t_q_row = tensor_2d(q_dev_, 1, q_dim_, ACL_FLOAT16);
+            aclTensor *t_o_row = tensor_2d(o_out_dev_, 1, cp_hidden_, ACL_FLOAT16);
+            w8_matmul_(t_q_row, layer_w_[il].o_proj_w_i8,
+                        layer_w_[il].o_proj_scale, cp_hidden_, q_dim_, t_o_row);
+            g_cann.aclDestroyTensor(t_q_row);
+            g_cann.aclDestroyTensor(t_o_row);
+        } else if (nz_applied_) {
             int64_t wT_shape[2]   = {(int64_t)q_dim_, (int64_t)cp_hidden_};
             int64_t wT_strides[2] = {1, (int64_t)q_dim_};
             aclTensor *t_wo_T = make_tensor(layer_w_[il].o_proj_w, 2, wT_shape,
@@ -1242,8 +1547,28 @@ void CpCannEngine::forward_one_token_launch(const float *input_talker_space,
         CANN_OP(RmsNorm, t_.cur_row, lt.post_ln, (double)eps_,
                 t_.normed_row, t_.rstd_11);
 
-        // M5.3: FFN gate/up/down. NZ path swaps operands as above.
-        if (nz_applied_) {
+        // FFN gate/up/down: W8 > NZ > ND.
+        if (w8_applied_) {
+            aclTensor *t_n_row    = tensor_2d(normed_dev_, 1, cp_hidden_, ACL_FLOAT16);
+            aclTensor *t_gate_row = tensor_2d(gate_dev_, 1, inter_, ACL_FLOAT16);
+            aclTensor *t_up_row   = tensor_2d(up_dev_,   1, inter_, ACL_FLOAT16);
+            aclTensor *t_ffn_row  = tensor_2d(ffn_out_dev_, 1, cp_hidden_, ACL_FLOAT16);
+            w8_matmul_(t_n_row, layer_w_[il].gate_proj_w_i8,
+                        layer_w_[il].gate_proj_scale, inter_, cp_hidden_,
+                        t_gate_row);
+            w8_matmul_(t_n_row, layer_w_[il].up_proj_w_i8,
+                        layer_w_[il].up_proj_scale,   inter_, cp_hidden_,
+                        t_up_row);
+            CANN_OP(Silu, t_.gate_flat, t_.gate_flat);
+            CANN_OP(InplaceMul, t_.gate_flat, t_.up_flat);
+            w8_matmul_(t_gate_row, layer_w_[il].down_proj_w_i8,
+                        layer_w_[il].down_proj_scale, cp_hidden_, inter_,
+                        t_ffn_row);
+            g_cann.aclDestroyTensor(t_n_row);
+            g_cann.aclDestroyTensor(t_gate_row);
+            g_cann.aclDestroyTensor(t_up_row);
+            g_cann.aclDestroyTensor(t_ffn_row);
+        } else if (nz_applied_) {
             auto wT_nz = [&](void *buf, int64_t rows, int64_t cols) {
                 int64_t shape[2]   = {cols, rows};
                 int64_t strides[2] = {1, cols};

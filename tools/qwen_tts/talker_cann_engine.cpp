@@ -258,6 +258,21 @@ TalkerCannEngine::~TalkerCannEngine() {
         free_dev(lw.down_proj_w);
         free_dev(lw.input_ln_w);
         free_dev(lw.post_ln_w);
+        // A16W8 parallel buffers (null on F16/NZ paths).
+        free_dev(lw.q_proj_w_i8);
+        free_dev(lw.k_proj_w_i8);
+        free_dev(lw.v_proj_w_i8);
+        free_dev(lw.o_proj_w_i8);
+        free_dev(lw.gate_proj_w_i8);
+        free_dev(lw.up_proj_w_i8);
+        free_dev(lw.down_proj_w_i8);
+        free_dev(lw.q_proj_scale);
+        free_dev(lw.k_proj_scale);
+        free_dev(lw.v_proj_scale);
+        free_dev(lw.o_proj_scale);
+        free_dev(lw.gate_proj_scale);
+        free_dev(lw.up_proj_scale);
+        free_dev(lw.down_proj_scale);
     }
     free_dev(final_norm_w_dev_);
 
@@ -430,6 +445,191 @@ void TalkerCannEngine::nz_convert_weight_(void *weight_dev,
 }
 
 // ============================================================================
+// A16W8 calibration (Stretch S1). Converts a host F32 weight [rows, cols]
+// (row-major, [out, in]) into:
+//   - INT8 weight [rows, cols] on device (row-major) into a NEW buffer
+//   - F16 per-output-channel scales [rows] on device into a NEW buffer
+// Symmetric quant, zero = 0 (absorbed by passing null offset downstream).
+//
+// Per row c: scale_c = max(|w[c,:]|) / 127. Rows with all-zero weight get
+// scale_c = 1 (avoids divide-by-zero; the resulting INT8 row is all zeros,
+// so the scale value is irrelevant). Saturates to [-127, 127]; -128 is
+// avoided so the sign is symmetric (matches PyTorch's symmetric=True).
+//
+// The caller retains any existing F16 weight buffer — this function only
+// allocates the parallel INT8 + scale pair. Failure leaves both output
+// pointers untouched (any partial allocation is cleaned up).
+// ============================================================================
+
+bool TalkerCannEngine::w8_calibrate_weight_(const float *host_w,
+                                             int64_t rows, int64_t cols,
+                                             void *&weight_i8_dev,
+                                             void *&scale_dev) {
+    if (!host_w || rows <= 0 || cols <= 0) return false;
+
+    std::vector<int8_t>   w_i8((size_t)rows * cols);
+    std::vector<uint16_t> scales_f16((size_t)rows);
+
+    // Per-output-channel symmetric INT8.
+    for (int64_t r = 0; r < rows; ++r) {
+        const float *row_src = host_w + (size_t)r * cols;
+        float max_abs = 0.0f;
+        for (int64_t j = 0; j < cols; ++j) {
+            float v = std::fabs(row_src[j]);
+            if (v > max_abs) max_abs = v;
+        }
+        float scale = (max_abs > 0.0f) ? (max_abs / 127.0f) : 1.0f;
+        float inv_scale = 1.0f / scale;
+        int8_t *row_dst = w_i8.data() + (size_t)r * cols;
+        for (int64_t j = 0; j < cols; ++j) {
+            float q = row_src[j] * inv_scale;
+            // rint() respects the current rounding mode (round-to-nearest by
+            // default on aarch64) — same behaviour as PyTorch's round().
+            int ir = (int)std::rint(q);
+            if (ir >  127) ir =  127;
+            if (ir < -127) ir = -127;  // keep symmetric; never emit -128
+            row_dst[j] = (int8_t)ir;
+        }
+        scales_f16[(size_t)r] = fp32_to_fp16(scale);
+    }
+
+    // Sanity: confirm all scales are finite. Non-finite values here would
+    // produce NaNs out of the fused W8 matmul — better to bail now than
+    // chase a NaN through decode.
+    for (int64_t r = 0; r < rows; ++r) {
+        float s = fp16_to_fp32(scales_f16[(size_t)r]);
+        if (!std::isfinite(s)) {
+            fprintf(stderr, "[talker_cann] w8 calib: non-finite scale on row "
+                    "%lld (max_abs source likely inf/nan)\n", (long long)r);
+            return false;
+        }
+    }
+
+    void *new_w = nullptr;
+    aclError err = g_cann.aclrtMalloc(&new_w, (size_t)rows * cols * sizeof(int8_t),
+                                       ACL_MEM_MALLOC_HUGE_FIRST);
+    if (err != 0 || !new_w) {
+        fprintf(stderr, "[talker_cann] w8 calib: INT8 aclrtMalloc failed\n");
+        return false;
+    }
+    ACL_CHECK_RET(g_cann.aclrtMemcpy(
+        new_w, (size_t)rows * cols * sizeof(int8_t),
+        w_i8.data(), (size_t)rows * cols * sizeof(int8_t),
+        ACL_MEMCPY_HOST_TO_DEVICE));
+
+    void *new_s = nullptr;
+    err = g_cann.aclrtMalloc(&new_s, (size_t)rows * sizeof(uint16_t),
+                              ACL_MEM_MALLOC_HUGE_FIRST);
+    if (err != 0 || !new_s) {
+        fprintf(stderr, "[talker_cann] w8 calib: scale aclrtMalloc failed\n");
+        g_cann.aclrtFree(new_w);
+        return false;
+    }
+    ACL_CHECK_RET(g_cann.aclrtMemcpy(
+        new_s, (size_t)rows * sizeof(uint16_t),
+        scales_f16.data(), (size_t)rows * sizeof(uint16_t),
+        ACL_MEMCPY_HOST_TO_DEVICE));
+    weight_i8_dev = new_w;
+    scale_dev     = new_s;
+    return true;
+}
+
+// ============================================================================
+// A16W8 matmul dispatch. Prefers V3 (CANN 8.5 primary) and falls back to V2.
+//
+// Semantics: y[M, N] = x[M, K] @ dequant(weight, scale) where weight is INT8
+// stored as [N, K] row-major (the on-device layout from w8_calibrate_weight_
+// — matches the original F16 [out, in] layout). V3 reads the weight via a
+// transposed view — caller supplies the [K, N] descriptor with strides
+// (1, K), which the op consumes as "the K-dim is contiguous inside each of
+// the N output channels". Scale has matching N elements.
+// ============================================================================
+
+void TalkerCannEngine::w8_matmul_(const aclTensor *x,
+                                    void *weight_dev, void *scale_dev,
+                                    int64_t out_n, int64_t in_k,
+                                    const aclTensor *y) {
+    // Build a [K, N] INT8 view over the [N, K] row-major buffer. Strides
+    // (1, K) express the transpose: advancing in K reads contiguous bytes
+    // inside one row; advancing in N jumps K elements. This is the same
+    // transposed-view trick the NZ path uses for F16 weights.
+    int64_t w_shape[2]   = {in_k, out_n};
+    int64_t w_strides[2] = {1, in_k};
+    int64_t w_storage    = out_n * in_k;
+    aclTensor *t_w = g_cann.aclCreateTensor(
+        w_shape, 2, ACL_INT8, w_strides, 0, ACL_FORMAT_ND,
+        &w_storage, 1, weight_dev);
+
+    int64_t s_shape[1]   = {out_n};
+    int64_t s_strides[1] = {1};
+    int64_t s_storage    = out_n;
+    aclTensor *t_scale = g_cann.aclCreateTensor(
+        s_shape, 1, ACL_FLOAT16, s_strides, 0, ACL_FORMAT_ND,
+        &s_storage, 1, scale_dev);
+
+    uint64_t ws_needed = 0;
+    aclOpExecutor *exec = nullptr;
+    aclnnStatus s = 0;
+
+    // Prefer V3 (CANN 8.5 primary). Fall back to V2 if V3 is absent OR if it
+    // returns a non-zero status from GetWorkspaceSize (some op-tiling shapes
+    // are V2-only on early 8.5 builds).
+    bool used_v3 = false;
+    if (g_cann.aclnnWeightQuantBatchMatmulV3GetWorkspaceSize &&
+        g_cann.aclnnWeightQuantBatchMatmulV3) {
+        s = g_cann.aclnnWeightQuantBatchMatmulV3GetWorkspaceSize(
+            x, t_w, t_scale,
+            /*antiquantOffsetOptional*/ nullptr,
+            /*quantScaleOptional*/      nullptr,
+            /*quantOffsetOptional*/     nullptr,
+            /*biasOptional*/            nullptr,
+            /*antiquantGroupSize*/      0,
+            /*innerPrecise*/            1,  // high-precision path
+            y, &ws_needed, &exec);
+        if (s == 0) used_v3 = true;
+    }
+    if (!used_v3) {
+        if (!g_cann.aclnnWeightQuantBatchMatmulV2GetWorkspaceSize ||
+            !g_cann.aclnnWeightQuantBatchMatmulV2) {
+            fprintf(stderr, "[talker_cann] w8_matmul: no V3/V2 symbol resolved\n");
+            g_cann.aclDestroyTensor(t_w);
+            g_cann.aclDestroyTensor(t_scale);
+            return;
+        }
+        s = g_cann.aclnnWeightQuantBatchMatmulV2GetWorkspaceSize(
+            x, t_w, t_scale,
+            /*antiquantOffsetOptional*/ nullptr,
+            /*quantScaleOptional*/      nullptr,
+            /*quantOffsetOptional*/     nullptr,
+            /*biasOptional*/            nullptr,
+            /*antiquantGroupSize*/      0,
+            y, &ws_needed, &exec);
+        if (s != 0) {
+            fprintf(stderr,
+                    "[talker_cann] w8_matmul V2 GetWorkspaceSize status=%d\n",
+                    (int)s);
+            g_cann.aclDestroyTensor(t_w);
+            g_cann.aclDestroyTensor(t_scale);
+            return;
+        }
+    }
+    ensure_workspace_(ws_needed);
+    void *ws = ws_needed > 0 ? workspace_dev_ : nullptr;
+    if (used_v3) {
+        s = g_cann.aclnnWeightQuantBatchMatmulV3(ws, ws_needed, exec, stream_);
+    } else {
+        s = g_cann.aclnnWeightQuantBatchMatmulV2(ws, ws_needed, exec, stream_);
+    }
+    if (s != 0) {
+        fprintf(stderr,
+                "[talker_cann] w8_matmul %s launch status=%d\n",
+                used_v3 ? "V3" : "V2", (int)s);
+    }
+    g_cann.aclDestroyTensor(t_w);
+    g_cann.aclDestroyTensor(t_scale);
+}
+
+// ============================================================================
 // RoPE cos/sin table construction. Uses rope_speed_factor_ to scale angles —
 // callers change it via set_rope_speed_factor, which triggers a rebuild.
 // ============================================================================
@@ -548,13 +748,36 @@ bool TalkerCannEngine::init_from_gguf(const std::string &gguf_path,
                    "path\n", nz_env);
         }
     }
-    const bool nz_enabled = use_nz_weights_ && g_cann.has_nz();
+    // A16W8 env override (Stretch S1). Same empty/"0" semantics as the NZ
+    // override. When set together with TALKER_NZ_WEIGHTS, W8 wins — we treat
+    // the two as mutually exclusive (decode call sites only dispatch one).
+    {
+        const char *w8_env = getenv("TALKER_W8_QUANT");
+        if (!use_w8_weights_ && w8_env && w8_env[0] != '\0' && w8_env[0] != '0') {
+            use_w8_weights_ = true;
+            printf("[talker_cann] TALKER_W8_QUANT=%s forcing A16W8 weight "
+                   "path\n", w8_env);
+        }
+    }
+    if (use_w8_weights_ && use_nz_weights_) {
+        printf("[talker_cann] TALKER_W8_QUANT and TALKER_NZ_WEIGHTS are "
+               "mutually exclusive in S1; disabling NZ in favour of W8\n");
+        use_nz_weights_ = false;
+    }
+    const bool w8_enabled = use_w8_weights_ && g_cann.has_w8_quant() &&
+                             !use_nz_weights_;
+    if (use_w8_weights_ && !g_cann.has_w8_quant()) {
+        printf("[talker_cann] W8 quant requested but "
+               "aclnnWeightQuantBatchMatmulV3/V2 unresolved on this CANN "
+               "toolkit — falling back to F16\n");
+    }
+    const bool nz_enabled = use_nz_weights_ && g_cann.has_nz() && !w8_enabled;
     if (use_nz_weights_ && !g_cann.has_nz()) {
         printf("[talker_cann] NZ weights requested but "
                "aclnnTransMatmulWeight unresolved on this CANN toolkit — "
                "falling back to ND\n");
     }
-    if (nz_enabled && workspace_dev_ == nullptr) {
+    if ((nz_enabled || w8_enabled) && workspace_dev_ == nullptr) {
         workspace_size_ = 4 * 1024 * 1024;
         ACL_CHECK_RET(g_cann.aclrtMalloc(&workspace_dev_, workspace_size_,
                                           ACL_MEM_MALLOC_HUGE_FIRST));
@@ -566,42 +789,74 @@ bool TalkerCannEngine::init_from_gguf(const std::string &gguf_path,
                "activation@weight_T and tag weight mat2 with "
                "ACL_FORMAT_FRACTAL_NZ for M5.3)\n");
     }
+    if (w8_enabled) {
+        printf("[talker_cann] A16W8 weight quantization ENABLED "
+               "(per-output-channel symmetric INT8 + F16 scales for Q/K/V/O/"
+               "gate/up/down; decode matmul call sites dispatch "
+               "aclnnWeightQuantBatchMatmulV3/V2; prefill stays on F16)\n");
+    }
 
     // ---- Per-layer weights ----
     layer_w_.resize(n_layers_);
     char name[128];
+    // Helper lambda: always upload F16 (for prefill + fallback decode paths),
+    // and ALSO calibrate to INT8 + F16 scale when W8 is enabled. The F16
+    // buffer is kept alongside the INT8 copy; prefill reads F16, decode reads
+    // INT8 when w8_applied_. S1 pays ~1.5x weight memory in W8 mode for the
+    // privilege of keeping prefill on its safe F16 path.
+    auto load_proj_weight = [&](const char *tname, int64_t rows, int64_t cols,
+                                 void *&weight_f16_dev,
+                                 void *&weight_i8_dev,
+                                 void *&scale_dev) -> bool {
+        // Always upload F16 first — prefill uses these.
+        if (!upload_tensor_f16(ggml_ctx, tname, (size_t)rows * cols,
+                               weight_f16_dev))
+            return false;
+        if (w8_enabled) {
+            std::vector<float> host = load_gguf_tensor_f32(
+                ggml_ctx, tname, (size_t)rows * cols);
+            if (host.empty()) return false;
+            if (!w8_calibrate_weight_(host.data(), rows, cols,
+                                       weight_i8_dev, scale_dev))
+                return false;
+        }
+        return true;
+    };
     for (int il = 0; il < n_layers_; ++il) {
         auto &lw = layer_w_[il];
 #define TFMT(fmt) (snprintf(name, sizeof(name), fmt, il), name)
-        if (!upload_tensor_f16(ggml_ctx,
-                               TFMT("blk.%d.attn_q.weight"),
-                               (size_t)q_dim_ * n_embd_, lw.q_proj_w))
+        if (!load_proj_weight(TFMT("blk.%d.attn_q.weight"),
+                               q_dim_, n_embd_,
+                               lw.q_proj_w, lw.q_proj_w_i8, lw.q_proj_scale))
             goto fail;
-        if (!upload_tensor_f16(ggml_ctx,
-                               TFMT("blk.%d.attn_k.weight"),
-                               (size_t)kv_dim_ * n_embd_, lw.k_proj_w))
+        if (!load_proj_weight(TFMT("blk.%d.attn_k.weight"),
+                               kv_dim_, n_embd_,
+                               lw.k_proj_w, lw.k_proj_w_i8, lw.k_proj_scale))
             goto fail;
-        if (!upload_tensor_f16(ggml_ctx,
-                               TFMT("blk.%d.attn_v.weight"),
-                               (size_t)kv_dim_ * n_embd_, lw.v_proj_w))
+        if (!load_proj_weight(TFMT("blk.%d.attn_v.weight"),
+                               kv_dim_, n_embd_,
+                               lw.v_proj_w, lw.v_proj_w_i8, lw.v_proj_scale))
             goto fail;
         // Output projection. GGUF stores this as [hidden, q_dim] which is the
         // [out, in] layout aclnnMm wants.
-        if (!upload_tensor_f16(ggml_ctx,
-                               TFMT("blk.%d.attn_output.weight"),
-                               (size_t)n_embd_ * q_dim_, lw.o_proj_w))
+        if (!load_proj_weight(TFMT("blk.%d.attn_output.weight"),
+                               n_embd_, q_dim_,
+                               lw.o_proj_w, lw.o_proj_w_i8, lw.o_proj_scale))
             goto fail;
-        if (!upload_tensor_f16(ggml_ctx,
-                               TFMT("blk.%d.ffn_gate.weight"),
-                               (size_t)inter_ * n_embd_, lw.gate_proj_w))
+        if (!load_proj_weight(TFMT("blk.%d.ffn_gate.weight"),
+                               inter_, n_embd_,
+                               lw.gate_proj_w, lw.gate_proj_w_i8,
+                               lw.gate_proj_scale))
             goto fail;
-        if (!upload_tensor_f16(ggml_ctx,
-                               TFMT("blk.%d.ffn_up.weight"),
-                               (size_t)inter_ * n_embd_, lw.up_proj_w))
+        if (!load_proj_weight(TFMT("blk.%d.ffn_up.weight"),
+                               inter_, n_embd_,
+                               lw.up_proj_w, lw.up_proj_w_i8,
+                               lw.up_proj_scale))
             goto fail;
-        if (!upload_tensor_f16(ggml_ctx,
-                               TFMT("blk.%d.ffn_down.weight"),
-                               (size_t)n_embd_ * inter_, lw.down_proj_w))
+        if (!load_proj_weight(TFMT("blk.%d.ffn_down.weight"),
+                               n_embd_, inter_,
+                               lw.down_proj_w, lw.down_proj_w_i8,
+                               lw.down_proj_scale))
             goto fail;
 
         // --- FRACTAL_NZ pre-conversion (M5.2) ---
@@ -727,6 +982,10 @@ bool TalkerCannEngine::init_from_gguf(const std::string &gguf_path,
                                           ACL_MEM_MALLOC_HUGE_FIRST));
     }
     nz_applied_ = nz_enabled;
+    w8_applied_ = w8_enabled;
+    // Contract invariant: these two paths never turn on together (enforced
+    // above by forcing NZ off whenever W8 wins the env-override tie).
+    assert(!(w8_applied_ && nz_applied_));
 
     // aclGraph cache (M4). OPT-IN only: set TALKER_CANN_GRAPH=1 to enable.
     // Rationale: within a single utterance each `pos` is visited exactly once
@@ -886,7 +1145,14 @@ void TalkerCannEngine::run_decode_body_(int pos) {
         dbg_sync(il, "input RmsNorm");
 
         // --- Q/K/V projection ---
-        // M5.3: two paths, picked at runtime via nz_applied_.
+        // Three paths, picked at runtime (mutually exclusive): W8 (Stretch S1)
+        // > NZ (M5.3) > ND (default).
+        //
+        //   W8 path (TALKER_W8_QUANT=1 + CANN 8.5): aclnnWeightQuantBatchMatmul
+        //   V3/V2 takes [M, K] F16 activation and [N, K]-transposed-view INT8
+        //   weight (per-output-channel F16 scale). Activation is the row
+        //   view of normed_dev_; output is the row view of q_dev_ / k_dev_ /
+        //   v_dev_. See w8_matmul_.
         //
         //   ND path (default / fallback): compute as
         //     [dim, 1] = W[dim, n_embd] @ x[n_embd, 1]
@@ -898,7 +1164,25 @@ void TalkerCannEngine::run_decode_body_(int pos) {
         //   [1, dim] = x^T[1, n_embd] @ W^T[n_embd, dim]. The W^T view over
         //   the NZ-converted buffer uses shape [n_embd, dim], strides (1, in).
         //   Activation rows are ND; weight descriptors carry FRACTAL_NZ.
-        if (nz_applied_) {
+        if (w8_applied_) {
+            aclTensor *t_norm_row = tensor_2d(normed_dev_, 1, n_embd_, ACL_FLOAT16);
+            aclTensor *t_q_row = tensor_2d(q_dev_, 1, q_dim_,  ACL_FLOAT16);
+            aclTensor *t_k_row = tensor_2d(k_dev_, 1, kv_dim_, ACL_FLOAT16);
+            aclTensor *t_v_row = tensor_2d(v_dev_, 1, kv_dim_, ACL_FLOAT16);
+            w8_matmul_(t_norm_row, lw.q_proj_w_i8, lw.q_proj_scale,
+                        q_dim_,  n_embd_, t_q_row);
+            dbg_sync(il, "q_proj w8");
+            w8_matmul_(t_norm_row, lw.k_proj_w_i8, lw.k_proj_scale,
+                        kv_dim_, n_embd_, t_k_row);
+            dbg_sync(il, "k_proj w8");
+            w8_matmul_(t_norm_row, lw.v_proj_w_i8, lw.v_proj_scale,
+                        kv_dim_, n_embd_, t_v_row);
+            dbg_sync(il, "v_proj w8");
+            g_cann.aclDestroyTensor(t_norm_row);
+            g_cann.aclDestroyTensor(t_q_row);
+            g_cann.aclDestroyTensor(t_k_row);
+            g_cann.aclDestroyTensor(t_v_row);
+        } else if (nz_applied_) {
             // Weight descriptors: transposed view with NZ format tag.
             auto wT = [&](void *buf, int64_t rows, int64_t cols) {
                 int64_t shape[2]   = {cols, rows};
@@ -1085,8 +1369,15 @@ void TalkerCannEngine::run_decode_body_(int pos) {
         dbg_sync(il, "fias");
 
         // --- O projection ---
-        // M5.3: NZ path swaps operands as in Q/K/V (see comments there).
-        if (nz_applied_) {
+        // W8 / NZ / ND — same three-way split as Q/K/V above.
+        if (w8_applied_) {
+            aclTensor *t_q_row = tensor_2d(q_dev_, 1, q_dim_, ACL_FLOAT16);
+            aclTensor *t_o_row = tensor_2d(o_out_dev_, 1, n_embd_, ACL_FLOAT16);
+            w8_matmul_(t_q_row, lw.o_proj_w_i8, lw.o_proj_scale,
+                        n_embd_, q_dim_, t_o_row);
+            g_cann.aclDestroyTensor(t_q_row);
+            g_cann.aclDestroyTensor(t_o_row);
+        } else if (nz_applied_) {
             int64_t wT_shape[2]   = {(int64_t)q_dim_, (int64_t)n_embd_};
             int64_t wT_strides[2] = {1, (int64_t)q_dim_};
             aclTensor *t_wo_T = make_tensor(lw.o_proj_w, 2, wT_shape, wT_strides,
@@ -1140,8 +1431,29 @@ void TalkerCannEngine::run_decode_body_(int pos) {
 
         // --- FFN: gate = silu(gate_proj @ normed) * (up_proj @ normed),
         //     ffn_out = down_proj @ gate ---
-        // M5.3: NZ path swaps operands so the weight is mat2 (see Q/K/V).
-        if (nz_applied_) {
+        // Three-way split (W8 / NZ / ND) same as Q/K/V.
+        if (w8_applied_) {
+            aclTensor *t_norm_row = tensor_2d(normed_dev_, 1, n_embd_, ACL_FLOAT16);
+            aclTensor *t_gate_row = tensor_2d(gate_dev_,   1, inter_,  ACL_FLOAT16);
+            aclTensor *t_up_row   = tensor_2d(up_dev_,     1, inter_,  ACL_FLOAT16);
+            aclTensor *t_gate_flat = tensor_1d(gate_dev_, inter_, ACL_FLOAT16);
+            aclTensor *t_up_flat   = tensor_1d(up_dev_,   inter_, ACL_FLOAT16);
+            aclTensor *t_ffn_row   = tensor_2d(ffn_out_dev_, 1, n_embd_, ACL_FLOAT16);
+            w8_matmul_(t_norm_row, lw.gate_proj_w_i8, lw.gate_proj_scale,
+                        inter_,  n_embd_, t_gate_row);
+            w8_matmul_(t_norm_row, lw.up_proj_w_i8,   lw.up_proj_scale,
+                        inter_,  n_embd_, t_up_row);
+            CANN_OP(Silu, t_gate_flat, t_gate_flat);
+            CANN_OP(InplaceMul, t_gate_flat, t_up_flat);
+            w8_matmul_(t_gate_row, lw.down_proj_w_i8, lw.down_proj_scale,
+                        n_embd_, inter_,  t_ffn_row);
+            g_cann.aclDestroyTensor(t_norm_row);
+            g_cann.aclDestroyTensor(t_gate_row);
+            g_cann.aclDestroyTensor(t_up_row);
+            g_cann.aclDestroyTensor(t_gate_flat);
+            g_cann.aclDestroyTensor(t_up_flat);
+            g_cann.aclDestroyTensor(t_ffn_row);
+        } else if (nz_applied_) {
             auto wT = [&](void *buf, int64_t rows, int64_t cols) {
                 int64_t shape[2]   = {cols, rows};
                 int64_t strides[2] = {1, cols};

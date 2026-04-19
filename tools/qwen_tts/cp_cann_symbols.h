@@ -219,6 +219,50 @@ struct CannSyms {
                                              aclOpExecutor *executor,
                                              aclrtStream stream);
 
+    // ---- aclnnWeightQuantBatchMatmulV3 (Stretch S1, CANN 8.5+) ---------------
+    // A16W8 pseudo-quantized matmul. The activation `x` stays F16/BF16 and the
+    // weight `weight` is INT8 (per-output-channel scales in `antiquantScale`,
+    // optional per-channel offsets in `antiquantOffsetOptional`). Computes
+    // y = x @ dequant(weight, antiquantScale, antiquantOffsetOptional) in
+    // a fused kernel — no host-side dequant pass. Scale/offset tensors must
+    // match y's dtype (F16 here; we use symmetric quantization so offset is
+    // null). See aclnn_weight_quant_batch_matmul_v3.h in CANN 8.5.
+    //
+    // V3 differs from V2 by taking an extra `innerPrecise` parameter between
+    // `antiquantGroupSize` and `y`. We resolve both; callers prefer V3 when
+    // available and fall back to V2 if V3 misbehaves.
+    //
+    // Capability gated via has_w8_quant().
+    aclnnStatus (*aclnnWeightQuantBatchMatmulV3GetWorkspaceSize)(
+        const aclTensor *x, const aclTensor *weight,
+        const aclTensor *antiquantScale,
+        const aclTensor *antiquantOffsetOptional,
+        const aclTensor *quantScaleOptional,
+        const aclTensor *quantOffsetOptional,
+        const aclTensor *biasOptional,
+        int antiquantGroupSize, int innerPrecise,
+        const aclTensor *y, uint64_t *workspaceSize,
+        aclOpExecutor **executor);
+    aclnnStatus (*aclnnWeightQuantBatchMatmulV3)(void *workspace,
+                                                  uint64_t workspaceSize,
+                                                  aclOpExecutor *executor,
+                                                  aclrtStream stream);
+
+    aclnnStatus (*aclnnWeightQuantBatchMatmulV2GetWorkspaceSize)(
+        const aclTensor *x, const aclTensor *weight,
+        const aclTensor *antiquantScale,
+        const aclTensor *antiquantOffsetOptional,
+        const aclTensor *quantScaleOptional,
+        const aclTensor *quantOffsetOptional,
+        const aclTensor *biasOptional,
+        int antiquantGroupSize,
+        const aclTensor *y, uint64_t *workspaceSize,
+        aclOpExecutor **executor);
+    aclnnStatus (*aclnnWeightQuantBatchMatmulV2)(void *workspace,
+                                                  uint64_t workspaceSize,
+                                                  aclOpExecutor *executor,
+                                                  aclrtStream stream);
+
     // ---- aclGraph (aclmdlRI*) — runtime graph capture/replay ---------------
     // Present on CANN 8.3+. The aclmdlRI / aclmdlRICaptureMode types come from
     // `acl/acl_rt.h` (pulled in transitively by `acl/acl.h` above). If the
@@ -261,6 +305,18 @@ struct CannSyms {
     bool has_matmul_weight_nz() const {
         return aclnnMatmulWeightNzGetWorkspaceSize != nullptr &&
                aclnnMatmulWeightNz                 != nullptr;
+    }
+
+    // Capability flag for aclnnWeightQuantBatchMatmulV3/V2 (Stretch S1,
+    // CANN 8.5+). True when either V3 OR V2 resolved — callers dispatch
+    // whichever is non-null (preferring V3). Absence means the toolkit is
+    // pre-8.5 or the W8Q op families aren't available, and the engines must
+    // fall back to plain F16 matmul (NZ or ND).
+    bool has_w8_quant() const {
+        return (aclnnWeightQuantBatchMatmulV3GetWorkspaceSize != nullptr &&
+                aclnnWeightQuantBatchMatmulV3                 != nullptr) ||
+               (aclnnWeightQuantBatchMatmulV2GetWorkspaceSize != nullptr &&
+                aclnnWeightQuantBatchMatmulV2                 != nullptr);
     }
 };
 
