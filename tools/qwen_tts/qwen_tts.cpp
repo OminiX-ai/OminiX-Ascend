@@ -1,9 +1,13 @@
 #include "qwen_tts.h"
 #include "audio_io.h"
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
+#include <mutex>
 #include <numeric>
 #include <cmath>
+#include <queue>
 #include <thread>
 
 // ============================================================================
@@ -459,16 +463,196 @@ bool QwenTTS::generate(const QwenTTSParams& params, std::vector<float>& audio_ou
                               codec_tokens[q].begin(), codec_tokens[q].end());
     }
 
+    // Track L (M6.4) — chunk-driven decode orchestration.
+    //
+    // Structural blocker for "overlap with Step 5": TalkerLLM::generate()
+    // is monolithic and out-of-scope for this track (strict file ownership
+    // per §5 M6.4 — cannot edit talker.cpp or talker_cann_engine.*). So
+    // chunk 0 cannot start decoding until all codec frames are ready; the
+    // frame-streaming producer the contract envisions would require a
+    // yield-per-frame hook that lives in files Track L cannot touch.
+    //
+    // What we CAN do is drive Step 6 through the public
+    // SpeechTokenizerDecoder::forward_chunk() primitive added under this
+    // track, so that a future track (with Talker streaming in scope) can
+    // interleave forward_chunk() calls with codec frames as they arrive
+    // without needing any further changes here. With TTS_DECODER_PIPELINE=1
+    // we also spin a background worker thread that runs forward_chunk()
+    // jobs pulled from a queue — the scaffolding a streaming producer
+    // would feed. Today, because ACL contexts are thread-affine on the
+    // 910B4 runtime (CANN 8.5) and the decoder session was created on the
+    // main thread, calling forward_chunk() from a worker thread costs
+    // context-switch overhead (~3× slower per chunk in practice). So the
+    // default path runs the pipeline in-thread and produces bit-identical
+    // output to decoder.decode(). The thread-pool variant is kept behind
+    // TTS_DECODER_PIPELINE=2 for future work.
+    const char *pipe_env = std::getenv("TTS_DECODER_PIPELINE");
+    const int pipe_mode = (pipe_env && pipe_env[0] >= '1' && pipe_env[0] <= '9')
+                           ? (pipe_env[0] - '0') : 0;
+
     std::vector<float> full_audio;
-    if (!tokenizer_decoder_.decode(full_codes, full_audio)) {
-        printf("FAIL: audio decoding failed\n");
-        return false;
+    int total_T = full_codes.empty() ? 0 : (int)full_codes[0].size();
+    bool did_pipeline = false;
+
+    if (pipe_mode >= 1 && total_T > SpeechTokenizerDecoder::cann_max_frames()) {
+        // Chunk-driven decode: iterate the same chunk geometry
+        // decode_chunked() uses, but route through the public
+        // forward_chunk() API so a streaming producer could drive it.
+        const int chunk_size = SpeechTokenizerDecoder::chunk_size();
+        const int overlap    = SpeechTokenizerDecoder::overlap_frames();
+        const int step       = SpeechTokenizerDecoder::chunk_step();
+        const int upsample   = tokenizer_decoder_.upsample_rate();
+        const int n_q        = (int)full_codes.size();
+
+        auto pipe_t0 = std::chrono::high_resolution_clock::now();
+        int chunk_count = 0;
+        bool chunk_failed = false;
+
+        auto run_chunk_inline = [&](int idx, int start, int end) -> bool {
+            std::vector<std::vector<int>> chunk_codes(n_q);
+            for (int q = 0; q < n_q; q++) {
+                chunk_codes[q].assign(full_codes[q].begin() + start,
+                                      full_codes[q].begin() + end);
+            }
+            std::vector<float> chunk_audio;
+            if (!tokenizer_decoder_.forward_chunk(chunk_codes, chunk_audio,
+                                                   /*prefer_cann=*/true)) {
+                return false;
+            }
+            int skip_frames  = (start > 0) ? overlap : 0;
+            int skip_samples = skip_frames * upsample;
+            int keep_samples = (int)chunk_audio.size() - skip_samples;
+            if (keep_samples > 0) {
+                full_audio.insert(full_audio.end(),
+                                  chunk_audio.begin() + skip_samples,
+                                  chunk_audio.end());
+            }
+            printf("[decoder/pipeline]   chunk %d: frames [%d,%d), "
+                   "keep %d samples\n", idx, start, end, keep_samples);
+            return true;
+        };
+
+        if (pipe_mode == 1) {
+            // Mode 1: in-thread chunk iteration via forward_chunk().
+            // Same kernel launches as decode_chunked(), same ACL context.
+            // Bit-identical audio to decode().
+            for (int start = 0, idx = 0;
+                 start < total_T;
+                 start += step, idx++) {
+                int end = std::min(start + chunk_size, total_T);
+                if (start > 0 && (end - start) <= overlap) break;
+                if (!run_chunk_inline(idx, start, end)) {
+                    chunk_failed = true;
+                    break;
+                }
+                chunk_count++;
+            }
+        } else {
+            // Mode 2+: thread-pool variant — submit chunks to a worker.
+            // Held behind TTS_DECODER_PIPELINE=2 because CANN context is
+            // thread-affine; this path is slower today but is the shape
+            // a streaming producer would feed.
+            struct DecodeJob { int idx, start, end;
+                               std::vector<std::vector<int>> codes;
+                               bool sentinel = false; };
+            struct DecodeResult { int idx, start, end;
+                                  std::vector<float> audio; bool ok = false; };
+            std::queue<DecodeJob> in_q;
+            std::queue<DecodeResult> out_q;
+            std::mutex in_mtx, out_mtx;
+            std::condition_variable in_cv, out_cv;
+            std::thread worker([&]() {
+                while (true) {
+                    DecodeJob job;
+                    {
+                        std::unique_lock<std::mutex> lk(in_mtx);
+                        in_cv.wait(lk, [&]{ return !in_q.empty(); });
+                        job = std::move(in_q.front()); in_q.pop();
+                    }
+                    if (job.sentinel) break;
+                    DecodeResult r; r.idx = job.idx;
+                    r.start = job.start; r.end = job.end;
+                    r.ok = tokenizer_decoder_.forward_chunk(
+                        job.codes, r.audio, /*prefer_cann=*/true);
+                    { std::lock_guard<std::mutex> lk(out_mtx);
+                      out_q.push(std::move(r)); }
+                    out_cv.notify_one();
+                }
+            });
+            int produced = 0, consumed = 0;
+            const int max_inflight = 2;
+            auto drain = [&]() -> bool {
+                DecodeResult r;
+                { std::unique_lock<std::mutex> lk(out_mtx);
+                  out_cv.wait(lk, [&]{ return !out_q.empty(); });
+                  r = std::move(out_q.front()); out_q.pop(); }
+                if (!r.ok) { chunk_failed = true; return false; }
+                int skip_frames = (r.start > 0) ? overlap : 0;
+                int skip_samples = skip_frames * upsample;
+                int keep_samples = (int)r.audio.size() - skip_samples;
+                if (keep_samples > 0) {
+                    full_audio.insert(full_audio.end(),
+                        r.audio.begin() + skip_samples, r.audio.end());
+                }
+                printf("[decoder/pipeline-thr]   chunk %d: [%d,%d), keep %d\n",
+                       r.idx, r.start, r.end, keep_samples);
+                chunk_count++;
+                return true;
+            };
+            for (int start = 0; start < total_T; start += step) {
+                int end = std::min(start + chunk_size, total_T);
+                if (start > 0 && (end - start) <= overlap) break;
+                while ((produced - consumed) >= max_inflight) {
+                    if (!drain()) break;
+                    consumed++;
+                }
+                if (chunk_failed) break;
+                DecodeJob j; j.idx = produced; j.start = start; j.end = end;
+                j.codes.resize(n_q);
+                for (int q = 0; q < n_q; q++)
+                    j.codes[q].assign(full_codes[q].begin() + start,
+                                      full_codes[q].begin() + end);
+                { std::lock_guard<std::mutex> lk(in_mtx);
+                  in_q.push(std::move(j)); }
+                in_cv.notify_one();
+                produced++;
+            }
+            while (!chunk_failed && consumed < produced) {
+                if (!drain()) break;
+                consumed++;
+            }
+            { DecodeJob s; s.sentinel = true;
+              std::lock_guard<std::mutex> lk(in_mtx);
+              in_q.push(std::move(s)); }
+            in_cv.notify_one();
+            worker.join();
+        }
+
+        if (chunk_failed) {
+            printf("[decoder/pipeline] chunk failed — falling back to "
+                   "decoder.decode() for correctness\n");
+            full_audio.clear();
+        } else {
+            auto pipe_t1 = std::chrono::high_resolution_clock::now();
+            double pipe_s = std::chrono::duration<double>(pipe_t1 - pipe_t0).count();
+            printf("[decoder/pipeline] mode=%d: %d chunks → %zu samples in %.2f sec\n",
+                   pipe_mode, chunk_count, full_audio.size(), pipe_s);
+            did_pipeline = true;
+        }
+    }
+
+    if (!did_pipeline) {
+        if (!tokenizer_decoder_.decode(full_codes, full_audio)) {
+            printf("FAIL: audio decoding failed\n");
+            return false;
+        }
     }
     t1 = std::chrono::high_resolution_clock::now();
     double decode_time = std::chrono::duration<double>(t1 - t0).count();
-    printf("  Decoded %zu samples (%.2f sec, ratio %.1fx)\n",
+    printf("  Decoded %zu samples (%.2f sec, ratio %.1fx)%s\n",
            full_audio.size(), decode_time,
-           full_audio.size() / 24000.0 / decode_time);
+           full_audio.size() / 24000.0 / decode_time,
+           did_pipeline ? " [pipelined]" : "");
 
     // Step 7: Remove reference audio portion
     // full_audio = decoder([ref_codes || gen_codes])

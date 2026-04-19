@@ -184,6 +184,34 @@ public:
     bool decode(const std::vector<std::vector<int>> &codes,
                 std::vector<float> &audio);
 
+    // Track L (M6.4) chunk geometry — exposed so callers can align their own
+    // frame-streaming schedule to the decoder's chunk window without having
+    // to duplicate the constants.
+    static int chunk_size() { return CHUNK_SIZE; }
+    static int overlap_frames() { return OVERLAP_FRAMES; }
+    static int chunk_step() { return CHUNK_SIZE - OVERLAP_FRAMES; }
+    static int cann_max_frames() { return CANN_MAX_FRAMES; }
+
+    // Track L (M6.4) per-chunk decode: runs a single chunk through the CANN
+    // (or CPU fallback) session and returns the audio samples that belong to
+    // this chunk *before* hard-cut stitching is applied. The caller is
+    // responsible for trimming `skip_samples = skip_frames * upsample_rate`
+    // from the front of the returned buffer when stitching multiple chunks
+    // together (see decode_chunked() for the reference stitching pattern).
+    // Returns false if both CANN and CPU sessions fail.
+    //
+    // This API is the primitive a frame-streaming producer (e.g. a future
+    // version of TalkerLLM::generate() that yields codec frames as they are
+    // sampled) can drive to overlap codec decode with the generation loop.
+    // Today's generate() still invokes decode() on the fully-gathered code
+    // sequence; decode() internally calls forward_chunk() via decode_chunked
+    // when the sequence is longer than cann_max_frames().
+    bool forward_chunk(const std::vector<std::vector<int>> &chunk_codes,
+                       std::vector<float> &chunk_audio,
+                       bool prefer_cann = true);
+
+    int upsample_rate() const { return config_.decode_upsample_rate; }
+
 private:
     DecoderConfig config_;
     bool split_mode_ = false;

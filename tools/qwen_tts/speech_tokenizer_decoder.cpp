@@ -799,6 +799,48 @@ bool SpeechTokenizerDecoder::decode(
 }
 
 // ============================================================================
+// Track L (M6.4) public chunk API — thin wrapper over decode_single_chunk
+// with CANN→CPU fallback so a frame-streaming producer can decode incremental
+// chunks without touching decoder internals.
+// ============================================================================
+
+bool SpeechTokenizerDecoder::forward_chunk(
+    const std::vector<std::vector<int>> &chunk_codes,
+    std::vector<float> &chunk_audio,
+    bool prefer_cann) {
+    if (chunk_codes.empty() || chunk_codes[0].empty()) {
+        chunk_audio.clear();
+        return true;  // empty chunk is not an error
+    }
+    int n_q = (int)chunk_codes.size();
+    if (n_q != config_.num_quantizers) {
+        printf("[decoder] forward_chunk: expected %d quantizers, got %d\n",
+               config_.num_quantizers, n_q);
+        return false;
+    }
+
+    // Try CANN first (fast path) if preferred and session exists.
+    if (prefer_cann && session_) {
+        if (decode_single_chunk(chunk_codes, chunk_audio, /*use_cann=*/true)) {
+            return true;
+        }
+        // CANN failed — fall through to CPU if available.
+        if (split_mode_ && cpu_session_) {
+            printf("[decoder] forward_chunk: CANN failed, falling back to CPU\n");
+        }
+    }
+    // CPU path (either requested directly, or CANN fallback).
+    if (split_mode_ && cpu_session_) {
+        return decode_single_chunk(chunk_codes, chunk_audio, /*use_cann=*/false);
+    }
+    // No CPU fallback available — single-session mode uses whatever session_ is.
+    if (!prefer_cann && session_) {
+        return decode_single_chunk(chunk_codes, chunk_audio, /*use_cann=*/true);
+    }
+    return false;
+}
+
+// ============================================================================
 // Single chunk decoding helper
 // ============================================================================
 
