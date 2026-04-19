@@ -97,8 +97,73 @@ bool QwenTTS::load(const QwenTTSParams& params) {
     // 5. Speech Tokenizer Decoder
     // CANN 27x faster (0.45s vs 11s) but fails for >99 total frames.
     // Use CANN with CPU fallback for long sequences.
+    //
+    // Track R (2026-04-17): probe CANN0 registration BEFORE handing "CANN0"
+    // to the decoder's ContextManager. Without this probe, a missing
+    // libggml-cann.so in the executable dir (or a silently-failing aclInit)
+    // causes ContextManager to log `create_backend: ERROR: backend CANN0
+    // not found` and fall back to CPU — but SpeechTokenizerDecoder::load()
+    // still sets split_mode_=true with session_ pointing to a CPU backend,
+    // which silently mislabels CPU decode as "CANN" in Step 6 logs and
+    // inside forward_chunk()'s prefer_cann=true path (exactly what Track L
+    // M6.4 hit). Probing up front lets us pick the honest single-session
+    // CPU path when CANN0 is unavailable, so ASR / throughput behavior
+    // matches the `n_gpu_layers==0` case deterministically.
     printf("\n[5/5] Loading speech tokenizer decoder...\n");
-    if (params.n_gpu_layers > 0) {
+
+    auto probe_cann0_available = [&]() -> bool {
+        if (params.n_gpu_layers <= 0) return false;
+        // Force dynamic backend discovery (idempotent — ContextManager also
+        // calls this, but doing it here lets us check presence before we
+        // commit to a split-mode load).
+        ggml_backend_load_all();
+        ggml_backend_dev_t dev = ggml_backend_dev_by_name("CANN0");
+        if (dev) return true;
+        // CANN0 is missing. Print a single-block diagnostic so the root
+        // cause is obvious from the build log (exec dir search path,
+        // registered backends, and relevant env vars).
+        fprintf(stderr,
+                "[qwen_tts] Track R: CANN0 backend NOT registered for decoder "
+                "ggml context.\n"
+                "  Registered backends (%zu):\n",
+                ggml_backend_reg_count());
+        for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {
+            ggml_backend_reg_t reg = ggml_backend_reg_get(i);
+            fprintf(stderr, "    - reg[%zu]: %s\n", i,
+                    ggml_backend_reg_name(reg));
+        }
+        fprintf(stderr, "  Registered devices (%zu):\n",
+                ggml_backend_dev_count());
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            ggml_backend_dev_t d = ggml_backend_dev_get(i);
+            fprintf(stderr, "    - dev[%zu]: %s (%s)\n", i,
+                    ggml_backend_dev_name(d),
+                    ggml_backend_dev_description(d));
+        }
+        const char *env_keys[] = {"LD_LIBRARY_PATH", "ASCEND_TOOLKIT_HOME",
+                                   "ASCEND_OPP_PATH", "ASCEND_HOME_PATH",
+                                   "ASCEND_CUSTOM_OPP_PATH",
+                                   "ASCEND_RT_VISIBLE_DEVICES",
+                                   "GGML_BACKEND_PATH"};
+        fprintf(stderr, "  Env (decoder load thread):\n");
+        for (const char *k : env_keys) {
+            const char *v = std::getenv(k);
+            fprintf(stderr, "    %s=%s\n", k, v ? v : "(unset)");
+        }
+        fprintf(stderr,
+                "  Likely cause: libggml-cann.so is not in the executable "
+                "dir or the CWD, so ggml_backend_load_all() silently "
+                "skipped it (talker / CP still work because they dlopen "
+                "$ASCEND_TOOLKIT_HOME/lib64/libascendcl.so directly via "
+                "cp_cann_symbols.cpp, bypassing the ggml backend "
+                "registry).\n"
+                "  Falling back to single-session CPU decoder (honest, "
+                "deterministic, bit-identical to n_gpu_layers==0 path).\n");
+        return false;
+    };
+
+    const bool use_cann_decoder = probe_cann0_available();
+    if (use_cann_decoder) {
         ContextParams dec_npu;
         dec_npu.device_name = "CANN0";
         dec_npu.n_threads = params.n_threads;

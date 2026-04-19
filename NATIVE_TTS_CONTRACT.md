@@ -1654,6 +1654,131 @@ carrying a silent false claim.
   + orchestrator landed but the overlap-with-Step-5 requirement the
   item actually names is blocked by file-ownership.
 
+- **2026-04-17 Track R (decoder CANN0 registration — diagnosed, not
+  fixed in-binary; honest CPU fallback landed; M6.4 stays `[~]`)**:
+
+  Track R's charter was to restore `ggml-cann` for the
+  `SpeechTokenizerDecoder` ggml context on ModelArts so
+  `create_backend: using CANN0 as primary backend` prints for the
+  decoder's session (and Track L's pipelined M6.4 can then exercise a
+  real chunked NPU path). After reading the ggml backend registry +
+  CANN dlopen plumbing end-to-end, the root cause is a **packaging /
+  search-path problem**, not an init-order bug:
+
+  1. Talker + CP ("the stacks that work on CANN") never touch the ggml
+     backend registry. `talker_cann_engine.*` + `cp_cann_engine.*` run
+     pure aclnn via `cp_cann_symbols.cpp`, which `dlopen`s
+     `$ASCEND_TOOLKIT_HOME/lib64/libascendcl.so` (+ `libnnopbase.so` +
+     `libopapi.so` + `libacl_op_compiler.so`) directly by absolute
+     toolkit path. Every aclnn symbol is resolved against the toolkit
+     install — independent of the ggml registry.
+  2. Tokenizer encoder + decoder ("the stacks that need ggml-cann") go
+     through `ContextManager::create_backend()` → `ggml_backend_dev_by_
+     name("CANN0")`. That device only exists if
+     `ggml_backend_load_all()` successfully dlopened the backend module
+     `libggml-cann-*.so` / `libggml-cann.so` during some prior
+     `ContextManager` construction in-process. `ggml_backend_load_all_
+     from_path(nullptr)` searches only `GGML_BACKEND_DIR` (compile-time,
+     unset in build-85), the **executable directory** (`build-85/bin/`),
+     and the current working directory. No `LD_LIBRARY_PATH` fallback.
+     If `libggml-cann.so` isn't present in those three places, the load
+     is silently skipped (NDEBUG → `silent=true`) and every subsequent
+     `ggml_backend_dev_by_name("CANN0")` returns NULL.
+  3. Order-of-init is not the culprit. `get_reg()` is a process-global
+     singleton; once CANN registers it stays registered for every
+     later `ContextManager`. If CANN registered for Step 3 (encoder),
+     it is still visible at Step 5 (decoder) — there is no "init once
+     per thread" or "decoder thread misses registry" race. Conversely,
+     if it failed at Step 3 it will also fail at Step 5 (both Track L
+     and Track R verified Step 3 produces the same `backend CANN0 not
+     found` on `--n_gpu_layers 1`).
+  4. Env vars are not the culprit either. The decoder ctor runs on
+     the main thread (not a worker), so it inherits the same
+     `LD_LIBRARY_PATH` / `ASCEND_TOOLKIT_HOME` / `ASCEND_OPP_PATH` the
+     Talker native-aclnn path used to succeed. The new Track R probe
+     dumps them at decoder-load time for future sessions to confirm.
+  5. The `aclInit` double-call is harmless. `ggml_backend_cann_reg()`
+     (ggml/src/ggml-cann/ggml-cann.cpp:2906) calls `aclInit(nullptr)`,
+     then `cp_cann_symbols.cpp:210` calls it again. Ascend returns
+     "already initialized" which both paths correctly ignore.
+
+  **Conclusion**: the ModelArts CANN 8.5 container's `build-85/bin/`
+  is missing `libggml-cann.so` (or equivalent
+  `libggml-cann-<variant>.so`), most plausibly because that build was
+  configured with `-DGGML_CANN=OFF` (or without it — the default) or
+  the ascend-soc-autodetect step in
+  `ggml/src/ggml-cann/CMakeLists.txt:16` FATAL_ERROR'd and was
+  suppressed. Fixing this requires touching the build system — out of
+  Track R's scope per the contract's file-ownership rule (CMakeLists.
+  txt is in the do-not-touch list).
+
+  **What Track R did land (in-scope, no numerics touched)**:
+
+  - `tools/qwen_tts/qwen_tts.cpp` Step 5: before handing `CANN0` to
+    `SpeechTokenizerDecoder::load()`'s split-mode signature, call
+    `ggml_backend_load_all()` and probe `ggml_backend_dev_by_name
+    ("CANN0")`. If present, split-mode load proceeds unchanged. If
+    absent, print a single diagnostic block (registered backends,
+    registered devices, `LD_LIBRARY_PATH` / `ASCEND_TOOLKIT_HOME` /
+    `ASCEND_OPP_PATH` / `ASCEND_HOME_PATH` / `ASCEND_RT_VISIBLE_DEVICES`
+    / `GGML_BACKEND_PATH`, plus the "libggml-cann.so missing from
+    executable dir" diagnosis line), then fall through to the
+    single-session CPU load — which is what the `n_gpu_layers==0`
+    path already does, so behavior is bit-identical to that path.
+    This turns the silent "split_mode_=true + CPU-backed session
+    pretending to be CANN" bug that Track L's forward_chunk() saw
+    into an explicit, deterministic single-session-CPU path.
+
+  - No edits to `speech_tokenizer_decoder.{h,cpp}` were needed; the
+    decoder already has a correct single-session-CPU constructor
+    (`load(path, params)`) that `qwen_tts.cpp` now uses exactly when
+    CANN0 isn't available.
+
+  **Smallest-possible next-session fix** (what would actually make
+  `create_backend: using CANN0 as primary backend` print for the
+  decoder): rebuild `build-85` on ModelArts with the ggml-cann
+  module enabled, e.g.
+
+  ```
+  cd build-85
+  cmake .. -DGGML_CANN=ON \
+           -DCANN_INSTALL_DIR=$ASCEND_TOOLKIT_HOME \
+           -DBUILD_SHARED_LIBS=ON
+  cmake --build . --target ggml-cann qwen_tts -j 4
+  ls build-85/bin/libggml-cann.so      # should now exist
+  ```
+
+  Then re-run the Track L bench. With
+  `libggml-cann.so` next to `qwen_tts`, `ggml_backend_load_all()`
+  discovers it, `ggml_backend_cann_reg()` registers `CANN0`, and
+  `ContextManager::create_backend("CANN0", …)` prints
+  `create_backend: using CANN0 as primary backend` for the decoder.
+  `decode_chunked()` then exercises real per-chunk NPU kernel
+  dispatch, and Track L's pipelined mode should be at parity with
+  baseline (or faster) at the median.
+
+  **Not stamping M6.4**: the acceptance gate is "`using CANN0 as
+  primary backend` prints for the decoder context" — not achievable
+  from a macOS worktree without rebuilding on ModelArts, and out of
+  Track R's file-ownership scope to fix via CMake. Keeping `[~]`.
+
+  **Verified-by**: (a) reading `ggml/src/ggml-backend-reg.cpp:454–566`
+  (`ggml_backend_load_best` search path: GGML_BACKEND_DIR → exec dir
+  → CWD, no LD_LIBRARY_PATH); `ggml/src/ggml-cann/ggml-cann.cpp:
+  2898–2932` (one-time `aclInit` + device enumeration guarded by
+  static mutex — no per-thread or per-ContextManager state);
+  `tools/qwen_common/ctx_manager.cpp:12` (every ContextManager ctor
+  calls `ggml_backend_load_all`, so order-of-init between Talker and
+  decoder doesn't matter); `tools/qwen_tts/cp_cann_symbols.cpp:
+  198–212` (Talker/CP dlopen toolkit libs by name — never goes near
+  the ggml backend registry); (b) matching all of the above against
+  Track L's report that encoder (Step 3) + decoder (Step 5) both
+  fail the same way under `--n_gpu_layers 1` while Talker (Step 4)
+  succeeds — the only structural difference is ggml-cann module
+  presence; (c) gate = `using CANN0 as primary backend` line in
+  decoder log → not printed (cannot print without the .so) → M6.4
+  stays `[~]`.
+
 - **2026-04-17 Track J (M6.2 — speculative-embedding variant landed,
   ASR PASS 4/4, DTW 0.973, but fps still under 28 gate)**:
 
