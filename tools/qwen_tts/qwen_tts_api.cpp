@@ -14,7 +14,10 @@
 #include "bpe_tokenizer.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -28,6 +31,22 @@ struct qwen_tts_ctx {
     bool has_tokenizer_encoder;
     int hidden_size;
     int vocab_size;
+
+    // --- High-level synthesize() path (B5) --------------------------------
+    // Loader config captured at qwen_tts_load() so we can lazily construct
+    // a QwenTTS wrapper on the first qwen_tts_synthesize() call without
+    // re-plumbing the load arguments. The primitives above stay authoritative
+    // for the fine-grained ABI (embed / forward / predict_codes / ...); the
+    // QwenTTS instance below is a parallel, one-shot synthesis surface that
+    // reuses the existing generation logic in qwen_tts.cpp verbatim.
+    std::string load_model_dir;
+    std::string load_tokenizer_dir;
+    std::string load_talker_override;
+    std::string load_cp_override;
+    int         load_n_gpu_layers = 0;
+    int         load_n_threads    = 0;
+    std::unique_ptr<QwenTTS> synth;
+    std::mutex  synth_mu;  // serialize synth init + generate (engine is !thread-safe per-handle)
 };
 
 extern "C" {
@@ -47,6 +66,15 @@ qwen_tts_ctx_t* qwen_tts_load(
     std::string tdir = tokenizer_dir ? std::string(tokenizer_dir) : mdir;
     if (mdir.back() != '/') mdir += '/';
     if (tdir.back() != '/') tdir += '/';
+
+    // Capture load config so qwen_tts_synthesize() can lazily build a QwenTTS
+    // with the same settings without re-plumbing args through the ABI.
+    ctx->load_model_dir       = mdir;
+    ctx->load_tokenizer_dir   = tdir;
+    ctx->load_talker_override = talker_override ? talker_override : "";
+    ctx->load_cp_override     = cp_override     ? cp_override     : "";
+    ctx->load_n_gpu_layers    = n_gpu_layers;
+    ctx->load_n_threads       = n_threads;
 
     // Load BPE tokenizer
     if (!ctx->bpe_tokenizer.load(tdir + "vocab.json", tdir + "merges.txt")) {
@@ -315,6 +343,152 @@ int qwen_tts_extract_speaker(
         memcpy(embedding_out, embedding.data(), embedding.size() * sizeof(float));
     }
     return 0;
+}
+
+/* ========================================================================== */
+/* High-level one-shot synthesis (B5)                                         */
+/* ========================================================================== */
+
+// Fill a QwenTTSParams struct the way QwenTTS::generate* expects.
+// `defaults` semantics mirror the struct doc in qwen_tts_api.h:
+//   seed                -> unused by the C++ path (RNG is set inside
+//                          TalkerSamplingParams/engine); we keep it in the
+//                          struct for future wiring but don't plumb here.
+//   max_tokens == 0     -> 2048
+//   temperature == 0    -> 0.9f
+//   top_k == 0          -> 50 ; top_k == -1 -> disabled (INT_MAX sentinel)
+//   top_p == 0          -> 1.0f
+//   repetition_penalty == 0 -> 1.05f
+//   cp_groups == 0      -> all 15
+//   cp_layers == 0      -> all 5
+//   greedy != 0         -> do_sample=false (argmax)
+static void translate_synth_params(
+    const qwen_tts_ctx* ctx,
+    const qwen_tts_synth_params_t* in,
+    QwenTTSParams& out)
+{
+    out.model_dir     = ctx->load_model_dir;
+    out.tokenizer_dir = ctx->load_tokenizer_dir;
+    out.talker_model  = ctx->load_talker_override;
+    out.cp_model      = ctx->load_cp_override;
+    out.n_threads     = ctx->load_n_threads;
+    out.n_gpu_layers  = ctx->load_n_gpu_layers;
+    // native CANN paths ON when GPU layers > 0 (matches QwenTTS::load default)
+    out.cp_cann       = true;
+    out.native_talker = true;
+
+    out.text        = in->text        ? in->text        : "";
+    out.ref_audio   = in->ref_audio_path ? in->ref_audio_path : "";
+    out.ref_text    = in->ref_text    ? in->ref_text    : "";
+    out.ref_lang    = in->ref_lang    ? in->ref_lang    : "English";
+    out.target_lang = in->target_lang ? in->target_lang : "English";
+    out.mode        = in->mode        ? in->mode        : "icl";
+    out.speaker     = in->speaker     ? in->speaker     : "";
+
+    out.max_new_tokens = in->max_tokens > 0 ? in->max_tokens : 2048;
+
+    TalkerSamplingParams s; // defaults match Python reference (0.9 / 50 / 1.0 / 1.05)
+    if (in->temperature != 0.0f)        s.temperature        = in->temperature;
+    if (in->top_p != 0.0f)              s.top_p              = in->top_p;
+    if (in->repetition_penalty != 0.0f) s.repetition_penalty = in->repetition_penalty;
+    if (in->top_k == -1)                s.top_k              = 0; // disabled in talker.cpp's sampler
+    else if (in->top_k > 0)             s.top_k              = in->top_k;
+    // else: keep default 50
+
+    if (in->greedy != 0) {
+        s.do_sample    = false;
+        s.cp_do_sample = false;
+    }
+
+    // Mirror CP sampling hyperparams onto the CP branch (Python reference
+    // uses the same temperature / top_k / top_p for both sampler passes).
+    s.cp_temperature = s.temperature;
+    s.cp_top_k       = s.top_k;
+    s.cp_top_p       = s.top_p;
+
+    if (in->cp_groups > 0) s.cp_max_groups = in->cp_groups;
+    if (in->cp_layers > 0) s.cp_max_layers = in->cp_layers;
+
+    out.sampling = s;
+}
+
+int qwen_tts_synthesize(
+    qwen_tts_ctx_t* ctx,
+    const qwen_tts_synth_params_t* in,
+    float** pcm_out,
+    int* n_samples_out
+) {
+    // Zero outputs up front so the error contract holds for every early return.
+    if (pcm_out)       *pcm_out = nullptr;
+    if (n_samples_out) *n_samples_out = 0;
+
+    if (!ctx || !in || !pcm_out || !n_samples_out) return -1;
+    if (!in->text || !in->mode) return -1;
+
+    std::lock_guard<std::mutex> guard(ctx->synth_mu);
+
+    // Lazy-init the QwenTTS wrapper on first call. Reuses the same model dir,
+    // tokenizer dir, and GGUF overrides passed to qwen_tts_load(). This
+    // duplicates the Talker/decoder load vs. the primitive ctx above — a
+    // deliberate tradeoff to keep the primitive ABI bit-for-bit unchanged
+    // (see contract §5 B5). Callers using synthesize() only can ignore the
+    // primitive components; callers using primitives only never pay this cost.
+    if (!ctx->synth) {
+        auto synth = std::make_unique<QwenTTS>();
+        QwenTTSParams load_params;
+        load_params.model_dir     = ctx->load_model_dir;
+        load_params.tokenizer_dir = ctx->load_tokenizer_dir;
+        load_params.talker_model  = ctx->load_talker_override;
+        load_params.cp_model      = ctx->load_cp_override;
+        load_params.n_threads     = ctx->load_n_threads;
+        load_params.n_gpu_layers  = ctx->load_n_gpu_layers;
+        load_params.cp_cann       = true;
+        load_params.native_talker = true;
+        if (!synth->load(load_params)) {
+            fprintf(stderr, "[qwen_tts_api] QwenTTS::load failed\n");
+            return -3;
+        }
+        ctx->synth = std::move(synth);
+    }
+
+    QwenTTSParams gen_params;
+    translate_synth_params(ctx, in, gen_params);
+
+    std::string mode = in->mode;
+    std::vector<float> audio;
+    bool ok = false;
+    if (mode == "icl") {
+        ok = ctx->synth->generate(gen_params, audio);
+    } else if (mode == "xvec") {
+        ok = ctx->synth->generate_xvec(gen_params, audio);
+    } else if (mode == "customvoice") {
+        ok = ctx->synth->generate_customvoice(gen_params, audio);
+    } else {
+        fprintf(stderr, "[qwen_tts_api] unknown mode: %s\n", mode.c_str());
+        return -2;
+    }
+
+    if (!ok) return -3;
+
+    const size_t n = audio.size();
+    if (n == 0) {
+        // Engine returned success but no samples — treat as generation failure
+        // so the caller doesn't have to special-case a NULL buffer with n==0.
+        return -3;
+    }
+
+    float* buf = static_cast<float*>(std::malloc(n * sizeof(float)));
+    if (!buf) return -3;
+    std::memcpy(buf, audio.data(), n * sizeof(float));
+
+    *pcm_out       = buf;
+    *n_samples_out = static_cast<int>(n);
+    return 0;
+}
+
+void qwen_tts_pcm_free(float* pcm) {
+    // Pair for the malloc() inside qwen_tts_synthesize(). Safe on NULL.
+    std::free(pcm);
 }
 
 } // extern "C"

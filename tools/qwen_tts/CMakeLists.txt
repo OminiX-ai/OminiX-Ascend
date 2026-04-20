@@ -122,6 +122,7 @@ target_compile_features(${TARGET} PRIVATE cxx_std_17)
 set(API_TARGET qwen_tts_api)
 set(API_SRC_FILES
     qwen_tts_api.cpp
+    qwen_tts.cpp                     # B5: QwenTTS::generate* used by qwen_tts_synthesize
     talker.cpp
     tts_transformer.cpp
     speaker_encoder.cpp
@@ -178,10 +179,13 @@ if(OpenMP_CXX_FOUND)
     target_link_libraries(${API_TARGET} PRIVATE OpenMP::OpenMP_CXX)
 endif()
 
-# SONAME versioning: libqwen_tts_api.so.1.0.0 with .so.1 and .so symlinks.
+# SONAME versioning: libqwen_tts_api.so.1.1.0 with .so.1 and .so symlinks.
+# Bumped MINOR (1.0.0 -> 1.1.0) for B5's additive qwen_tts_synthesize +
+# qwen_tts_pcm_free exports. SOVERSION stays at 1 — existing consumers
+# linked against the 14-symbol ABI resolve cleanly against this build.
 set_target_properties(${API_TARGET} PROPERTIES
     OUTPUT_NAME qwen_tts_api
-    VERSION     1.0.0
+    VERSION     1.1.0
     SOVERSION   1
 )
 

@@ -1,7 +1,12 @@
-/* Linker version script: export ONLY the 12 C API symbols.
+/* Linker version script: export ONLY the 16 C API symbols.
  * Hides ggml/ggml-cann/llama/qwen_common internals to avoid
  * symbol collision with future deps in consumer binaries
- * (Ascend API Bridge Contract §7 risk register). */
+ * (Ascend API Bridge Contract §7 risk register).
+ *
+ * Additive-only: B5 added qwen_tts_synthesize + qwen_tts_pcm_free
+ * (Ascend API Bridge Contract §5 B5). Version tag stays
+ * QWEN_TTS_API_1.0 — callers compiled against the 14-symbol header
+ * resolve cleanly against this .so, and SOVERSION=1 is preserved. */
 QWEN_TTS_API_1.0 {
     global:
         qwen_tts_load;
@@ -18,6 +23,8 @@ QWEN_TTS_API_1.0 {
         qwen_tts_predict_codes;
         qwen_tts_decode_audio;
         qwen_tts_extract_speaker;
+        qwen_tts_synthesize;
+        qwen_tts_pcm_free;
     local:
         *;
 };

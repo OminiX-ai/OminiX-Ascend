@@ -183,6 +183,72 @@ int qwen_tts_extract_speaker(
     float* embedding_out
 );
 
+/* ========================================================================== */
+/* High-level one-shot synthesis (Ascend API Bridge Contract §5 B5)           */
+/* ========================================================================== */
+
+/**
+ * Parameters for qwen_tts_synthesize().
+ *
+ * Mirrors the fields of QwenTTSParams (see qwen_tts.h) actually consumed by
+ * QwenTTS::generate() / generate_xvec() / generate_customvoice(). Callers
+ * construct, fill, and pass by pointer; the library never retains it past
+ * the synthesize() call.
+ *
+ * Zero-defaulted sampling fields use the same defaults as the qwen_tts
+ * CLI / Python reference (documented per-field below). Set any field to
+ * its "use default" sentinel to fall through.
+ */
+typedef struct {
+    const char* text;               /* target text (UTF-8, non-null)            */
+    const char* ref_audio_path;     /* path to ref .wav (NULL if mode != "icl") */
+    const char* ref_text;           /* reference transcript (NULL if not ICL)   */
+    const char* ref_lang;           /* "English" | "Chinese" | etc              */
+    const char* target_lang;        /* same set                                 */
+    const char* mode;               /* "icl" | "xvec" | "customvoice"           */
+    const char* speaker;            /* for customvoice mode (NULL otherwise)    */
+    int         seed;               /* sampling seed (0 = non-deterministic)    */
+    int         max_tokens;         /* 0 = default 2048                         */
+    float       temperature;        /* 0 = default 0.9                          */
+    int         top_k;              /* 0 = default 50, -1 = disabled            */
+    float       top_p;              /* 0 = default 1.0                          */
+    float       repetition_penalty; /* 0 = default 1.05                         */
+    int         cp_groups;          /* 0 = default (all 15)                     */
+    int         cp_layers;          /* 0 = default (all 5)                      */
+    int         greedy;             /* 0 = sample, non-zero = greedy            */
+} qwen_tts_synth_params_t;
+
+/**
+ * One-shot text-to-speech synthesis.
+ *
+ * Dispatches by params->mode to QwenTTS::generate() (ICL),
+ * generate_xvec(), or generate_customvoice(). The library allocates the
+ * output PCM buffer via malloc() (size is unknown up front); the caller
+ * MUST release it with qwen_tts_pcm_free().
+ *
+ * pcm_out:       [out] pointer receiving the malloc()'d f32 buffer (24kHz mono)
+ * n_samples_out: [out] number of float samples written
+ *
+ * Returns 0 on success. On any error, *pcm_out is set to NULL and
+ * *n_samples_out is set to 0. Error codes:
+ *   -1: ctx or params was NULL
+ *   -2: unknown mode
+ *   -3: generation failed inside QwenTTS::generate*
+ */
+int qwen_tts_synthesize(
+    qwen_tts_ctx_t*                   ctx,
+    const qwen_tts_synth_params_t*    params,
+    float**                           pcm_out,
+    int*                              n_samples_out
+);
+
+/**
+ * Release a PCM buffer returned by qwen_tts_synthesize().
+ *
+ * Equivalent to free(pcm). Safe to call with NULL (no-op).
+ */
+void qwen_tts_pcm_free(float* pcm);
+
 #ifdef __cplusplus
 }
 #endif
