@@ -23,7 +23,7 @@ struct qwen_tts_ctx {
     SpeechTokenizerDecoder decoder;
     SpeakerEncoder speaker_encoder;
     SpeechTokenizerEncoder tokenizer_encoder;
-    BPETokenizer bpe_tokenizer;
+    BpeTokenizer bpe_tokenizer;
     bool has_speaker_encoder;
     bool has_tokenizer_encoder;
     int hidden_size;
@@ -55,16 +55,14 @@ qwen_tts_ctx_t* qwen_tts_load(
         return nullptr;
     }
 
-    // Load talker LLM
+    // Load talker LLM. Default to the F16/F32 `qwen_tts_talker_llama.gguf`
+    // because the native TalkerCannEngine (CP-CANN path) rejects Q-quantized
+    // weights with "unsupported dtype". Q8_0 is only viable via the llama.cpp
+    // fallback (QWEN_TTS_LLAMA=ON), which is off by default in the API build.
+    // Honour an explicit caller override without second-guessing.
     std::string talker_llama = talker_override
         ? std::string(talker_override)
         : mdir + "qwen_tts_talker_llama.gguf";
-    // Try Q8_0 first
-    {
-        std::string q8 = mdir + "qwen_tts_talker_llama_q8_0.gguf";
-        FILE* f = fopen(q8.c_str(), "rb");
-        if (f) { fclose(f); talker_llama = q8; }
-    }
 
     std::string cp_path = cp_override
         ? std::string(cp_override)
@@ -75,11 +73,24 @@ qwen_tts_ctx_t* qwen_tts_load(
         else fclose(f);
     }
 
+    // Decide whether to activate the native CP-CANN / Talker-CANN paths.
+    // Built-in when QWEN_TTS_HAS_CP_CANN is defined at compile time AND the
+    // caller asked for NPU layers. Without llama.cpp linked, the native path
+    // is the ONLY viable forward pass — load_model() returns false otherwise.
+#ifdef QWEN_TTS_HAS_CP_CANN
+    const bool use_cp_cann     = (n_gpu_layers > 0);
+    const bool use_talker_cann = (n_gpu_layers > 0);
+#else
+    const bool use_cp_cann     = false;
+    const bool use_talker_cann = false;
+#endif
+
     if (!ctx->talker.load_model(
         talker_llama,
         mdir + "qwen_tts_talker.gguf",
         mdir + "qwen_tts_code_predictor.gguf",
-        n_threads, n_gpu_layers, cp_path)) {
+        n_threads, n_gpu_layers, cp_path,
+        use_cp_cann, use_talker_cann)) {
         fprintf(stderr, "[qwen_tts_api] failed to load talker\n");
         delete ctx;
         return nullptr;

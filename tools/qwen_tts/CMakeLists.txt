@@ -104,6 +104,111 @@ endif()
 target_link_libraries  (${TARGET} PRIVATE Threads::Threads)
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
 
+# =============================================================================
+# qwen_tts_api — Shared library exposing the C ABI in qwen_tts_api.h.
+#
+# Built for OminiX-API FFI (Ascend API Bridge Contract §5 B1). Links the SAME
+# internals as the qwen_tts executable (BPETokenizer, TalkerLLM, SpeechTokenizer
+# encoder/decoder, SpeakerEncoder, ggml, ggml-cann, kissfft) but exposes ONLY
+# the 14 qwen_tts_* C symbols via a linker version script to prevent ggml /
+# ggml-cann symbol pollution in downstream binaries (risk register §7).
+#
+# Does NOT include main.cpp / qwen_tts.cpp (CLI entry points) or the llama.cpp
+# fallback path — the library is a pure compute surface. The native CP-CANN
+# Talker engine (cp_cann_engine.cpp, cp_cann_symbols.cpp, talker_cann_engine.cpp)
+# is included when QWEN_TTS_CP_CANN is ON so Ascend clients get the same
+# native-Talker path the executable uses.
+# =============================================================================
+set(API_TARGET qwen_tts_api)
+set(API_SRC_FILES
+    qwen_tts_api.cpp
+    talker.cpp
+    tts_transformer.cpp
+    speaker_encoder.cpp
+    speech_tokenizer_encoder.cpp
+    speech_tokenizer_decoder.cpp
+    model_defs.cpp
+    stft.cpp
+    ${KISSFFT_SRC}
+)
+if(QWEN_TTS_CP_CANN)
+    list(APPEND API_SRC_FILES
+        cp_cann_engine.cpp
+        cp_cann_symbols.cpp
+        talker_cann_engine.cpp
+    )
+endif()
+
+add_library(${API_TARGET} SHARED ${API_SRC_FILES})
+
+# qwen_common is a STATIC dep and is linked into a SHARED lib here, so its
+# object files must be PIC. qwen_common's own CMakeLists doesn't set PIC
+# (its only other consumer is the qwen_tts executable, which doesn't need
+# it). We flip the flag on the existing target from here — this touches
+# build flags, not source code in tools/qwen_common/.
+set_property(TARGET qwen_common PROPERTY POSITION_INDEPENDENT_CODE ON)
+
+target_link_libraries     (${API_TARGET} PUBLIC ggml qwen_common)
+target_link_libraries     (${API_TARGET} PRIVATE Threads::Threads)
+target_include_directories(${API_TARGET} PUBLIC  .)
+target_include_directories(${API_TARGET} PRIVATE
+    ${CMAKE_SOURCE_DIR}/include   # llama.h visible for talker.h (fallback types)
+    ../.. ../../vendor ${KISSFFT_DIR}
+    $ENV{ASCEND_TOOLKIT_HOME}/include)
+target_compile_features   (${API_TARGET} PRIVATE cxx_std_17)
+set_target_properties     (${API_TARGET} PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+if(QWEN_TTS_LLAMA)
+    target_link_libraries     (${API_TARGET} PUBLIC llama)
+    target_compile_definitions(${API_TARGET} PRIVATE QWEN_TTS_LLAMA=1)
+endif()
+
+if(QWEN_TTS_CP_CANN)
+    target_link_libraries(${API_TARGET} PRIVATE ${CMAKE_DL_LIBS})
+    target_compile_definitions(${API_TARGET} PRIVATE QWEN_TTS_HAS_CP_CANN=1)
+    target_include_directories(${API_TARGET} PRIVATE
+        $ENV{ASCEND_TOOLKIT_HOME}/aarch64-linux/include)
+endif()
+
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+    target_compile_options(${API_TARGET} PRIVATE -march=armv8.2-a+fp16)
+endif()
+
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(${API_TARGET} PRIVATE OpenMP::OpenMP_CXX)
+endif()
+
+# SONAME versioning: libqwen_tts_api.so.1.0.0 with .so.1 and .so symlinks.
+set_target_properties(${API_TARGET} PROPERTIES
+    OUTPUT_NAME qwen_tts_api
+    VERSION     1.0.0
+    SOVERSION   1
+)
+
+# Hide every symbol that isn't in the version script. Prevents ggml/ggml-cann
+# internals from leaking into consumer binaries.
+set(API_VERSION_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/qwen_tts_api.version")
+if(UNIX AND NOT APPLE AND EXISTS "${API_VERSION_SCRIPT}")
+    target_link_options(${API_TARGET} PRIVATE
+        "-Wl,--version-script=${API_VERSION_SCRIPT}"
+        "-Wl,--no-undefined")
+    set_property(TARGET ${API_TARGET} APPEND PROPERTY
+        LINK_DEPENDS "${API_VERSION_SCRIPT}")
+    # NOTE: We deliberately do NOT use -fvisibility=hidden at compile time.
+    # The version script's `local: *;` already suppresses every non-API symbol
+    # at link time, including symbols from static-linked qwen_common / kissfft.
+    # Adding -fvisibility=hidden would hide the extern "C" qwen_tts_* symbols
+    # as well (they have no __attribute__((visibility("default"))) annotation),
+    # leaving nothing for the version script to export.
+endif()
+
+# Install library to lib/, public header to include/.
+install(TARGETS ${API_TARGET}
+    LIBRARY DESTINATION lib
+    ARCHIVE DESTINATION lib
+    RUNTIME DESTINATION bin)
+install(FILES qwen_tts_api.h DESTINATION include)
+
 # Test: Code Predictor verification
 set(TEST_CP_SRC
     test_code_predictor.cpp

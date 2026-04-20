@@ -1,0 +1,23 @@
+/* Linker version script: export ONLY the 12 C API symbols.
+ * Hides ggml/ggml-cann/llama/qwen_common internals to avoid
+ * symbol collision with future deps in consumer binaries
+ * (Ascend API Bridge Contract §7 risk register). */
+QWEN_TTS_API_1.0 {
+    global:
+        qwen_tts_load;
+        qwen_tts_free;
+        qwen_tts_hidden_size;
+        qwen_tts_vocab_size;
+        qwen_tts_has_speaker_encoder;
+        qwen_tts_text_embed;
+        qwen_tts_codec_embed;
+        qwen_tts_codec_head;
+        qwen_tts_generation_embed;
+        qwen_tts_reset_cache;
+        qwen_tts_forward;
+        qwen_tts_predict_codes;
+        qwen_tts_decode_audio;
+        qwen_tts_extract_speaker;
+    local:
+        *;
+};
