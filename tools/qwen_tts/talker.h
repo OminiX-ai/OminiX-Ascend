@@ -1,5 +1,8 @@
 #pragma once
 
+// Forward declaration for standalone transformer
+struct TtsTransformer;
+
 #include "build_graph.h"
 #include "ctx_manager.h"
 #include "ggml.h"
@@ -7,7 +10,6 @@
 #include "model_loader.h"
 #include "infer_session.hpp"
 #include "llama.h"
-#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -31,6 +33,13 @@ struct TalkerSamplingParams {
     int cp_top_k = 50;
     float cp_top_p = 1.0f;
     bool cp_do_sample = true;
+    // CP codec group limit: predict only groups 1..cp_max_groups (0=all 15).
+    // Lower values skip higher codebook levels for faster inference.
+    // Groups 1-8 carry ~95% of signal quality; 9-15 are fine detail.
+    int cp_max_groups = 0;
+    // CP transformer layer limit: use only first N layers (0=all 5).
+    // Hypothesis: layers 3-4 are refinement; first 2-3 may suffice.
+    int cp_max_layers = 0;
 };
 
 // ============================================================================
@@ -61,6 +70,8 @@ struct TalkerConfig {
     int codec_think_eos_id = 2157;
     // Language IDs (parsed from JSON)
     std::map<std::string, int> language_ids;
+    // Speaker IDs for CustomVoice model (parsed from JSON spk_id)
+    std::map<std::string, int> spk_ids;
 };
 
 // ============================================================================
@@ -163,6 +174,9 @@ public:
 // High-level Talker LLM interface
 // ============================================================================
 
+class CpCannEngine;         // cp_cann_engine.h (optional, Ascend-only)
+class TalkerCannEngine;     // talker_cann_engine.h (optional, Ascend-only)
+
 class TalkerLLM {
 public:
     TalkerLLM() = default;
@@ -172,31 +186,24 @@ public:
     //   talker_llama_path: llama.cpp-compatible GGUF (backbone)
     //   talker_embed_path: original Talker GGUF (embeddings + heads)
     //   code_predictor_path: Code Predictor GGUF
+    //   use_cp_cann: when true and cp_llama_path is empty, run CP via the
+    //     native CANN engine (direct ACL ops, bypasses llama.cpp).
+    //   use_talker_cann: when true, also run the Talker backbone via a
+    //     native aclnn engine instead of llama.cpp. Unifies the numerical
+    //     path with CP and eliminates framework-mixing artifacts that
+    //     produced audible fragments in the hybrid setup.
     bool load_model(const std::string &talker_llama_path,
                     const std::string &talker_embed_path,
                     const std::string &code_predictor_path,
                     int n_threads = 4,
                     int n_gpu_layers = 0,
-                    const std::string &cp_llama_path = "");
+                    const std::string &cp_llama_path = "",
+                    bool use_cp_cann = false,
+                    bool use_talker_cann = false);
 
-    // Per-frame callback hook for streaming generation. Called immediately
-    // after each newly produced codec frame is appended to codec_tokens.
-    //   frame_idx: 0-based index of the frame just appended
-    //   codec_tokens: current accumulated tokens (size = frame_idx + 1)
-    // The callback runs synchronously inside the generation loop, so it
-    // should be lightweight (e.g. enqueue onto a chunk buffer).
-    using FrameCallback = std::function<void(
-        int frame_idx,
-        const std::vector<std::vector<int>> &codec_tokens)>;
-
-    // Generate codec tokens.
-    //   ref_text_tokens: tokenized ref text content (no role prefix/suffix). Empty in xvec mode.
+    // Generate codec tokens (ICL voice cloning mode)
+    //   ref_text_tokens: tokenized ref text content (no role prefix/suffix)
     //   target_text_tokens: tokenized target text content (no role prefix/suffix)
-    //   ref_codes: per-quantizer reference codec frames. Empty in xvec mode.
-    //   xvec_mode: true → x-vector-only synthesis (no ICL ref). Mirrors Qwen3-TTS
-    //              x_vector_only_mode: prefill is shorter (role + mixed_prefix + 1 pos)
-    //              and trailing_text uses target_text[1:] + tts_eos.
-    //   frame_callback: optional, see FrameCallback above
     bool generate(const std::vector<int> &ref_text_tokens,
                   const std::vector<int> &target_text_tokens,
                   const std::vector<float> &spk_embedding,
@@ -204,11 +211,71 @@ public:
                   const std::string &language,
                   std::vector<std::vector<int>> &codec_tokens,
                   int max_new_tokens = 2048,
-                  const TalkerSamplingParams &sampling = TalkerSamplingParams(),
-                  bool xvec_mode = false,
-                  FrameCallback frame_callback = nullptr);
+                  const TalkerSamplingParams &sampling = TalkerSamplingParams());
+
+    // Generate codec tokens (x-vector voice cloning — no ref audio codec)
+    //   Same as MLX synthesize_voice_clone: uses speaker embedding only.
+    //   Prefill: [role(3)] + [codec_prefix(4) overlaid on tts_pad] + [spk(1)] + [bos+pad(1)] + [first_text+bos(1)]
+    bool generate_xvec(const std::vector<int> &target_text_tokens,
+                       const std::vector<float> &spk_embedding,
+                       const std::string &language,
+                       std::vector<std::vector<int>> &codec_tokens,
+                       int max_new_tokens = 2048,
+                       const TalkerSamplingParams &sampling = TalkerSamplingParams());
+
+    // Generate codec tokens (CustomVoice built-in speaker mode — no ref audio)
+    //   Uses discrete speaker token ID instead of continuous speaker embedding.
+    //   Prefill: [role(3)] + [codec_prefix(5) with spk_id overlaid on tts_pad] + [bos+pad(1)] + [first_text+bos(1)]
+    // X-vector clone using standalone transformer (correct MRoPE, bypasses llama.cpp)
+    bool generate_xvec_standalone(const std::vector<int> &target_text_tokens,
+                       const std::vector<float> &spk_embedding,
+                       const std::string &language,
+                       std::vector<std::vector<int>> &codec_tokens,
+                       int max_new_tokens,
+                       const TalkerSamplingParams &sampling,
+                       TtsTransformer *tfm);
+
+    bool generate_customvoice(const std::vector<int> &target_text_tokens,
+                              const std::string &speaker,
+                              const std::string &language,
+                              std::vector<std::vector<int>> &codec_tokens,
+                              int max_new_tokens = 2048,
+                              const TalkerSamplingParams &sampling = TalkerSamplingParams());
 
     const TalkerConfig &get_config() const { return talker_config_; }
+
+    // ---- Public accessors for C API (qwen_tts_api.cpp) ----
+
+    void cache_tts_embeddings_public() { cache_tts_embeddings(); }
+
+    void lookup_text_projected_public(int token_id, float *out) {
+        cache_tts_embeddings();
+        lookup_text_projected(token_id, out);
+    }
+
+    void lookup_codec_embedding_public(int token_id, float *out) {
+        lookup_codec_embedding(token_id, out);
+    }
+
+    void apply_codec_head_public(const float *hidden, float *logits) {
+        apply_codec_head(hidden, logits);
+    }
+
+    void reset_cache_public();
+
+    // Forward pass for C API: feed embeddings, get logits + hidden from last pos
+    int forward_public(const float *input_embeds, int seq_len,
+                       float *logits_out, float *hidden_out);
+
+    // Generation embedding using correct CP codec embeddings for groups 1-15
+    void compute_next_embedding_public(int group0, const std::vector<int> &groups_1_15, float *out) {
+        compute_next_embedding(group0, groups_1_15, out);
+    }
+
+    const float* get_tts_pad_embed() {
+        cache_tts_embeddings();
+        return tts_pad_embed_.data();
+    }
 
     // TTS special text token IDs (from Qwen3-TTS config)
     static constexpr int tts_bos_token_id = 151672;
@@ -230,11 +297,24 @@ private:
     llama_model *llama_model_ = nullptr;
     llama_context *llama_ctx_ = nullptr;
     int n_embd_ = 0;
+    int api_cur_pos_ = 0;  // Position counter for C API forward_public
 
     // CP via llama.cpp (NPU acceleration)
     llama_model *cp_llama_model_ = nullptr;
     llama_context *cp_llama_ctx_ = nullptr;
     bool cp_use_llama_ = false;
+
+    // CP via native CANN engine (direct ACL ops, lowest-overhead NPU path).
+    // Raw pointer (not unique_ptr) so the destructor can be defined in
+    // talker.cpp where CpCannEngine's full type is conditionally visible.
+    CpCannEngine *cp_cann_engine_ = nullptr;
+    bool cp_use_cann_ = false;
+
+    // Native Talker backbone (M2) — when enabled, bypasses llama.cpp's
+    // llama_decode for the Talker transformer too, running the full 28-layer
+    // forward through direct aclnn calls. Matches CpCannEngine pattern.
+    TalkerCannEngine *talker_cann_engine_ = nullptr;
+    bool talker_use_cann_ = false;
 
     // Custom embedding/head tensors
     std::unique_ptr<InferenceSession<TalkerEmbeddingModel>> embed_session_;
@@ -253,33 +333,16 @@ private:
     bool head_f32_ready_ = false;
     void init_head_f32_weights();
 
+    // Pre-allocated batch for per-step talker decode (avoids alloc/free per iteration)
+    llama_batch talker_step_batch_ = {};
+    bool talker_step_batch_ready_ = false;
+    void ensure_talker_step_batch();
+
     // Trailing text hidden for streaming ICL generation
     std::vector<float> trailing_text_;   // [trailing_text_len_ * dim] or [dim] if just tts_pad
     int trailing_text_len_ = 0;          // 0 = use tts_pad for all steps
     bool tts_embeds_cached_ = false;
     void cache_tts_embeddings();
-
-    // Cached ICL embeddings for multi-sentence reuse.  Role prefix and
-    // ref-text / ref-codec embeddings are identical across sentences within
-    // one generate() call; caching avoids redundant text_projection matvecs
-    // and 16-group codec lookups.
-    std::vector<float> cached_role_embeds_;       // [3 * dim]
-    bool role_embeds_cached_ = false;
-    std::vector<float> cached_ref_text_proj_;     // [ref_text_len * dim]
-    std::vector<int>   cached_ref_text_keys_;     // token ids for validation
-    std::vector<float> cached_codec_embeds_;      // [codec_lens * dim]
-    int cached_codec_lens_ = -1;
-
-    // Scratch buffer for compute_next_embedding (avoids per-frame malloc)
-    std::vector<float> emb_scratch_;              // [dim]
-
-    // Near-repeat loop detector state. Counts how many consecutive codec
-    // frames had ≥ 10 of 16 quantizers matching the previous frame.
-    // After 3 consecutive near-repeats the talker generation loop forces
-    // EOS and drops the looping frames so the audio doesn't carry the
-    // stuck syllable. Catches the rare case where the model gets locked
-    // into a syllable repetition. Reset at the top of every generate().
-    int near_repeat_run_ = 0;
 
     // Embedding helpers (operate on raw weight data)
     void lookup_text_embedding(int token_id, float *out);
@@ -287,17 +350,30 @@ private:
     void apply_text_projection(const float *in, float *out);
     void apply_codec_head(const float *hidden, float *logits);
 
-    // Build prefill embedding sequence.
-    //   xvec_mode=false: streaming ICL prefill (role + mixed_prefix + interleaved ICL)
-    //   xvec_mode=true:  x-vector-only prefill (role + mixed_prefix + 1 extra pos)
+    // Build prefill embedding sequence (non-streaming ICL mode)
     bool build_input_embeddings(const std::vector<int> &ref_text_tokens,
                                  const std::vector<int> &target_text_tokens,
                                  const std::vector<float> &spk_embedding,
                                  const std::vector<std::vector<int>> &ref_codes,
                                  const std::string &language,
                                  std::vector<float> &embeddings,
-                                 int &seq_len,
-                                 bool xvec_mode = false);
+                                 int &seq_len);
+
+    // Build prefill for x-vector voice clone (10 positions, matches MLX)
+    //   [role(3)] + [codec_prefix(4)] + [spk_embed(1)] + [bos+pad(1)] + [first_text+bos(1)]
+    bool build_xvec_prefill(const std::vector<int> &target_text_tokens,
+                            const std::vector<float> &spk_embedding,
+                            const std::string &language,
+                            std::vector<float> &embeddings,
+                            int &seq_len);
+
+    // Build prefill for CustomVoice (10 positions)
+    //   [role(3)] + [codec_prefix(5) with spk_id] + [bos+pad(1)] + [first_text+bos(1)]
+    bool build_customvoice_prefill(const std::vector<int> &target_text_tokens,
+                                   int spk_token_id,
+                                   const std::string &language,
+                                   std::vector<float> &embeddings,
+                                   int &seq_len);
 
     // Compute text_proj(text_emb(token_id)) into out
     void lookup_text_projected(int token_id, float *out);
@@ -310,6 +386,9 @@ private:
     void compute_next_embedding(int group0_token,
                                  const std::vector<int> &group_tokens,
                                  float *out);
+
+    // CP layer limit (0=all, set from sampling.cp_max_layers before predict_code_groups)
+    int cp_active_layers_ = 0;
 
     // CP KV cache for incremental code prediction (avoids full recompute)
     static constexpr int CP_MAX_SEQ = 17;  // 2 base + 15 groups

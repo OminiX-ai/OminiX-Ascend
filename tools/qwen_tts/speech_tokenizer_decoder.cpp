@@ -5,40 +5,6 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
-#include <vector>
-
-namespace {
-// Build a causal sliding-window attention mask for the decoder's
-// pre-transformer layer. Matches the encoder convention used in
-// speech_tokenizer_encoder.cpp:553 — `mask[j + i*T] = 0` when key j is at
-// or before query i AND `|i - j| <= sliding_window`, else -inf.
-//
-// This used to be left as whatever garbage happened to be in the input
-// buffer at allocation time. That worked accidentally for a single-shot
-// non-streaming decode (the buffer was zero-initialized so attention
-// degenerated to dense), but exposed nondeterminism in streaming mode
-// where multiple decode calls with different shapes triggered graph
-// rebuilds and the buffer contents diverged. Filling the mask explicitly
-// makes every decoder call deterministic regardless of how it's invoked.
-static std::vector<float> build_decoder_mask(int seq_len, int sliding_window) {
-    std::vector<float> mask((size_t) seq_len * (size_t) seq_len);
-    for (int i = 0; i < seq_len; i++) {        // query position
-        for (int j = 0; j < seq_len; j++) {    // key position
-            bool causal_ok = (j <= i);
-            bool sw_ok     = (std::abs(i - j) <= sliding_window);
-            mask[j + i * seq_len] =
-                (causal_ok && sw_ok) ? 0.0f : -INFINITY;
-        }
-    }
-    return mask;
-}
-
-static std::vector<int32_t> build_decoder_pos(int seq_len) {
-    std::vector<int32_t> pos(seq_len);
-    for (int i = 0; i < seq_len; i++) pos[i] = i;
-    return pos;
-}
-} // namespace
 
 // ============================================================================
 // load_hparams
@@ -784,13 +750,8 @@ bool SpeechTokenizerDecoder::decode(
         bool use_cann = true;
         const char *backend = "CANN";
 
-        std::vector<float>   mask = build_decoder_mask(T, config_.sliding_window);
-        std::vector<int32_t> pos  = build_decoder_pos(T);
-
         session_->set_input_shape({{"codes", {n_q * T}}});
         session_->set_input("codes", flat_codes);
-        session_->set_input("kq_mask", mask);
-        session_->set_input("dec_pos", pos);
         if (session_->run(audio)) {
             // Runtime validation: check for corrupted output (RMS ~1.0 = all clipped)
             float sum_sq = 0;
@@ -809,8 +770,6 @@ bool SpeechTokenizerDecoder::decode(
         if (!use_cann) {
             cpu_session_->set_input_shape({{"codes", {n_q * T}}});
             cpu_session_->set_input("codes", flat_codes);
-            cpu_session_->set_input("kq_mask", mask);
-            cpu_session_->set_input("dec_pos", pos);
             if (!cpu_session_->run(audio)) {
                 printf("[decoder] CPU inference failed\n");
                 return false;
@@ -825,12 +784,8 @@ bool SpeechTokenizerDecoder::decode(
 
     // === Single session mode (backward compat) ===
     // Update input shape (internally rebuilds graph)
-    std::vector<float>   mask = build_decoder_mask(T, config_.sliding_window);
-    std::vector<int32_t> pos  = build_decoder_pos(T);
     session_->set_input_shape({{"codes", {n_q * T}}});
     session_->set_input("codes", flat_codes);
-    session_->set_input("kq_mask", mask);
-    session_->set_input("dec_pos", pos);
 
     // Run inference
     if (!session_->run(audio)) {
@@ -906,12 +861,8 @@ bool SpeechTokenizerDecoder::decode_single_chunk(
     }
 
     auto *sess = use_cann ? session_.get() : cpu_session_.get();
-    std::vector<float>   mask = build_decoder_mask(T, config_.sliding_window);
-    std::vector<int32_t> pos  = build_decoder_pos(T);
     sess->set_input_shape({{"codes", {n_q * T}}});
     sess->set_input("codes", flat_codes);
-    sess->set_input("kq_mask", mask);
-    sess->set_input("dec_pos", pos);
 
     if (!sess->run(audio)) {
         return false;

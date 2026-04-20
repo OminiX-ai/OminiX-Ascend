@@ -76,15 +76,6 @@ target_include_directories(${TARGET} PRIVATE ../.. ../../vendor ${KISSFFT_DIR}
     $ENV{ASCEND_TOOLKIT_HOME}/include)
 target_compile_features   (${TARGET} PRIVATE cxx_std_17)
 
-# When building with the CANN backend, define OMINIX_HAS_CANN so the talker
-# can call ggml_backend_cann_set_thread_acl_graph_override() to selectively
-# enable graph capture for cp_llama (the only sub-model whose shape pattern
-# actually benefits from capture/replay). The ggml-cann library is already
-# linked transitively via the `ggml` target.
-if (GGML_CANN)
-    target_compile_definitions(${TARGET} PRIVATE OMINIX_HAS_CANN)
-endif()
-
 # Enable NEON F16 intrinsics for ARM
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
     target_compile_options(${TARGET} PRIVATE -march=armv8.2-a+fp16)

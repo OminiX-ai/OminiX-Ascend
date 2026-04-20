@@ -25,7 +25,7 @@ OminiX 框架支持多种模态的模型推理：
 | **图像生成** | Qwen Image 2512、SD1.5、SD2.1、SDXL、SD3、Flux2.2 |
 | **视频生成 & 世界模型** | Wan2.2、Cosmos |
 | **VLM & VLA（视觉语言/动作模型）** | Moxin-VLA、OpenVLA、Qwen-VL、Vote、Pi-0.5、AntVLA |
-| **语音识别 & 合成** | Qwen ASR、Qwen3-TTS（内置音色 / x-vector / ICL 克隆）、Whisper、GPT-SoVITS、Fun-ASR |
+| **语音识别** | Qwen ASR、Qwen TTS、Whisper、GPT-SoVITS、Fun-ASR |
 
 ## 性能测试
 
@@ -82,7 +82,6 @@ cmake --build build --config Release -j$(nproc)
 | `build/bin/ominix-diffusion-cli` | SD 图像生成 |
 | `build/bin/ominix-diffusion-server` | SD HTTP 服务 |
 | `build/bin/qwen_asr` | 语音识别 (ASR) |
-| `build/bin/qwen_tts` | 语音合成 (TTS, Qwen3-TTS) |
 
 ### 运行推理
 
@@ -160,62 +159,6 @@ GGML_CANN_ACL_GRAPH=1 GGML_CANN_QUANT_BF16=on \
   --threads 8
 ```
 
-#### TTS 语音合成
-
-Qwen3-TTS 支持三种声音克隆模式，推理入口统一为 `build/bin/qwen_tts`。模型由四个
-子模型组成（speaker encoder / talker / cp llama / codec decoder），权重放在
-`tools/qwen_tts/gguf/`。
-
-**模式一：内置音色（`--voice`）** — 项目自带一组预烘焙的音色缓存，开箱即用：
-
-```bash
-# 一次性烘焙所有内置音色（依赖已构建的 build/bin/qwen_tts）
-tools/qwen_tts/scripts/bake_voices.sh
-
-# 查看可用音色
-./build/bin/qwen_tts --list_voices
-
-# 按音色 id 合成
-./build/bin/qwen_tts \
-  -m tools/qwen_tts/gguf --tokenizer_dir tools/qwen_tts/gguf \
-  --talker_model tools/qwen_tts/gguf/qwen_tts_talker_llama_q8_0.gguf \
-  --cp_model tools/qwen_tts/gguf/qwen_tts_cp_llama.gguf \
-  --n_gpu_layers 29 \
-  --voice ellen \
-  -t "Hello from a built-in voice." -o out.wav
-```
-
-**模式二：X-Vector 克隆（`--xvec`）** — 只用 2048 维 speaker embedding 做声音克隆，
-不需要 ref audio 的 codec codes，也不需要 ref text。对应 Qwen3-TTS 原生的
-`x_vector_only_mode=True`。prefill 极短（~10 tokens），生成更快，`.xvec` 文件仅 ~8 KB：
-
-```bash
-# 1) 从一段 wav 中提取 speaker embedding，写入 .xvec（一次即可）
-./build/bin/qwen_tts \
-  -m tools/qwen_tts/gguf --tokenizer_dir tools/qwen_tts/gguf \
-  --talker_model tools/qwen_tts/gguf/qwen_tts_talker_llama_q8_0.gguf \
-  --cp_model tools/qwen_tts/gguf/qwen_tts_cp_llama.gguf \
-  --n_gpu_layers 29 \
-  --xvec_extract tools/qwen_tts/data/ref_audios/ellen_ref_24k.wav \
-  --xvec_out ellen.xvec
-
-# 2) 用 .xvec 直接合成（无需 ref_audio / ref_text / ref_cache）
-./build/bin/qwen_tts \
-  -m tools/qwen_tts/gguf --tokenizer_dir tools/qwen_tts/gguf \
-  --talker_model tools/qwen_tts/gguf/qwen_tts_talker_llama_q8_0.gguf \
-  --cp_model tools/qwen_tts/gguf/qwen_tts_cp_llama.gguf \
-  --n_gpu_layers 29 \
-  --xvec ellen.xvec \
-  -t "Hello from x-vector cloning." -o out.wav
-```
-
-`.xvec` 文件格式：`magic "QXVC" (4B) | version u32 | spk_dim u32 | float32[spk_dim]`。
-`--xvec` 与 `--voice` / `--ref_cache` / `--ref_audio` 互斥。
-
-**模式三：ICL 克隆（`--ref_audio` / `--ref_cache`）** — 使用 ref audio 的 codec codes
-和 ref text 作为 in-context learning 条件，保真度最高。更多 TTS 细节（CLI 参数、
-ref_cache 烘焙、性能数据）见 [tools/qwen_tts/README.md](tools/qwen_tts/README.md)。
-
 ### 环境变量参考
 
 | 环境变量 | 默认值 | 说明 |
@@ -232,7 +175,6 @@ ref_cache 烘焙、性能数据）见 [tools/qwen_tts/README.md](tools/qwen_tts/
 |------|------|----------|
 | LLM | Qwen3-8B-Q8_0 | Prompt 245.4 t/s, Generation 42.5 t/s |
 | ASR | Qwen-ASR (Q8_0) | 9.36s 音频 → 1.2s 完成识别 |
-| TTS | Qwen3-TTS (Q8_0) | x-vector 模式 RTF 0.88x（prefill 10 tokens），ICL 模式 RTF 1.40x |
 | SD | Qwen-Image-Q8_0 (1024x1024) | 20步采样 32.04s (1.59s/it), NaN 检查全部通过 |
 
 更多 CANN 后端优化细节请参考 [LLM_CANN_OPTIMIZATIONS.md](LLM_CANN_OPTIMIZATIONS.md)。
@@ -256,8 +198,7 @@ OminiX-Ascend/
 │   │   ├── src/                #       └── libstable-diffusion 库
 │   │   ├── cli/                #       └── ominix-diffusion-cli
 │   │   └── server/             #       └── ominix-diffusion-server
-│   ├── qwen_asr/               #   └── 语音识别 (ASR)
-│   ├── qwen_tts/               #   └── 语音合成 (Qwen3-TTS，--voice/--xvec/ICL)
+│   ├── qwen_asr/               #   └── 语音识别
 │   └── qwen_common/            #   └── ASR/TTS 共享模块
 ├── examples/                   # 示例应用
 │   └── diffusion/              #   └── Dream LLM diffusion 示例

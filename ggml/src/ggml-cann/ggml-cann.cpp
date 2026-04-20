@@ -70,20 +70,6 @@
 // Thread-local variable to record the current device of this thread.
 thread_local int g_current_cann_device = -1;
 
-#ifdef USE_ACL_GRAPH
-// Thread-local override for the per-context acl_graph_mode flag.
-// When g_acl_graph_override_active is true, ggml_backend_cann_graph_compute
-// uses g_acl_graph_override_value instead of cann_ctx->acl_graph_mode for
-// any compute call from this thread. This lets a caller surgically force
-// graph mode on (or off) around a specific block of llama_decode/run calls
-// without touching the env var or the per-context flag — useful when only
-// some sub-models in a multi-model pipeline benefit from graph mode while
-// others (e.g. decoders that crash under capture, or contexts whose shapes
-// thrash the graph cache) must stay in eager mode.
-thread_local bool g_acl_graph_override_active = false;
-thread_local bool g_acl_graph_override_value  = false;
-#endif  // USE_ACL_GRAPH
-
 /**
  * @brief Set the CANN device to be used.
  *
@@ -2306,13 +2292,7 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, 
         }
     }
 
-    // Thread-local override takes precedence over the per-context flag.
-    // See the declaration of g_acl_graph_override_* above for rationale.
-    if (g_acl_graph_override_active) {
-        if (!g_acl_graph_override_value) {
-            use_cann_graph = false;
-        }
-    } else if (!cann_ctx->acl_graph_mode) {
+    if (!cann_ctx->acl_graph_mode) {
         use_cann_graph = false;
     }
 
@@ -2985,16 +2965,6 @@ void ggml_backend_cann_get_device_description(int32_t device, char * description
     ggml_cann_set_device(device);
     const char * soc_name = aclrtGetSocName();
     snprintf(description, description_size, "%s", soc_name);
-}
-
-void ggml_backend_cann_set_thread_acl_graph_override(bool active, bool value) {
-#ifdef USE_ACL_GRAPH
-    g_acl_graph_override_active = active;
-    g_acl_graph_override_value  = value;
-#else
-    (void) active;
-    (void) value;
-#endif
 }
 
 void ggml_backend_cann_get_device_memory(int32_t device, size_t * free, size_t * total) {

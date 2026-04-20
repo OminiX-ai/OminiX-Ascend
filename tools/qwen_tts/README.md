@@ -89,58 +89,6 @@ make qwen_tts -j$(nproc)
   -t "Another sentence with same voice." -o out2.wav
 ```
 
-### 使用内置语音（Built-in Voices）
-
-项目自带一组预置音色，使用前先烘焙缓存（仅需一次）：
-
-```bash
-# 一次性烘焙所有内置音色 (依赖已构建的 build/bin/qwen_tts)
-tools/qwen_tts/scripts/bake_voices.sh
-
-# 查看可用音色
-./build/bin/qwen_tts --list_voices
-
-# 直接按音色 id 推理
-./build/bin/qwen_tts \
-  -m tools/qwen_tts/gguf --tokenizer_dir tools/qwen_tts/gguf \
-  --voice ellen \
-  --talker_model tools/qwen_tts/gguf/qwen_tts_talker_llama_q8_0.gguf \
-  --cp_model tools/qwen_tts/gguf/qwen_tts_cp_llama.gguf \
-  --n_gpu_layers 29 \
-  -t "Hello from a built-in voice." -o out.wav
-```
-
-音色清单由 `tools/qwen_tts/data/voices/voices.json` 维护，可通过 `--voices_dir` 指向其它目录。
-
-### X-Vector 克隆模式
-
-x-vector 模式只用一个 2048 维的 speaker embedding 做声音克隆，不需要 ref audio 的 codec
-codes 也不需要 ref text，对应 Qwen3-TTS 原生的 `x_vector_only_mode=True`。
-该模式 prefill 极短（~10 tokens），生成更快，且 .xvec 文件只有约 8 KB。
-
-```bash
-# 1) 从一段 wav 中提取 speaker embedding，写入 .xvec（一次即可）
-./build/bin/qwen_tts \
-  -m tools/qwen_tts/gguf --tokenizer_dir tools/qwen_tts/gguf \
-  --talker_model tools/qwen_tts/gguf/qwen_tts_talker_llama_q8_0.gguf \
-  --cp_model tools/qwen_tts/gguf/qwen_tts_cp_llama.gguf \
-  --n_gpu_layers 29 \
-  --xvec_extract tools/qwen_tts/data/ref_audios/ellen_ref_24k.wav \
-  --xvec_out ellen.xvec
-
-# 2) 用 .xvec 直接合成，无需 ref_audio / ref_text / ref_cache
-./build/bin/qwen_tts \
-  -m tools/qwen_tts/gguf --tokenizer_dir tools/qwen_tts/gguf \
-  --talker_model tools/qwen_tts/gguf/qwen_tts_talker_llama_q8_0.gguf \
-  --cp_model tools/qwen_tts/gguf/qwen_tts_cp_llama.gguf \
-  --n_gpu_layers 29 \
-  --xvec ellen.xvec \
-  -t "Hello from x-vector cloning." -o out.wav
-```
-
-文件格式：`magic "QXVC" (4B) | version u32 | spk_dim u32 | float32[spk_dim]`。
-`--xvec` 与 `--voice` / `--ref_cache` / `--ref_audio` 互斥（xvec 模式禁用 ICL）。
-
 ### CLI Arguments
 
 | Argument | Short | Description | Default |
@@ -152,12 +100,6 @@ codes 也不需要 ref text，对应 Qwen3-TTS 原生的 `x_vector_only_mode=Tru
 | `--ref_audio` | `-r` | Reference audio path (24kHz recommended) | - |
 | `--ref_text` | | Reference audio transcript | - |
 | `--ref_cache` | | Pre-computed ref cache file (.bin) | - |
-| `--voice` | | Built-in voice id (see `--list_voices`) | - |
-| `--voices_dir` | | Directory containing `voices.json` | `tools/qwen_tts/data/voices` |
-| `--list_voices` | | List built-in voices and exit | - |
-| `--xvec` | | X-vector file (xvec-only inference, no ICL) | - |
-| `--xvec_extract` | | Wav path for tool mode: extract spk embedding → `--xvec_out` | - |
-| `--xvec_out` | | Output `.xvec` path for `--xvec_extract` | `voice.xvec` |
 | `--output` | `-o` | Output audio path | `output.wav` |
 | `--talker_model` | | Override Talker GGUF (for quantized models) | - |
 | `--cp_model` | | Override CP llama GGUF (for NPU acceleration) | - |

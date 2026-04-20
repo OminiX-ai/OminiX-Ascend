@@ -20,7 +20,6 @@
 #include <mutex>
 #include <string>
 #include <vector>
-#include <unistd.h>
 
 struct qwen_tts_ctx {
     TalkerLLM talker;
@@ -102,14 +101,24 @@ qwen_tts_ctx_t* qwen_tts_load(
         else fclose(f);
     }
 
-    // Upstream's 2026-04-20 refactor removed the cp_cann / talker_cann
-    // flags from load_model(); native CANN paths are selected internally
-    // based on compile-time flags + runtime backend availability.
+    // Decide whether to activate the native CP-CANN / Talker-CANN paths.
+    // Built-in when QWEN_TTS_HAS_CP_CANN is defined at compile time AND the
+    // caller asked for NPU layers. Without llama.cpp linked, the native path
+    // is the ONLY viable forward pass — load_model() returns false otherwise.
+#ifdef QWEN_TTS_HAS_CP_CANN
+    const bool use_cp_cann     = (n_gpu_layers > 0);
+    const bool use_talker_cann = (n_gpu_layers > 0);
+#else
+    const bool use_cp_cann     = false;
+    const bool use_talker_cann = false;
+#endif
+
     if (!ctx->talker.load_model(
         talker_llama,
         mdir + "qwen_tts_talker.gguf",
         mdir + "qwen_tts_code_predictor.gguf",
-        n_threads, n_gpu_layers, cp_path)) {
+        n_threads, n_gpu_layers, cp_path,
+        use_cp_cann, use_talker_cann)) {
         fprintf(stderr, "[qwen_tts_api] failed to load talker\n");
         delete ctx;
         return nullptr;
@@ -188,14 +197,156 @@ int qwen_tts_has_speaker_encoder(const qwen_tts_ctx_t* ctx) {
 }
 
 /* ========================================================================== */
+/* Embedding operations                                                       */
+/* ========================================================================== */
+
+void qwen_tts_text_embed(qwen_tts_ctx_t* ctx, uint32_t token_id, float* out) {
+    if (!ctx) return;
+    // Delegates to TalkerLLM's lookup_text_projected
+    // (which does text_embed → text_projection)
+    ctx->talker.cache_tts_embeddings_public();
+    ctx->talker.lookup_text_projected_public(token_id, out);
+}
+
+void qwen_tts_codec_embed(qwen_tts_ctx_t* ctx, uint32_t codec_token, float* out) {
+    if (!ctx) return;
+    ctx->talker.lookup_codec_embedding_public(codec_token, out);
+}
+
+void qwen_tts_codec_head(qwen_tts_ctx_t* ctx, const float* hidden, float* logits_out) {
+    if (!ctx) return;
+    ctx->talker.apply_codec_head_public(hidden, logits_out);
+}
+
+void qwen_tts_generation_embed(
+    qwen_tts_ctx_t* ctx,
+    const float* text_embed,
+    const uint32_t* prev_codes,
+    float* out
+) {
+    if (!ctx) return;
+    int dim = ctx->hidden_size;
+
+    // Sum codec embeddings for all 16 groups
+    memset(out, 0, dim * sizeof(float));
+    float tmp[4096]; // max hidden_size
+    for (int g = 0; g < 16; g++) {
+        ctx->talker.lookup_codec_embedding_public(prev_codes[g], tmp);
+        for (int j = 0; j < dim; j++) out[j] += tmp[j];
+    }
+
+    // Add text embedding
+    for (int j = 0; j < dim; j++) out[j] += text_embed[j];
+}
+
+/* ========================================================================== */
+/* Transformer forward                                                        */
+/* ========================================================================== */
+
+void qwen_tts_reset_cache(qwen_tts_ctx_t* ctx) {
+    if (!ctx) return;
+    // Reset llama.cpp KV cache via the talker's internal context
+    // This needs a public method on TalkerLLM
+    ctx->talker.reset_cache_public();
+}
+
+int qwen_tts_forward(
+    qwen_tts_ctx_t* ctx,
+    const float* input_embeds,
+    int seq_len,
+    float* logits_out,
+    float* hidden_out
+) {
+    if (!ctx) return -1;
+    return ctx->talker.forward_public(input_embeds, seq_len, logits_out, hidden_out);
+}
+
+/* ========================================================================== */
+/* Code prediction                                                            */
+/* ========================================================================== */
+
+int qwen_tts_predict_codes(
+    qwen_tts_ctx_t* ctx,
+    const float* hidden,
+    uint32_t code0,
+    uint32_t* codes_out
+) {
+    if (!ctx) return -1;
+    std::vector<int> group_tokens;
+    TalkerSamplingParams sampling;
+    if (!ctx->talker.predict_code_groups(hidden, 1, (int)code0, group_tokens, sampling)) {
+        return -1;
+    }
+    for (size_t i = 0; i < group_tokens.size() && i < 15; i++) {
+        codes_out[i] = (uint32_t)group_tokens[i];
+    }
+    return 0;
+}
+
+/* ========================================================================== */
+/* Speech decoder                                                             */
+/* ========================================================================== */
+
+int qwen_tts_decode_audio(
+    qwen_tts_ctx_t* ctx,
+    const uint32_t* codes,
+    int n_frames,
+    int n_groups,
+    float* audio_out,
+    int* n_samples_out
+) {
+    if (!ctx) return -1;
+
+    // Convert flat codes to vector<vector<int>> format
+    std::vector<std::vector<int>> code_vecs(n_groups);
+    for (int g = 0; g < n_groups; g++) {
+        code_vecs[g].resize(n_frames);
+        for (int f = 0; f < n_frames; f++) {
+            code_vecs[g][f] = (int)codes[f * n_groups + g];
+        }
+    }
+
+    std::vector<float> audio;
+    if (!ctx->decoder.decode(code_vecs, audio)) {
+        return -1;
+    }
+
+    if (audio_out && !audio.empty()) {
+        memcpy(audio_out, audio.data(), audio.size() * sizeof(float));
+    }
+    if (n_samples_out) {
+        *n_samples_out = (int)audio.size();
+    }
+    return 0;
+}
+
+/* ========================================================================== */
+/* Speaker encoder                                                            */
+/* ========================================================================== */
+
+int qwen_tts_extract_speaker(
+    qwen_tts_ctx_t* ctx,
+    const float* audio,
+    int n_samples,
+    int sample_rate,
+    float* embedding_out
+) {
+    if (!ctx || !ctx->has_speaker_encoder) return -1;
+
+    std::vector<float> audio_vec(audio, audio + n_samples);
+    std::vector<float> embedding;
+    if (!ctx->speaker_encoder.extract(audio_vec, sample_rate, embedding)) {
+        return -1;
+    }
+
+    if (embedding_out && !embedding.empty()) {
+        memcpy(embedding_out, embedding.data(), embedding.size() * sizeof(float));
+    }
+    return 0;
+}
+
+/* ========================================================================== */
 /* High-level one-shot synthesis (B5)                                         */
-/*                                                                            */
-/* v1.2 (2026-04-20): Fine-grained primitive functions (text_embed,           */
-/* forward, predict_codes, decode_audio, extract_speaker, reset_cache,        */
-/* codec_head, codec_embed, generation_embed) removed after upstream's        */
-/* QwenTTS::generate() unification dropped the TalkerLLM friend-accessors     */
-/* they required. No consumer existed for the primitives; bindings consumers  */
-/* call qwen_tts_synthesize exclusively.                                      */
 /* ========================================================================== */
 
 // Fill a QwenTTSParams struct the way QwenTTS::generate* expects.
@@ -222,25 +373,17 @@ static void translate_synth_params(
     out.cp_model      = ctx->load_cp_override;
     out.n_threads     = ctx->load_n_threads;
     out.n_gpu_layers  = ctx->load_n_gpu_layers;
+    // native CANN paths ON when GPU layers > 0 (matches QwenTTS::load default)
+    out.cp_cann       = true;
+    out.native_talker = true;
 
     out.text        = in->text        ? in->text        : "";
+    out.ref_audio   = in->ref_audio_path ? in->ref_audio_path : "";
+    out.ref_text    = in->ref_text    ? in->ref_text    : "";
     out.ref_lang    = in->ref_lang    ? in->ref_lang    : "English";
     out.target_lang = in->target_lang ? in->target_lang : "English";
-
-    // Mode dispatch via which QwenTTSParams fields are populated:
-    //   ICL         → ref_audio + ref_text
-    //   CustomVoice → voice (built-in speaker id)
-    //   X-Vector    → xvec (path to .xvec file; wav auto-extract handled in
-    //                       qwen_tts_synthesize below)
-    const std::string mode = in->mode ? in->mode : "icl";
-    if (mode == "icl") {
-        out.ref_audio = in->ref_audio_path ? in->ref_audio_path : "";
-        out.ref_text  = in->ref_text      ? in->ref_text      : "";
-    } else if (mode == "customvoice") {
-        out.voice = in->speaker ? in->speaker : "";
-    } else if (mode == "xvec") {
-        out.xvec = in->ref_audio_path ? in->ref_audio_path : "";
-    }
+    out.mode        = in->mode        ? in->mode        : "icl";
+    out.speaker     = in->speaker     ? in->speaker     : "";
 
     out.max_new_tokens = in->max_tokens > 0 ? in->max_tokens : 2048;
 
@@ -263,11 +406,8 @@ static void translate_synth_params(
     s.cp_top_k       = s.top_k;
     s.cp_top_p       = s.top_p;
 
-    // cp_groups / cp_layers fields in qwen_tts_synth_params_t are reserved;
-    // upstream's TalkerSamplingParams no longer exposes them as of the
-    // 2026-04-20 refactor. Ignored silently for forward ABI compatibility.
-    (void)in->cp_groups;
-    (void)in->cp_layers;
+    if (in->cp_groups > 0) s.cp_max_groups = in->cp_groups;
+    if (in->cp_layers > 0) s.cp_max_layers = in->cp_layers;
 
     out.sampling = s;
 }
@@ -302,6 +442,8 @@ int qwen_tts_synthesize(
         load_params.cp_model      = ctx->load_cp_override;
         load_params.n_threads     = ctx->load_n_threads;
         load_params.n_gpu_layers  = ctx->load_n_gpu_layers;
+        load_params.cp_cann       = true;
+        load_params.native_talker = true;
         if (!synth->load(load_params)) {
             fprintf(stderr, "[qwen_tts_api] QwenTTS::load failed\n");
             return -3;
@@ -312,44 +454,19 @@ int qwen_tts_synthesize(
     QwenTTSParams gen_params;
     translate_synth_params(ctx, in, gen_params);
 
-    const std::string mode = in->mode;
-    if (mode != "icl" && mode != "xvec" && mode != "customvoice") {
+    std::string mode = in->mode;
+    std::vector<float> audio;
+    bool ok = false;
+    if (mode == "icl") {
+        ok = ctx->synth->generate(gen_params, audio);
+    } else if (mode == "xvec") {
+        ok = ctx->synth->generate_xvec(gen_params, audio);
+    } else if (mode == "customvoice") {
+        ok = ctx->synth->generate_customvoice(gen_params, audio);
+    } else {
         fprintf(stderr, "[qwen_tts_api] unknown mode: %s\n", mode.c_str());
         return -2;
     }
-
-    // Upstream refactor (2026-04-20) unified QwenTTS::generate*() into one
-    // generate() that infers mode from which QwenTTSParams fields are set:
-    //   ICL         → ref_audio / ref_text
-    //   CustomVoice → voice
-    //   X-Vector    → xvec (expects a .xvec file, not a wav)
-    // For back-compat with the B5 ABI shape where callers pass ref_audio_path
-    // uniformly, auto-extract .wav → tempfile.xvec for the xvec path.
-    std::string xvec_tempfile;
-    if (mode == "xvec" && !gen_params.xvec.empty()) {
-        const std::string &path = gen_params.xvec;
-        if (path.size() > 4 && path.substr(path.size() - 4) == ".wav") {
-            char tmpl[] = "/tmp/qwen_tts_xvec_XXXXXX";
-            int fd = mkstemp(tmpl);
-            if (fd < 0) {
-                fprintf(stderr, "[qwen_tts_api] mkstemp failed for xvec\n");
-                return -3;
-            }
-            close(fd);
-            if (!ctx->synth->extract_xvec(path, tmpl)) {
-                unlink(tmpl);
-                fprintf(stderr, "[qwen_tts_api] extract_xvec failed\n");
-                return -3;
-            }
-            xvec_tempfile = tmpl;
-            gen_params.xvec = tmpl;
-        }
-    }
-
-    std::vector<float> audio;
-    bool ok = ctx->synth->generate(gen_params, audio);
-
-    if (!xvec_tempfile.empty()) unlink(xvec_tempfile.c_str());
 
     if (!ok) return -3;
 

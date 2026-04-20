@@ -118,31 +118,6 @@ GGML_BACKEND_API void ggml_backend_cann_get_device_memory(int32_t device,
                                                   size_t* free,
                                                   size_t* total);
 
-/**
- * @brief Sets a thread-local override for the ACL graph execution mode.
- *
- * When `active` is true, the override `value` (true=enable, false=disable)
- * is used in place of the per-context `acl_graph_mode` flag for any
- * subsequent CANN graph_compute calls made from this thread. Pass
- * `active=false` to clear the override and fall back to the per-context
- * flag (which itself is initialized from the GGML_CANN_ACL_GRAPH env var).
- *
- * Use case: in a pipeline where multiple sub-models share the CANN backend
- * but only some benefit from graph capture (because others have unique
- * shapes per call that thrash the cache, or use ops that crash under
- * capture), wrap the calls into the benefiting sub-model with
- *   ggml_backend_cann_set_thread_acl_graph_override(true, true);
- *   ... llama_decode / session.run ...
- *   ggml_backend_cann_set_thread_acl_graph_override(false, false);
- *
- * No-op when ggml-cann was built without USE_ACL_GRAPH.
- *
- * @param active If true, the override is in effect.
- * @param value  Forced graph mode value when the override is active.
- */
-GGML_BACKEND_API void ggml_backend_cann_set_thread_acl_graph_override(
-    bool active, bool value);
-
 #ifdef __cplusplus
 }
 #endif

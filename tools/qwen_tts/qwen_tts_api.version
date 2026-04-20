@@ -1,16 +1,12 @@
-/* Linker version script: export ONLY the 7 C API symbols.
+/* Linker version script: export ONLY the 16 C API symbols.
  * Hides ggml/ggml-cann/llama/qwen_common internals to avoid
  * symbol collision with future deps in consumer binaries
  * (Ascend API Bridge Contract §7 risk register).
  *
- * v1.2 (2026-04-20): dropped 9 primitive symbols (text_embed,
- * codec_embed, codec_head, generation_embed, reset_cache, forward,
- * predict_codes, decode_audio, extract_speaker) after upstream's
- * QwenTTS::generate() unification removed the TalkerLLM friend
- * accessors they required. SOVERSION stays 1 (VERSION bumped to 1.2.0)
- * — consumers that linked against the 16-symbol .so will see missing
- * symbols at startup; the only in-tree consumer (qwen-tts-ascend-sys)
- * uses qwen_tts_synthesize exclusively. */
+ * Additive-only: B5 added qwen_tts_synthesize + qwen_tts_pcm_free
+ * (Ascend API Bridge Contract §5 B5). Version tag stays
+ * QWEN_TTS_API_1.0 — callers compiled against the 14-symbol header
+ * resolve cleanly against this .so, and SOVERSION=1 is preserved. */
 QWEN_TTS_API_1.0 {
     global:
         qwen_tts_load;
@@ -18,6 +14,15 @@ QWEN_TTS_API_1.0 {
         qwen_tts_hidden_size;
         qwen_tts_vocab_size;
         qwen_tts_has_speaker_encoder;
+        qwen_tts_text_embed;
+        qwen_tts_codec_embed;
+        qwen_tts_codec_head;
+        qwen_tts_generation_embed;
+        qwen_tts_reset_cache;
+        qwen_tts_forward;
+        qwen_tts_predict_codes;
+        qwen_tts_decode_audio;
+        qwen_tts_extract_speaker;
         qwen_tts_synthesize;
         qwen_tts_pcm_free;
     local:
