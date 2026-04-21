@@ -416,4 +416,38 @@ if(QWEN_TTS_CP_CANN)
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
         target_compile_options(test_mm_diff PRIVATE -march=armv8.2-a+fp16)
     endif()
+
+    # -------------------------------------------------------------------------
+    # G1 HARD GATE feasibility probe: test_aclgraph_smoke.
+    #
+    # Answers the single open question from G0: does
+    # `aclmdlRICaptureTaskUpdateBegin/End` accept rebinding of RoPE slice
+    # ptrs / KV-cache write offset / FIAv2 `seq_len` on an already-captured
+    # `aclOpExecutor`? See ACLGRAPH_CONTRACT.md §5 G1 for the gate logic.
+    #
+    # Gated on QWEN_TTS_ACLGRAPH_SMOKE=ON (default OFF; only built when the
+    # G1 agent is running). No behavioural impact on the main qwen_tts
+    # binary — this is a standalone harness.
+    # -------------------------------------------------------------------------
+    option(QWEN_TTS_ACLGRAPH_SMOKE "Build G1 aclGraph capture/replay smoke test" OFF)
+    if(QWEN_TTS_ACLGRAPH_SMOKE)
+        add_executable(test_aclgraph_smoke
+            test_aclgraph_smoke.cpp
+            cp_cann_symbols.cpp
+        )
+        target_link_libraries     (test_aclgraph_smoke PUBLIC ggml llama qwen_common)
+        target_link_libraries     (test_aclgraph_smoke PRIVATE Threads::Threads common
+                                                                 ${CMAKE_DL_LIBS})
+        target_include_directories(test_aclgraph_smoke PUBLIC  .)
+        target_include_directories(test_aclgraph_smoke PRIVATE ../.. ../../vendor
+            $ENV{ASCEND_TOOLKIT_HOME}/aarch64-linux/include
+            $ENV{ASCEND_TOOLKIT_HOME}/include)
+        target_compile_definitions(test_aclgraph_smoke PRIVATE QWEN_TTS_HAS_CP_CANN=1
+                                                                TALKER_CP_ACLGRAPH_SMOKE=1)
+        target_compile_features   (test_aclgraph_smoke PRIVATE cxx_std_17)
+        if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+            target_compile_options(test_aclgraph_smoke PRIVATE -march=armv8.2-a+fp16)
+        endif()
+        message(STATUS "qwen_tts: G1 aclGraph smoke harness ENABLED")
+    endif()
 endif()

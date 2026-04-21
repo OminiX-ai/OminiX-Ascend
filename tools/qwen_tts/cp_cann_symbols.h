@@ -298,6 +298,20 @@ struct CannSyms {
     aclError (*aclmdlRIExecuteAsync)(aclmdlRI, aclrtStream);
     aclError (*aclmdlRIDestroy)(aclmdlRI);
 
+    // ---- aclGraph task-group + task-update (G1 HARD GATE) ------------------
+    // Present on CANN 8.3+ (sibling of the base capture API above). These
+    // enable the vllm-ascend-style "capture once, rebind params per replay"
+    // flow: `CaptureTaskGrpBegin/End` wraps a sub-range of the capture as a
+    // named task group, and `CaptureTaskUpdateBegin/End` rewrites the tensor
+    // bindings of that group on a side stream between replays. Absence on
+    // the toolkit means we cannot parameter-rebind and must either fall back
+    // to a pos-keyed graph cache or abandon aclGraph entirely. Types:
+    //   aclrtTaskGrp is defined as `void *` in acl/acl_base.h:63.
+    aclError (*aclmdlRICaptureTaskGrpBegin)(aclrtStream);
+    aclError (*aclmdlRICaptureTaskGrpEnd)(aclrtStream, aclrtTaskGrp *);
+    aclError (*aclmdlRICaptureTaskUpdateBegin)(aclrtStream, aclrtTaskGrp);
+    aclError (*aclmdlRICaptureTaskUpdateEnd)(aclrtStream);
+
     bool is_ready() const { return aclrtMalloc != nullptr; }
 
     // Separate capability flag: aclGraph is optional. Callers that want to
@@ -308,6 +322,21 @@ struct CannSyms {
                aclmdlRICaptureEnd   != nullptr &&
                aclmdlRIExecuteAsync != nullptr &&
                aclmdlRIDestroy      != nullptr;
+    }
+
+    // Capability flag for the task-group + task-update sub-family (G1 HARD
+    // GATE). True iff all 4 new symbols resolve in addition to the base
+    // aclGraph set. vllm-ascend's paged-attention `update_graph_params` path
+    // requires these; our CP forward per-pos rebinding (RoPE slice, KV-slot,
+    // FIAv2 seq_len) does the same. If false on 8.3.RC1, the aclGraph
+    // feasibility track aborts — the base capture-only path has no way to
+    // per-frame rebind.
+    bool has_aclgraph_task_update() const {
+        return has_aclgraph() &&
+               aclmdlRICaptureTaskGrpBegin    != nullptr &&
+               aclmdlRICaptureTaskGrpEnd      != nullptr &&
+               aclmdlRICaptureTaskUpdateBegin != nullptr &&
+               aclmdlRICaptureTaskUpdateEnd   != nullptr;
     }
 
     // Capability flag for the FRACTAL_NZ weight pre-conversion path (M5).

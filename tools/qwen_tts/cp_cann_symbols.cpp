@@ -172,6 +172,21 @@ bool load_once() {
     resolve_optional(h_rt, "aclmdlRIDestroy",
                      g_cann.aclmdlRIDestroy);
 
+    // Optional: aclGraph task-group + task-update (G1 HARD GATE). Sibling of
+    // the base aclGraph API above. Callers that want parameter rebinding on
+    // an already-captured graph gate on has_aclgraph_task_update(). Absence
+    // on a toolkit that does expose the base aclGraph API means the vendor
+    // has not shipped the rebind primitive — callers must pivot to a
+    // pos-keyed graph cache or abandon aclGraph.
+    resolve_optional(h_rt, "aclmdlRICaptureTaskGrpBegin",
+                     g_cann.aclmdlRICaptureTaskGrpBegin);
+    resolve_optional(h_rt, "aclmdlRICaptureTaskGrpEnd",
+                     g_cann.aclmdlRICaptureTaskGrpEnd);
+    resolve_optional(h_rt, "aclmdlRICaptureTaskUpdateBegin",
+                     g_cann.aclmdlRICaptureTaskUpdateBegin);
+    resolve_optional(h_rt, "aclmdlRICaptureTaskUpdateEnd",
+                     g_cann.aclmdlRICaptureTaskUpdateEnd);
+
     // Optional: FRACTAL_NZ weight pre-conversion (M5). Lives in libopapi.so
     // alongside the other aclnn ops; absence means older CANN and callers
     // gate via has_nz() before touching weights.
