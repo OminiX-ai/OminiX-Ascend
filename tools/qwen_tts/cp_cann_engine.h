@@ -411,6 +411,31 @@ private:
     bool cp_ascendc_enabled_ = false;
     bool cp_ascendc_applied_ = false;
 
+    // ---- G2 aclGraph pos-keyed capture/replay cache -------------------------
+    // Gated by env var TALKER_CP_ACLGRAPH=1 (opt-in, same pattern as W1/W3b).
+    // When set AND g_cann.has_aclgraph() at init time, the engine captures
+    // MAX_ACLGRAPH_POS+1 = 17 full forward-one-token graphs (one per
+    // pos in [0, 16]) during init(). Each graph bakes the pos-specific
+    // RoPE slice pointer, V-cache slot offset, and FIAv2 seq_len. Per-frame
+    // replay = pointer-select + aclmdlRIExecuteAsync.
+    //
+    // Canonical benchmark path only: capture runs only if
+    // cp_fusion_applied_ && w8_applied_ && !cp_ascendc_applied_. Otherwise
+    // aclgraph stays disabled (eager path). This is a scope constraint —
+    // other combinations stay on the stock eager path.
+    //
+    // D2D memcpys inside `forward_one_token_launch` (residual=cur, V→slot)
+    // return err=507009 inside aclmdlRICapture on CANN 8.3.RC1 (G1 finding).
+    // The capturable variant `forward_one_token_capturable_(pos)` replaces
+    // these with aclnn-based Adds (aclnnAdd with alpha=1 over a zero buf),
+    // and redirects V-proj output to write directly into the pos-specific
+    // cache slot — both capturable.
+    static constexpr int MAX_ACLGRAPH_POS = 16;
+    bool aclgraph_enabled_ = false;
+    bool aclgraph_applied_ = false;
+    std::vector<aclmdlRI> aclgraph_graphs_;
+    void *zero_f16_cp_dev_ = nullptr;  // F16 [cp_hidden] zeros — copy helper
+
     // ---- Internal helpers ----
     void alloc_dev(void **ptr, size_t bytes);
     void upload(void *dev, const float *host, size_t n_floats);
@@ -454,4 +479,15 @@ private:
     void build_persistent_tensors_();
     // Destroy all persistent descriptors (called from destructor).
     void destroy_persistent_tensors_();
+
+    // G2: capturable variant of forward_one_token_launch. Identical aclnn
+    // dispatch chain to the W8+fusion path, but with all D2D memcpys replaced
+    // by aclnn Adds and V-proj writing directly to v_cache slot. Used both at
+    // capture time (inside CaptureBegin/End) and as the scoped replay fallback
+    // for pos > MAX_ACLGRAPH_POS. Records `forward_done_event_` at the tail.
+    void forward_one_token_capturable_(int pos);
+
+    // G2: capture-at-init. No-op unless env gate set and canonical path. On
+    // success, fills aclgraph_graphs_[0..MAX] and flips aclgraph_applied_=true.
+    void capture_aclgraph_forwards_();
 };

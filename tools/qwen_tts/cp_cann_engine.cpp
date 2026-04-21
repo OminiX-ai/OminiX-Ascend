@@ -214,6 +214,15 @@ CpCannEngine::~CpCannEngine() {
     for (auto &p : k_cache_dev_) free_dev(p);
     for (auto &p : v_cache_dev_) free_dev(p);
 
+    // G2: destroy captured aclGraph handles.
+    if (g_cann.aclmdlRIDestroy) {
+        for (auto &g : aclgraph_graphs_) {
+            if (g) { g_cann.aclmdlRIDestroy(g); g = nullptr; }
+        }
+    }
+    aclgraph_graphs_.clear();
+    free_dev(zero_f16_cp_dev_);
+
     free_dev(workspace_dev_);
     free_dev(input_stage_f32_dev_);
     free_dev(output_stage_f32_dev_);
@@ -1153,6 +1162,27 @@ bool CpCannEngine::init_from_safetensors(const std::string &path,
     build_persistent_tensors_();
 
     ready_ = true;
+
+    // G2: opt-in aclGraph capture-at-init. Gated by TALKER_CP_ACLGRAPH=1.
+    // Requires the canonical W8+fusion path to be active (capturable variant
+    // handles only that combination). Silent no-op when unset.
+    {
+        const char *env = getenv("TALKER_CP_ACLGRAPH");
+        aclgraph_enabled_ = (env && env[0] != '\0' && env[0] != '0');
+        if (aclgraph_enabled_) {
+            printf("[cp_cann] TALKER_CP_ACLGRAPH=1 — attempting full-forward "
+                   "capture at init (pos 0..%d)...\n", MAX_ACLGRAPH_POS);
+            capture_aclgraph_forwards_();
+            if (aclgraph_applied_) {
+                printf("[cp_cann] G2 aclGraph ENABLED — replay path active for "
+                       "pos in [0, %d].\n", MAX_ACLGRAPH_POS);
+            } else {
+                printf("[cp_cann] G2 aclGraph disabled (capture incomplete) — "
+                       "staying on eager path.\n");
+            }
+        }
+    }
+
     printf("[cp_cann] BF16-weights engine initialized from %s\n", path.c_str());
     printf("[cp_cann] dims: cp_hidden=%d q_dim=%d kv_dim=%d inter=%d head=%d\n",
            cp_hidden_, q_dim_, kv_dim_, inter_, head_dim_);
@@ -1458,6 +1488,27 @@ bool CpCannEngine::init(const CpWeightsF32 &w, const CodePredictorConfig &cfg,
     }
 
     ready_ = true;
+
+    // G2: opt-in aclGraph capture-at-init (mirror of the init_from_safetensors
+    // block). See forward_one_token_capturable_ for the capture-friendly
+    // forward variant.
+    {
+        const char *env = getenv("TALKER_CP_ACLGRAPH");
+        aclgraph_enabled_ = (env && env[0] != '\0' && env[0] != '0');
+        if (aclgraph_enabled_) {
+            printf("[cp_cann] TALKER_CP_ACLGRAPH=1 — attempting full-forward "
+                   "capture at init (pos 0..%d)...\n", MAX_ACLGRAPH_POS);
+            capture_aclgraph_forwards_();
+            if (aclgraph_applied_) {
+                printf("[cp_cann] G2 aclGraph ENABLED — replay path active for "
+                       "pos in [0, %d].\n", MAX_ACLGRAPH_POS);
+            } else {
+                printf("[cp_cann] G2 aclGraph disabled (capture incomplete) — "
+                       "staying on eager path.\n");
+            }
+        }
+    }
+
     printf("[cp_cann] v4 F16 engine initialized: %d layers, device %d\n",
            n_layers_, device_);
     printf("[cp_cann] dims: cp_hidden=%d q_dim=%d kv_dim=%d inter=%d head=%d\n",
@@ -1467,6 +1518,439 @@ bool CpCannEngine::init(const CpWeightsF32 &w, const CodePredictorConfig &cfg,
 
 void CpCannEngine::reset_kv_cache() {
     kv_cache_len_ = 0;
+}
+
+// ============================================================================
+// G2: forward_one_token_capturable_ — aclGraph-safe mirror of the W8+fusion
+// canonical forward path. Differences from forward_one_token_launch eager:
+//   * H2D input upload is NOT here — the caller stages into
+//     input_stage_f32_dev_ before this is called (capture time) or before the
+//     captured graph is replayed (runtime; handled by the aclgraph fast path
+//     in forward_one_token_launch).
+//   * D2D `aclrtMemcpyAsync` calls (residual=cur at layer-start, V→v_cache
+//     slot, residual=cur after fused post-attn AddRmsNorm) are replaced with
+//     `aclnnAdd(src, zero_f16_cp_dev_, alpha=1, dst)` for the residual copies
+//     and with direct V-proj output redirection to the cache slot. Both are
+//     capturable aclnn ops; `aclrtMemcpyAsync` D2D returns err=507009 inside
+//     aclmdlRICapture on CANN 8.3.RC1 (G1 finding).
+//   * Only handles the canonical W8+fusion path (cp_fusion_applied_ &&
+//     w8_applied_ && !cp_ascendc_applied_). Callers must verify before
+//     invoking; otherwise aclgraph stays disabled.
+// ============================================================================
+
+void CpCannEngine::forward_one_token_capturable_(int pos) {
+    assert(ready_);
+    assert(cp_fusion_applied_ && w8_applied_ && !cp_ascendc_applied_);
+    assert(zero_f16_cp_dev_ != nullptr);
+
+    // Helper: aclnn-based F16 copy buf-sized [cp_hidden]. dst = src + 1*zero.
+    auto aclnn_copy_cp_ = [&](void *dst, void *src) {
+        aclTensor *t_src = tensor_1d(src, cp_hidden_, ACL_FLOAT16);
+        aclTensor *t_zero = tensor_1d(zero_f16_cp_dev_, cp_hidden_, ACL_FLOAT16);
+        aclTensor *t_dst = tensor_1d(dst, cp_hidden_, ACL_FLOAT16);
+        float one = 1.0f;
+        aclScalar *alpha = g_cann.aclCreateScalar(&one, ACL_FLOAT16);
+        // out = self + alpha * other -> dst = src + 1*zero = src.
+        uint64_t ws = 0; aclOpExecutor *exec = nullptr;
+        ACL_CHECK_RET(g_cann.aclnnAddGetWorkspaceSize(t_src, t_zero, alpha,
+                                                       t_dst, &ws, &exec));
+        if (ws > workspace_size_) {
+            if (workspace_dev_) g_cann.aclrtFree(workspace_dev_);
+            ACL_CHECK_RET(g_cann.aclrtMalloc(&workspace_dev_, ws,
+                           ACL_MEM_MALLOC_HUGE_FIRST));
+            workspace_size_ = ws;
+        }
+        void *ws_ptr = ws > 0 ? workspace_dev_ : nullptr;
+        ACL_CHECK_RET(g_cann.aclnnAdd(ws_ptr, ws, exec, stream_));
+        g_cann.aclDestroyTensor(t_src);
+        g_cann.aclDestroyTensor(t_zero);
+        g_cann.aclDestroyTensor(t_dst);
+        g_cann.aclDestroyScalar(alpha);
+    };
+
+    // Input projection in F32 (proj_w/proj_b are F32).
+    {
+        aclTensor *t_x = tensor_2d(input_stage_f32_dev_,
+                                    talker_hidden_, 1, ACL_FLOAT);
+        CANN_OP(Mm, t_.proj_w_f32, t_x, t_.proj_out_f32_col,
+                /*cubeMathType=*/0);
+        g_cann.aclDestroyTensor(t_x);
+    }
+    {
+        float one = 1.0f;
+        aclScalar *alpha_f32 = g_cann.aclCreateScalar(&one, ACL_FLOAT);
+        CANN_OP(InplaceAdd, t_.proj_out_f32_flat, t_.proj_b_f32, alpha_f32);
+        g_cann.aclDestroyScalar(alpha_f32);
+    }
+    CANN_OP(Cast, t_.proj_out_f32_flat, ACL_FLOAT16,
+            t_.cur_f16_flat_as_target);
+
+    const int seq_len = pos + 1;
+
+    uint16_t *cos_pos = (uint16_t *)rope_cos_dev_ + (size_t)pos * head_dim_;
+    uint16_t *sin_pos = (uint16_t *)rope_sin_dev_ + (size_t)pos * head_dim_;
+    aclTensor *t_cos = [&]() {
+        int64_t shape[4]   = {1, 1, 1, (int64_t)head_dim_};
+        int64_t strides[4] = {(int64_t)head_dim_, (int64_t)head_dim_,
+                               (int64_t)head_dim_, 1};
+        return tensor_strided(cos_pos, 4, shape, strides);
+    }();
+    aclTensor *t_sin = [&]() {
+        int64_t shape[4]   = {1, 1, 1, (int64_t)head_dim_};
+        int64_t strides[4] = {(int64_t)head_dim_, (int64_t)head_dim_,
+                               (int64_t)head_dim_, 1};
+        return tensor_strided(sin_pos, 4, shape, strides);
+    }();
+
+    const int layers_to_run = (active_layers_ > 0 && active_layers_ < n_layers_)
+                               ? active_layers_ : n_layers_;
+    for (int il = 0; il < layers_to_run; ++il) {
+        const auto &lt = t_.layer[il];
+
+        // Layer-start: residual = cur (aclnn copy, not D2D memcpy).
+        // Unlike the eager path, we execute this copy EVERY layer even in
+        // fused mode — the prior layer's fused AddRmsNorm produces `cur`
+        // holding the running residual sum, and this layer's post-attn Add
+        // needs it mirrored into `residual_dev_`. In eager mode this was the
+        // `aclrtMemcpyAsync(residual, cur, D2D)` call; aclnn Add does the
+        // same without hitting the capture-incompatible memcpy primitive.
+        if (il == 0) {
+            aclnn_copy_cp_(residual_dev_, cur_dev_);
+            // Fused-path: the FIRST layer still needs the input_ln RmsNorm
+            // (there's no prior fused Add to have produced normed_dev_).
+            CANN_OP(RmsNorm, t_.cur_row, lt.input_ln, (double)eps_,
+                    t_.normed_row, t_.rstd_11);
+        } else {
+            // il > 0 in fused path: `normed_dev_` already holds
+            // RmsNorm(cur, input_ln[il]) from prior layer's post-FFN fusion.
+            // We still need residual=cur mirrored for THIS layer's post-attn.
+            aclnn_copy_cp_(residual_dev_, cur_dev_);
+        }
+
+        // QKV projections (W8 path). V-proj writes DIRECTLY into the v_cache
+        // slot for this (layer, pos), removing the need for a D2D memcpy
+        // post-hoc. Since `pos` is baked per-captured-graph, the tensor
+        // descriptor below locks in the right slot at capture time.
+        {
+            aclTensor *t_n_row = tensor_2d(normed_dev_, 1, cp_hidden_, ACL_FLOAT16);
+            aclTensor *t_q_row = tensor_2d(q_dev_, 1, q_dim_, ACL_FLOAT16);
+            aclTensor *t_k_row = tensor_2d(k_dev_, 1, kv_dim_, ACL_FLOAT16);
+            // V-proj output view into v_cache_dev_[il] + pos*kv_dim (F16).
+            uint16_t *v_slot_ptr =
+                (uint16_t *)v_cache_dev_[il] + (size_t)pos * kv_dim_;
+            aclTensor *t_v_row = tensor_2d(v_slot_ptr, 1, kv_dim_, ACL_FLOAT16);
+            w8_matmul_(t_n_row, layer_w_[il].q_proj_w_i8,
+                        layer_w_[il].q_proj_scale, q_dim_, cp_hidden_, t_q_row);
+            w8_matmul_(t_n_row, layer_w_[il].k_proj_w_i8,
+                        layer_w_[il].k_proj_scale, kv_dim_, cp_hidden_, t_k_row);
+            w8_matmul_(t_n_row, layer_w_[il].v_proj_w_i8,
+                        layer_w_[il].v_proj_scale, kv_dim_, cp_hidden_, t_v_row);
+            g_cann.aclDestroyTensor(t_n_row);
+            g_cann.aclDestroyTensor(t_q_row);
+            g_cann.aclDestroyTensor(t_k_row);
+            g_cann.aclDestroyTensor(t_v_row);
+        }
+
+        // q_norm / k_norm (per-head / per-kv-head RmsNorm).
+        CANN_OP(RmsNorm, t_.q_heads, lt.q_norm, (double)eps_,
+                t_.q_heads, t_.rstd_heads);
+        CANN_OP(RmsNorm, t_.k_kv,    lt.k_norm, (double)eps_,
+                t_.k_kv,    t_.rstd_kv);
+
+        // Q RoPE (out -> attn_out_dev_).
+        CANN_OP(RotaryPositionEmbedding,
+                t_.q_rope_4d, t_cos, t_sin,
+                /*mode=*/(int64_t)0, t_.attn_out_4d);
+
+        // K RoPE: write directly into the KV-cache slot (existing behaviour).
+        uint16_t *k_cache_slot =
+            (uint16_t *)k_cache_dev_[il] + (size_t)pos * kv_dim_;
+        aclTensor *t_k_rope_src = [&]() {
+            int64_t shape[4]   = {1, 1, (int64_t)n_kv_, (int64_t)head_dim_};
+            int64_t strides[4] = {(int64_t)kv_dim_, (int64_t)kv_dim_,
+                                   (int64_t)head_dim_, 1};
+            return tensor_strided(k_dev_, 4, shape, strides);
+        }();
+        aclTensor *t_k_rope_dst = [&]() {
+            int64_t shape[4]   = {1, 1, (int64_t)n_kv_, (int64_t)head_dim_};
+            int64_t strides[4] = {(int64_t)kv_dim_, (int64_t)kv_dim_,
+                                   (int64_t)head_dim_, 1};
+            return tensor_strided(k_cache_slot, 4, shape, strides);
+        }();
+        CANN_OP(RotaryPositionEmbedding,
+                t_k_rope_src, t_cos, t_sin,
+                /*mode=*/(int64_t)0, t_k_rope_dst);
+        g_cann.aclDestroyTensor(t_k_rope_src);
+        g_cann.aclDestroyTensor(t_k_rope_dst);
+
+        // V-to-cache-slot D2D memcpy is GONE — V-proj above wrote directly
+        // into the slot. This is the key capture-friendly change.
+
+        // FIAv2: seq_len baked per pos into the K/V stride-over-seq views.
+        aclTensor *t_q_bsnd = [&]() {
+            int64_t shape[4]   = {1, 1, (int64_t)n_heads_, (int64_t)head_dim_};
+            int64_t strides[4] = {(int64_t)q_dim_, (int64_t)q_dim_,
+                                   (int64_t)head_dim_, 1};
+            return tensor_strided(attn_out_dev_, 4, shape, strides,
+                                   ACL_FLOAT16);
+        }();
+        aclTensor *t_k_bsnd = [&]() {
+            int64_t shape[4]   = {1, (int64_t)seq_len, (int64_t)n_kv_,
+                                   (int64_t)head_dim_};
+            int64_t strides[4] = {(int64_t)seq_len * kv_dim_,
+                                   (int64_t)kv_dim_,
+                                   (int64_t)head_dim_, 1};
+            return tensor_strided(k_cache_dev_[il], 4, shape, strides,
+                                   ACL_FLOAT16);
+        }();
+        aclTensor *t_v_bsnd = [&]() {
+            int64_t shape[4]   = {1, (int64_t)seq_len, (int64_t)n_kv_,
+                                   (int64_t)head_dim_};
+            int64_t strides[4] = {(int64_t)seq_len * kv_dim_,
+                                   (int64_t)kv_dim_,
+                                   (int64_t)head_dim_, 1};
+            return tensor_strided(v_cache_dev_[il], 4, shape, strides,
+                                   ACL_FLOAT16);
+        }();
+        aclTensor *t_attn_out_bsnd = [&]() {
+            int64_t shape[4]   = {1, 1, (int64_t)n_heads_, (int64_t)head_dim_};
+            int64_t strides[4] = {(int64_t)q_dim_, (int64_t)q_dim_,
+                                   (int64_t)head_dim_, 1};
+            return tensor_strided(q_dev_, 4, shape, strides, ACL_FLOAT16);
+        }();
+
+        aclTensorList *t_k_list = g_cann.aclCreateTensorList(&t_k_bsnd, 1);
+        aclTensorList *t_v_list = g_cann.aclCreateTensorList(&t_v_bsnd, 1);
+
+        {
+            uint64_t fa_ws = 0;
+            aclOpExecutor *fa_exec = nullptr;
+            char layout[5] = {'B','S','N','D',0};
+            double scale = 1.0 / sqrt((double)head_dim_);
+            ACL_CHECK_RET(g_cann.aclnnFusedInferAttentionScoreV2GetWorkspaceSize(
+                t_q_bsnd, t_k_list, t_v_list,
+                nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                nullptr, nullptr, nullptr,
+                /*numHeads*/ (int64_t)n_heads_,
+                /*scaleValue*/ scale,
+                /*preTokens*/ (int64_t)65535, /*nextTokens*/ (int64_t)65535,
+                layout,
+                /*numKeyValueHeads*/ (int64_t)n_kv_,
+                /*sparseMode*/ 0, /*innerPrecise*/ 0,
+                /*blockSize*/ 0, /*antiquantMode*/ 0,
+                /*softmaxLseFlag*/ false,
+                /*keyAntiquantMode*/ 0, /*valueAntiquantMode*/ 0,
+                t_attn_out_bsnd, nullptr, &fa_ws, &fa_exec));
+            if (fa_ws > workspace_size_) {
+                if (workspace_dev_) g_cann.aclrtFree(workspace_dev_);
+                ACL_CHECK_RET(g_cann.aclrtMalloc(&workspace_dev_, fa_ws,
+                               ACL_MEM_MALLOC_HUGE_FIRST));
+                workspace_size_ = fa_ws;
+            }
+            void *ws = fa_ws > 0 ? workspace_dev_ : nullptr;
+            ACL_CHECK_RET(g_cann.aclnnFusedInferAttentionScoreV2(
+                ws, fa_ws, fa_exec, stream_));
+        }
+
+        g_cann.aclDestroyTensorList(t_k_list);
+        g_cann.aclDestroyTensorList(t_v_list);
+        g_cann.aclDestroyTensor(t_q_bsnd);
+        g_cann.aclDestroyTensor(t_attn_out_bsnd);
+
+        // O-proj (W8).
+        {
+            aclTensor *t_q_row = tensor_2d(q_dev_, 1, q_dim_, ACL_FLOAT16);
+            aclTensor *t_o_row = tensor_2d(o_out_dev_, 1, cp_hidden_, ACL_FLOAT16);
+            w8_matmul_(t_q_row, layer_w_[il].o_proj_w_i8,
+                        layer_w_[il].o_proj_scale, cp_hidden_, q_dim_, t_o_row);
+            g_cann.aclDestroyTensor(t_q_row);
+            g_cann.aclDestroyTensor(t_o_row);
+        }
+
+        // Fused post-attn Add+RmsNorm: xOut=cur_dev_, yOut=normed_dev_.
+        {
+            aclTensor *t_resid_row =
+                tensor_2d(residual_dev_, 1, cp_hidden_, ACL_FLOAT16);
+            aclTensor *t_o_out_row =
+                tensor_2d(o_out_dev_,    1, cp_hidden_, ACL_FLOAT16);
+            uint64_t ws_needed = 0; aclOpExecutor *exec = nullptr;
+            ACL_CHECK_RET(g_cann.aclnnAddRmsNormGetWorkspaceSize(
+                t_resid_row, t_o_out_row, lt.post_ln_f16, (double)eps_,
+                t_.normed_row, t_.rstd_11, t_.cur_row,
+                &ws_needed, &exec));
+            if (ws_needed > workspace_size_) {
+                if (workspace_dev_) g_cann.aclrtFree(workspace_dev_);
+                ACL_CHECK_RET(g_cann.aclrtMalloc(&workspace_dev_, ws_needed,
+                               ACL_MEM_MALLOC_HUGE_FIRST));
+                workspace_size_ = ws_needed;
+            }
+            void *ws = ws_needed > 0 ? workspace_dev_ : nullptr;
+            ACL_CHECK_RET(g_cann.aclnnAddRmsNorm(ws, ws_needed, exec,
+                                                   stream_));
+            g_cann.aclDestroyTensor(t_resid_row);
+            g_cann.aclDestroyTensor(t_o_out_row);
+            // residual = cur (aclnn copy, not D2D memcpy).
+            aclnn_copy_cp_(residual_dev_, cur_dev_);
+        }
+
+        // FFN gate/up/silu/mul/down (W8).
+        {
+            aclTensor *t_n_row    = tensor_2d(normed_dev_, 1, cp_hidden_, ACL_FLOAT16);
+            aclTensor *t_gate_row = tensor_2d(gate_dev_, 1, inter_, ACL_FLOAT16);
+            aclTensor *t_up_row   = tensor_2d(up_dev_,   1, inter_, ACL_FLOAT16);
+            aclTensor *t_ffn_row  = tensor_2d(ffn_out_dev_, 1, cp_hidden_, ACL_FLOAT16);
+            w8_matmul_(t_n_row, layer_w_[il].gate_proj_w_i8,
+                        layer_w_[il].gate_proj_scale, inter_, cp_hidden_,
+                        t_gate_row);
+            w8_matmul_(t_n_row, layer_w_[il].up_proj_w_i8,
+                        layer_w_[il].up_proj_scale,   inter_, cp_hidden_,
+                        t_up_row);
+            CANN_OP(Silu, t_.gate_flat, t_.gate_flat);
+            CANN_OP(InplaceMul, t_.gate_flat, t_.up_flat);
+            w8_matmul_(t_gate_row, layer_w_[il].down_proj_w_i8,
+                        layer_w_[il].down_proj_scale, cp_hidden_, inter_,
+                        t_ffn_row);
+            g_cann.aclDestroyTensor(t_n_row);
+            g_cann.aclDestroyTensor(t_gate_row);
+            g_cann.aclDestroyTensor(t_up_row);
+            g_cann.aclDestroyTensor(t_ffn_row);
+        }
+
+        // Fused post-FFN Add+RmsNorm with next layer's gamma (or final_norm).
+        {
+            const bool is_last = (il + 1 == layers_to_run);
+            const aclTensor *next_gamma =
+                is_last ? t_.final_norm_f16 : t_.layer[il + 1].input_ln_f16;
+            aclTensor *t_resid_row =
+                tensor_2d(residual_dev_, 1, cp_hidden_, ACL_FLOAT16);
+            aclTensor *t_ffn_row =
+                tensor_2d(ffn_out_dev_,  1, cp_hidden_, ACL_FLOAT16);
+            uint64_t ws_needed = 0; aclOpExecutor *exec = nullptr;
+            ACL_CHECK_RET(g_cann.aclnnAddRmsNormGetWorkspaceSize(
+                t_resid_row, t_ffn_row, next_gamma, (double)eps_,
+                t_.normed_row, t_.rstd_11, t_.cur_row,
+                &ws_needed, &exec));
+            if (ws_needed > workspace_size_) {
+                if (workspace_dev_) g_cann.aclrtFree(workspace_dev_);
+                ACL_CHECK_RET(g_cann.aclrtMalloc(&workspace_dev_, ws_needed,
+                               ACL_MEM_MALLOC_HUGE_FIRST));
+                workspace_size_ = ws_needed;
+            }
+            void *ws = ws_needed > 0 ? workspace_dev_ : nullptr;
+            ACL_CHECK_RET(g_cann.aclnnAddRmsNorm(ws, ws_needed, exec,
+                                                   stream_));
+            g_cann.aclDestroyTensor(t_resid_row);
+            g_cann.aclDestroyTensor(t_ffn_row);
+        }
+    }
+
+    // With fusion, final RmsNorm was already folded into the last layer's
+    // post-FFN AddRmsNorm (gamma=final_norm). So just cast to F32.
+    CANN_OP(Cast, t_.output_f16, ACL_FLOAT, t_.output_f32);
+
+    g_cann.aclDestroyTensor(t_cos);
+    g_cann.aclDestroyTensor(t_sin);
+}
+
+// ============================================================================
+// G2: capture the 17 per-pos forward graphs at engine init. No-op unless
+// env gate set + canonical path. Failures are reported but non-fatal; we flip
+// aclgraph_applied_ = false so runtime drops to eager.
+// ============================================================================
+
+void CpCannEngine::capture_aclgraph_forwards_() {
+    if (!aclgraph_enabled_) return;
+    if (!g_cann.has_aclgraph()) {
+        fprintf(stderr, "[cp_cann] TALKER_CP_ACLGRAPH=1 but runtime lacks "
+                        "aclmdlRI* — falling back to eager.\n");
+        return;
+    }
+    if (!(cp_fusion_applied_ && w8_applied_ && !cp_ascendc_applied_)) {
+        fprintf(stderr, "[cp_cann] TALKER_CP_ACLGRAPH=1 but build config is "
+                        "not the canonical W8+fusion path — aclgraph disabled.\n");
+        return;
+    }
+
+    // Allocate the zero-buffer used by aclnn_copy_cp_ (aclnnAdd with
+    // `self + 1.0 * zero = self` pattern).
+    if (!zero_f16_cp_dev_) {
+        alloc_dev(&zero_f16_cp_dev_, (size_t)cp_hidden_ * sizeof(uint16_t));
+        std::vector<uint16_t> zeros(cp_hidden_, 0);
+        ACL_CHECK_RET(g_cann.aclrtMemcpy(
+            zero_f16_cp_dev_, cp_hidden_ * sizeof(uint16_t),
+            zeros.data(), cp_hidden_ * sizeof(uint16_t),
+            ACL_MEMCPY_HOST_TO_DEVICE));
+    }
+
+    aclgraph_graphs_.assign(MAX_ACLGRAPH_POS + 1, nullptr);
+
+    // Stage a deterministic non-zero input into input_stage_f32_dev_ so the
+    // capture-time forward has plausible numerics (no denormals, no NaN).
+    {
+        std::vector<float> stub(talker_hidden_, 0.01f);
+        ACL_CHECK_RET(g_cann.aclrtMemcpy(
+            input_stage_f32_dev_, talker_hidden_ * sizeof(float),
+            stub.data(), talker_hidden_ * sizeof(float),
+            ACL_MEMCPY_HOST_TO_DEVICE));
+    }
+
+    int captured = 0, failed = 0;
+    aclmdlRICaptureMode mode = ACL_MODEL_RI_CAPTURE_MODE_GLOBAL;
+    for (int p = 0; p <= MAX_ACLGRAPH_POS; ++p) {
+        // Drain the stream before opening a new capture — prevents cross-
+        // capture state pollution in the driver's task-DAG tracker.
+        ACL_CHECK_RET(g_cann.aclrtSynchronizeStream(stream_));
+
+        aclError cb = g_cann.aclmdlRICaptureBegin(stream_, mode);
+        if (cb != 0 && p == 0 && mode == ACL_MODEL_RI_CAPTURE_MODE_GLOBAL) {
+            // Try RELAXED as fallback (stop-rule #1).
+            fprintf(stderr, "[cp_cann] CaptureBegin GLOBAL rejected (err=%d); "
+                            "retrying with RELAXED...\n", (int)cb);
+            mode = ACL_MODEL_RI_CAPTURE_MODE_RELAXED;
+            cb = g_cann.aclmdlRICaptureBegin(stream_, mode);
+        }
+        if (cb != 0) {
+            fprintf(stderr, "[cp_cann] CaptureBegin pos=%d err=%d: %s — "
+                            "aborting aclgraph init, falling back to eager.\n",
+                    p, (int)cb,
+                    g_cann.aclGetRecentErrMsg ? g_cann.aclGetRecentErrMsg() : "?");
+            // Cleanup any partial handles and disable.
+            for (auto &g : aclgraph_graphs_) {
+                if (g) { g_cann.aclmdlRIDestroy(g); g = nullptr; }
+            }
+            aclgraph_graphs_.clear();
+            return;
+        }
+
+        // Dispatch the capturable forward for position p.
+        forward_one_token_capturable_(p);
+
+        aclmdlRI ri = nullptr;
+        aclError ce = g_cann.aclmdlRICaptureEnd(stream_, &ri);
+        if (ce != 0 || ri == nullptr) {
+            fprintf(stderr, "[cp_cann] CaptureEnd pos=%d err=%d, ri=%p — "
+                            "aborting aclgraph init.\n", p, (int)ce, (void *)ri);
+            if (ri) g_cann.aclmdlRIDestroy(ri);
+            for (auto &g : aclgraph_graphs_) {
+                if (g) { g_cann.aclmdlRIDestroy(g); g = nullptr; }
+            }
+            aclgraph_graphs_.clear();
+            return;
+        }
+
+        aclgraph_graphs_[p] = ri;
+        ++captured;
+    }
+
+    printf("[cp_cann] G2 aclGraph capture: %d/%d positions succeeded "
+           "(mode=%s)\n", captured, MAX_ACLGRAPH_POS + 1,
+           mode == ACL_MODEL_RI_CAPTURE_MODE_GLOBAL ? "GLOBAL" : "RELAXED");
+    if (captured == MAX_ACLGRAPH_POS + 1) {
+        aclgraph_applied_ = true;
+    }
+    (void)failed;
 }
 
 // ============================================================================
@@ -1490,6 +1974,25 @@ void CpCannEngine::forward_one_token_launch(const float *input_talker_space,
         input_stage_f32_dev_, talker_hidden_ * sizeof(float),
         input_talker_space,   talker_hidden_ * sizeof(float),
         ACL_MEMCPY_HOST_TO_DEVICE));
+
+    // ---------- G2: aclGraph replay fast path ----------
+    // When `aclgraph_applied_` AND pos is within the captured cache (0..MAX),
+    // swap the full eager dispatch for a single `aclmdlRIExecuteAsync` call on
+    // `stream_`. The captured graph bakes every pos-dependent pointer (RoPE
+    // slice, V-cache slot, FIAv2 seq_len), so replay is just one driver call.
+    // Fall through to the eager path for unknown pos or when the capture was
+    // not done (env unset, or non-canonical build config).
+    if (aclgraph_applied_ && pos >= 0 && pos <= MAX_ACLGRAPH_POS &&
+        (size_t)pos < aclgraph_graphs_.size() && aclgraph_graphs_[pos] != nullptr) {
+        ACL_CHECK_RET(g_cann.aclmdlRIExecuteAsync(aclgraph_graphs_[pos],
+                                                    stream_));
+        if (forward_done_event_ && g_cann.aclrtRecordEvent) {
+            ACL_CHECK_RET(g_cann.aclrtRecordEvent(forward_done_event_,
+                                                    stream_));
+        }
+        return;
+    }
+    // ----------------------------------------------------
 
     // 2. Input projection in F32 (proj_w/proj_b are F32; input is F32).
     //    Output goes to proj_out_f32_dev_ (F32). This matches the precision
