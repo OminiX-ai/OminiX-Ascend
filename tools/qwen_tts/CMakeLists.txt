@@ -368,6 +368,35 @@ if(QWEN_TTS_CP_CANN)
         target_compile_options(test_prefill_diff PRIVATE -march=armv8.2-a+fp16)
     endif()
 
+    # W4.1.2 offline-diff harness: dispatch the fused_attn_sublayer AscendC
+    # kernel on a synthetic fixture and compare its output against the same
+    # math run in host-F32. Gate: max-abs-diff ≤ 1e-2.
+    if(QWEN_TTS_ASCENDC)
+        add_executable(test_fused_attn_diff
+            ascendc/test_fused_attn_diff.cpp
+            cp_cann_symbols.cpp
+        )
+        target_link_libraries     (test_fused_attn_diff PUBLIC ggml llama qwen_common)
+        target_link_libraries     (test_fused_attn_diff PRIVATE Threads::Threads common
+                                                                 ${CMAKE_DL_LIBS}
+                                                                 qwen_tts_ascendc_kernels)
+        target_include_directories(test_fused_attn_diff PUBLIC  .)
+        target_include_directories(test_fused_attn_diff PRIVATE ../.. ../../vendor
+            $ENV{ASCEND_TOOLKIT_HOME}/aarch64-linux/include
+            $ENV{ASCEND_TOOLKIT_HOME}/include
+            ${CMAKE_BINARY_DIR}/include/qwen_tts_ascendc_kernels)
+        target_compile_definitions(test_fused_attn_diff PRIVATE QWEN_TTS_HAS_CP_CANN=1
+                                                                 QWEN_TTS_HAS_ASCENDC=1)
+        target_compile_features   (test_fused_attn_diff PRIVATE cxx_std_17)
+        # The ascendc_library() macro produces PIC object files; any target
+        # that links it must also be PIC.
+        set_target_properties     (test_fused_attn_diff PROPERTIES
+                                    POSITION_INDEPENDENT_CODE ON)
+        if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+            target_compile_options(test_fused_attn_diff PRIVATE -march=armv8.2-a+fp16)
+        endif()
+    endif()
+
     # Diagnostic: per-row aclnnMm(W, X_col) vs batched aclnnMm(X, W^T strided).
     # Verifies the strided-weight view pattern used in forward_prefill matches
     # the contiguous-weight pattern used in forward_decode.
