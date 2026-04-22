@@ -2413,9 +2413,22 @@ void CpCannEngine::capture_aclgraph_forwards_() {
 // M6.2: launch path queues every op for position `pos` on `stream_` and
 // returns without syncing or D2H. Records `forward_done_event_` so callers
 // can fence from another stream (Talker[N+1] waiting on CP[N] final group).
+//
+// M3'new' additions (default-off, existing callers see identical behavior):
+//   - use_async_memcpy: when true, use `aclrtMemcpyAsync` on `stream_` for
+//     the H2D input upload. This makes the upload stream-ordered (not
+//     host-synchronous). Used by `forward_two_tokens_launch` so pos 1's
+//     input upload serializes on stream_ after pos 0's compute has read
+//     `input_stage_f32_dev_`, without host blocking between the two calls.
+//   - record_event: when false, skip recording `forward_done_event_` at
+//     the tail (both aclGraph fast path and eager path). Used by
+//     `forward_two_tokens_launch` for the pos-0 call; the pos-1 call then
+//     records the event for the single aggregated fence.
 void CpCannEngine::forward_one_token_launch(const float *input_talker_space,
                                              int pos,
-                                             aclrtEvent wait_event) {
+                                             aclrtEvent wait_event,
+                                             bool use_async_memcpy,
+                                             bool record_event) {
     assert(ready_);
 
     if (wait_event && g_cann.aclrtStreamWaitEvent) {
@@ -2423,10 +2436,22 @@ void CpCannEngine::forward_one_token_launch(const float *input_talker_space,
     }
 
     // 1. Upload F32 input embedding to f32 stage buffer.
-    ACL_CHECK_RET(g_cann.aclrtMemcpy(
-        input_stage_f32_dev_, talker_hidden_ * sizeof(float),
-        input_talker_space,   talker_hidden_ * sizeof(float),
-        ACL_MEMCPY_HOST_TO_DEVICE));
+    if (use_async_memcpy && g_cann.aclrtMemcpyAsync) {
+        // Stream-ordered H2D — the device will read `input_stage_f32_dev_`
+        // only after all prior queued work on `stream_` has finished
+        // consuming it (the input projection Mm right below is the sole
+        // reader, so subsequent pos-1 writes via this same async path are
+        // safe once that Mm has drained on the stream).
+        ACL_CHECK_RET(g_cann.aclrtMemcpyAsync(
+            input_stage_f32_dev_, talker_hidden_ * sizeof(float),
+            input_talker_space,   talker_hidden_ * sizeof(float),
+            ACL_MEMCPY_HOST_TO_DEVICE, stream_));
+    } else {
+        ACL_CHECK_RET(g_cann.aclrtMemcpy(
+            input_stage_f32_dev_, talker_hidden_ * sizeof(float),
+            input_talker_space,   talker_hidden_ * sizeof(float),
+            ACL_MEMCPY_HOST_TO_DEVICE));
+    }
 
     // ---------- G2: aclGraph replay fast path ----------
     // When `aclgraph_applied_` AND pos is within the captured cache (0..MAX),
@@ -2439,7 +2464,7 @@ void CpCannEngine::forward_one_token_launch(const float *input_talker_space,
         (size_t)pos < aclgraph_graphs_.size() && aclgraph_graphs_[pos] != nullptr) {
         ACL_CHECK_RET(g_cann.aclmdlRIExecuteAsync(aclgraph_graphs_[pos],
                                                     stream_));
-        if (forward_done_event_ && g_cann.aclrtRecordEvent) {
+        if (record_event && forward_done_event_ && g_cann.aclrtRecordEvent) {
             ACL_CHECK_RET(g_cann.aclrtRecordEvent(forward_done_event_,
                                                     stream_));
         }
@@ -3084,13 +3109,37 @@ void CpCannEngine::forward_one_token_launch(const float *input_talker_space,
     CANN_OP(Cast, t_.output_f16, ACL_FLOAT, t_.output_f32);
 
     // Record event so `forward_one_token_fetch` (or another stream via
-    // aclrtStreamWaitEvent) can fence against forward completion.
-    if (forward_done_event_ && g_cann.aclrtRecordEvent) {
+    // aclrtStreamWaitEvent) can fence against forward completion. M3'new'
+    // lets the caller skip this when chaining a second forward in the
+    // same submission (forward_two_tokens_launch's pos-0 leg).
+    if (record_event && forward_done_event_ && g_cann.aclrtRecordEvent) {
         ACL_CHECK_RET(g_cann.aclrtRecordEvent(forward_done_event_, stream_));
     }
 
     g_cann.aclDestroyTensor(t_cos);
     g_cann.aclDestroyTensor(t_sin);
+}
+
+// M3'new': batched prefill of CP positions 0+1 on `stream_` with no host
+// sync between the two forwards. See header for semantics.
+void CpCannEngine::forward_two_tokens_launch(const float *input0,
+                                              const float *input1,
+                                              aclrtEvent wait_event) {
+    assert(ready_);
+    // Pos 0: upload via async memcpy so pos 1's upload further down is
+    // stream-ordered against it without the host-synchronous memcpy gap.
+    // Skip the tail event record — it's folded into the pos-1 call below.
+    forward_one_token_launch(input0, /*pos=*/0, wait_event,
+                              /*use_async_memcpy=*/true,
+                              /*record_event=*/false);
+    // Pos 1: stream-ordered async upload again. The pos-0 input projection
+    // Mm on `stream_` has already consumed `input_stage_f32_dev_` by the
+    // time this memcpy runs on-device, so overwriting the buffer is safe.
+    // Record the done event at the tail — callers fence on this just like
+    // they would after the second sequential `forward_one_token_launch`.
+    forward_one_token_launch(input1, /*pos=*/1, /*wait_event=*/nullptr,
+                              /*use_async_memcpy=*/true,
+                              /*record_event=*/true);
 }
 
 void CpCannEngine::forward_one_token_fetch(float *hidden_out) {

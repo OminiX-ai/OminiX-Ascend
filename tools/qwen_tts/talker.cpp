@@ -1641,11 +1641,33 @@ bool TalkerLLM::predict_code_groups(
 
         std::vector<float> cp_out(cp_hidden);
 
-        // Position 0: talker hidden state (engine does input_proj internally)
+        // ---- M3'new' pos-batch gate ----
+        // When TALKER_CP_POS_BATCH=1, the two prefill positions (pos 0 =
+        // talker hidden, pos 1 = group-0 codec embedding) are dispatched
+        // as a single engine call — the two forwards queue back-to-back on
+        // the CP stream with no host sync between them. Pos 0's hidden is
+        // never consumed on host (only pos 1's is read into cp_out below),
+        // so the batching does not reorder observable computation. See
+        // docs/cp_group_dependency_audit.md §Q3 (only the 2-token prefill
+        // is batchable; groups 1-15 stay strictly serial).
+        static const bool cp_pos_batch_on =
+            (getenv("TALKER_CP_POS_BATCH") != nullptr);
+
+        // Position 1: group-0 codec embedding in talker space. Computed up
+        // front — it depends only on `group0_token` (function input), so
+        // it can be prepared before either CP forward launches.
+        std::vector<float> g0_emb(talker_hidden);
         {
             auto t0 = cp_clock::now();
-            cp_cann_engine_->forward_one_token_launch(hidden_states, 0,
-                                                       /*wait*/ nullptr);
+            lookup_codec_embedding(group0_token, g0_emb.data());
+            prof_tick(prof_emb_ms, t0);
+        }
+
+        if (cp_pos_batch_on) {
+            auto t0 = cp_clock::now();
+            cp_cann_engine_->forward_two_tokens_launch(hidden_states,
+                                                        g0_emb.data(),
+                                                        /*wait*/ nullptr);
             if (lm_head_npu) {
                 // Hidden stays on NPU — no D2H needed. sync only.
                 cp_cann_engine_->forward_one_token_sync();
@@ -1653,25 +1675,32 @@ bool TalkerLLM::predict_code_groups(
                 cp_cann_engine_->forward_one_token_fetch(cp_out.data());
             }
             prof_tick(prof_fwd_ms, t0);
-        }
-
-        // Position 1: group-0 codec embedding in talker space
-        std::vector<float> g0_emb(talker_hidden);
-        {
-            auto t0 = cp_clock::now();
-            lookup_codec_embedding(group0_token, g0_emb.data());
-            prof_tick(prof_emb_ms, t0);
-        }
-        {
-            auto t0 = cp_clock::now();
-            cp_cann_engine_->forward_one_token_launch(g0_emb.data(), 1,
-                                                       /*wait*/ nullptr);
-            if (lm_head_npu) {
-                cp_cann_engine_->forward_one_token_sync();
-            } else {
-                cp_cann_engine_->forward_one_token_fetch(cp_out.data());
+        } else {
+            // Stock path: two sequential launches with a host sync between.
+            // Position 0: talker hidden state (engine does input_proj internally)
+            {
+                auto t0 = cp_clock::now();
+                cp_cann_engine_->forward_one_token_launch(hidden_states, 0,
+                                                           /*wait*/ nullptr);
+                if (lm_head_npu) {
+                    cp_cann_engine_->forward_one_token_sync();
+                } else {
+                    cp_cann_engine_->forward_one_token_fetch(cp_out.data());
+                }
+                prof_tick(prof_fwd_ms, t0);
             }
-            prof_tick(prof_fwd_ms, t0);
+            // Position 1: the pre-computed group-0 embedding.
+            {
+                auto t0 = cp_clock::now();
+                cp_cann_engine_->forward_one_token_launch(g0_emb.data(), 1,
+                                                           /*wait*/ nullptr);
+                if (lm_head_npu) {
+                    cp_cann_engine_->forward_one_token_sync();
+                } else {
+                    cp_cann_engine_->forward_one_token_fetch(cp_out.data());
+                }
+                prof_tick(prof_fwd_ms, t0);
+            }
         }
 
         // Decode groups 1-15 autoregressively

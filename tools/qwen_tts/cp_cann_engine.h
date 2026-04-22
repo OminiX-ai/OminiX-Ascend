@@ -73,8 +73,31 @@ public:
     // The original `forward_one_token` is now `{ launch; fetch; }` for
     // callers that don't want async.
     void forward_one_token_launch(const float *input_talker_space, int pos,
-                                   aclrtEvent wait_event = nullptr);
+                                   aclrtEvent wait_event = nullptr,
+                                   bool use_async_memcpy = false,
+                                   bool record_event = true);
     void forward_one_token_fetch(float *hidden_out);
+
+    // ---- M3'new' batched prefill of CP positions 0+1 ----------------------
+    // Queues two back-to-back CP forwards (pos 0 and pos 1) on `stream_`
+    // without any host sync between them. Both input uploads and both
+    // forward dispatches are submitted on `stream_` with stream-ordering
+    // providing the H→D-write / device-read ordering for the shared
+    // `input_stage_f32_dev_` buffer.
+    //
+    // Semantics match `forward_one_token_launch(input0, 0);
+    //                  forward_one_token_launch(input1, 1)` with two
+    // differences:
+    //   1. No `forward_one_token_sync` needed between positions — pos 1
+    //      begins queuing as soon as pos 0's ops are submitted.
+    //   2. Only one `forward_done_event_` record (after pos 1). The
+    //      caller can wait on that event to get pos 1's hidden state;
+    //      pos 0's output is overwritten and not exposed (matches the
+    //      talker.cpp contract — pos 0's hidden is never consumed).
+    //
+    // Typically gated by `TALKER_CP_POS_BATCH=1` at the caller.
+    void forward_two_tokens_launch(const float *input0, const float *input1,
+                                    aclrtEvent wait_event = nullptr);
 
     // W1: device-only sync after `_launch`. Blocks on `forward_done_event_`
     // (or `stream_` if no event) without doing the D2H of hidden_out. Use
