@@ -74,6 +74,22 @@
 namespace ominix_qie {
 
 // ---------------------------------------------------------------------------
+// Phase 2 runtime context. The engine tracks a few counters across init so
+// Phase-2 smoke can print a receipts blob (tensor count + peak HBM) without
+// piping through a whole stats struct. These are read-only accessors for
+// the driver binary.
+// ---------------------------------------------------------------------------
+struct DiTInitStats {
+    int64_t tensors_uploaded  = 0;
+    size_t  f16_weight_bytes  = 0;
+    size_t  f32_weight_bytes  = 0;
+    size_t  scratch_bytes     = 0;
+    size_t  rope_bytes        = 0;
+    double  load_wall_ms      = 0.0;
+    double  dequant_wall_ms   = 0.0;
+};
+
+// ---------------------------------------------------------------------------
 // Config mirrors `Qwen::QwenImageParams` in
 // tools/ominix_diffusion/src/qwen_image.hpp (the reference CPU implementation
 // our ggml-cann path builds against). Defaults match Qwen-Image-Edit-2511.
@@ -315,6 +331,7 @@ public:
     bool is_ready()   const { return ready_; }
     int  device_id()  const { return device_; }
     const ImageDiffusionConfig &config() const { return cfg_; }
+    const DiTInitStats &stats() const { return stats_; }
 
 private:
     // --- State ---
@@ -349,6 +366,9 @@ private:
     // aclnn workspace (grows on demand).
     void  *workspace_dev_ = nullptr;
     size_t workspace_size_ = 0;
+
+    // --- Phase 2 bookkeeping ---
+    DiTInitStats stats_{};
 
     // --- Helpers (all stubbed in Phase 1) ----------------------------------
     void alloc_dev_(void **ptr, size_t bytes);
