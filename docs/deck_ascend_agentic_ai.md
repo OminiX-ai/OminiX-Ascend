@@ -12,6 +12,7 @@ v3.3 (2026-04-21): Slide 7b "what closes the gap" gains CannFusion-as-CUTLASS-an
 v3.4 (2026-04-21): added Slide 5.5 architecture map with mermaid flowchart + optimization heat-map table; no renumbering
 v3.6 (2026-04-21): Slide 8 — added HCCL env-tuning cheatsheet to speaker notes (5 vars, +89% TG measured on 16 × 910 gen1 Qwen3-235B, with fullmesh-garbage + AICPU-gen1-crash correctness landmines) + one body bullet cross-referencing `docs/llm_mutil_npu_brief.md` §Q2 as single source of truth; no renumbering
 v3.7 (2026-04-21): A2-reopen YELLOW verdict integration — V2 RoPE op numerically correct (1 ulp on 16Q/8KV GQA); both "packed-UB GQA" and "cos/sin prep" hypotheses falsified; A.2 heat-map row → REWIRE-IN-FLIGHT; Slide 9 risks + Slide 9.5 mode #1 gain "source-reading is not a substitute for probe" lesson; WSPOOL retain-list infra (fork 8a36f5fa) noted as candidate fix for the remaining workspace-lifetime hypothesis in A.2-rewire. No main-slide renumbering.
+v3.8 (2026-04-22): QKV grouped matmul probe GREEN — first vendor-fused-op +fps contribution this session. Refined A16W8 narrative: gap is FFN/SwiGLU-family-specific, NOT universal across grouped-matmul family. Slide 7b + 9 + 5.5 + Appendix B updated; Slide 5.5 adds row 13 (QKV GMM SHIP-IN-FLIGHT).
 -->
 
 ---
@@ -182,6 +183,7 @@ flowchart TB
     class OPR stock
 
     QKV -. "FO-audit no fused QKV in CANN 8.3 PENDING" .-> QKV
+    QKV -. "GMM-wire SHIP-IN-FLIGHT — A16W8 grouped matmul, +0.3 fps" .-> QKV
     ROPE -. "A.2 V2 RoPE REWIRE-IN-FLIGHT (op correct within 1 ulp; both packed-UB and cos/sin hypotheses falsified; workspace/descriptor/stream hypothesis next)" .-> ROPE
     TAIL1 -. "W3b AddRmsNorm LANDED +0.66 fps" .-> TAIL1
     TAIL1 -. "A.1 Inplace LANDED +0.3 fps" .-> TAIL1
@@ -210,6 +212,7 @@ flowchart TB
 | 10 | CannFusion | CP FFN Mm+epilogue | PARKED | A16W8 upstream |
 | 11 | M2 Talker aclGraph | Talker 28-layer forward | PENDING | +0.4-0.8 proj |
 | 12 | W4 quant | All W8 matmuls | PENDING | +2-5 (risky) |
+| 13 | QKV GMM | CP attn Q/K/V matmul (3→1 op) | **SHIP-IN-FLIGHT** (wiring agent running) | +0.3 projected |
 
 **Speaker notes**: Three dense stages — Talker 2024 ms, CP 1732 ms (biggest slice), codec decode (vocoder, separate story). CP is the target: 80-op aclnn chain runs 15× per frame × N frames — max amortisation surface. Walk the green nodes. W1 sits *between* CP forwards, not inside the layer — that's why it's +8.3 standalone: CPU-to-NPU migration of a 9.72 ms/frame cost, not an aclnn-chain optimisation. W3b and A.1 hit the same per-layer tails at different granularities; they compose because inplace bypasses a memcpy AddRmsNorm alone still pays. G2 captures the entire `forward_one_token_launch`, and the captured graph already contains W3b + A.1's fused nodes — aclGraph amortises dispatch *after* fusion collapses ops. M3N batches positions 0+1 at frame start — different axis from G2 (G2 amortises per-dispatch launch; M3N amortises prefill). Red nodes: every CLOSED track aimed further inside the CP layer, each failed for a **different** reason — Path C was 1949 drift, FFNV3 non-MoE runtime rejection, M3 RVQ strict dep. V2 RoPE has now had **both** its leading hypotheses falsified by our own A2-reopen standalone probe on ac02: the original "GQA packed-UB shared-stride" rootcause (from source-reading of `apply_rotary_pos_emb_small.h:113-165`) and the follow-on "cos/sin prep half-duplicated vs half-half mismatch" candidate (MN's lead from the llm_mutil_npu brief). Probe shows `aclnnApplyRotaryPosEmbV2` is numerically correct on our 16Q/8KV GQA shape to within 1 F16 ulp (max_abs = 4.88e-4) under both Prep A and Prep B cos/sin layouts, and the two host tables are byte-identical by FNV-1a hash. Remaining hypothesis space for the original 457-vs-434 failure: workspace lifetime, tensor descriptor parity, aclGraph-capture-gate ordering, stream ordering race, KV-slot address arithmetic. A.2-rewire probe is running; WSPOOL retain-list infra (fork `8a36f5fa`) closes the async-workspace-free-race candidate. **Meta-lesson on stage**: a V2-debug agent reading vendor kernel source produced a sophisticated-but-wrong hypothesis that only a direct probe could falsify — **probe-first is non-negotiable even after we've "rootcaused" something via source-reading**. That variety validates probe-first: no single root cause to plan around, and the V2 RoPE reversal is itself a receipt for the orchestration mode "kill-cleanly-with-receipts — but stay open to new evidence". M2 Talker aclGraph and W4 quant are the two remaining structural levers; everything else hit a wall, cleanly.
 
@@ -265,6 +268,7 @@ flowchart TB
 - **Chinese-first docs, undersized LLM training corpus**: Ascend infra is underrepresented; agents hallucinate ops that don't exist or miss ones that do
 - **Remote-only dev**: everything runs on ac01 / ac02 / ac03 — SSH + CANN env sourcing + `LD_LIBRARY_PATH` wrangling per session, no local iteration
 - **Header-vs-runtime mismatches** — three for three: FFNV3 advertises W8 activation, runtime rejects no-expert branch; `aclnnApplyRotaryPosEmbV2` advertises GQA, packed-UB breaks on GQA shape; CannFusion codegen advertises composability, `validate.rs:141-163` hardcodes an A16W8 rejection
+- **A16W8 vendor-gap is FFN/SwiGLU-family-specific, not universal**: `aclnnGroupedMatmulV3` accepts our A16W8 production dtype at probe-gate (QKV-grouped-probe 2026-04-22), ~+0.3 fps ship-ready with `antiquantOffset=zeros` workaround — **first vendor-fused-op +fps contribution this session**. The header-vs-runtime mismatch pattern we saw in FFNV3 / V2 RoPE / CannFusion validator does NOT generalize across all vendor fused-ops — it's concentrated in MoE-biased FFN/activation paths. Probe per op-family; don't extrapolate.
 - **717 aclnn headers, no curated index**: discovery = grep; vendor catalog is not an API
 - **Opaque error codes**: `EZ9999 161002`, `ACL_ERROR_RT_AICORE_EXCEPTION 507015` — agents can't pattern-match these to causes
 - **Toolchain churn**: CANN 8.3.RC1 vs 8.5.0 have different op availability; agent context is wrong for one or the other
@@ -319,6 +323,7 @@ The deepest agent-coding lever — on both NVIDIA and Apple — is the ability t
 
 - **Correctness gates matter**: W4.1 kernel passed offline 5e-4 diff, **drifted 1949 at runtime** — only the live gate caught it
 - **Agents invent**: CannFusion F1 probe found the dtype whitelist blocks A16W8 — upstream GitCode #26 filed, would have wasted weeks without probe-first
+- **Vendor fused-op coverage is uneven across op families**: FFN-fused-op family (FFNV3, SwiGLU-quant) has A16W8 gated behind MoE dispatch or lacks the A16W8 path entirely. Grouped-matmul family (`aclnnGroupedMatmulV3/V4`) does support A16W8 cleanly (QKV-grouped-probe GREEN 2026-04-22, +0.3 fps ship-ready). Lesson: "A16W8 vendor gap" is not monolithic — probe per op-family, don't extrapolate from one op's rejection to "all vendor fused ops fail A16W8".
 - **Scaffold probes catch silent regressions**: Talker `TALKER_CANN_GRAPH=1` existing scaffold — measured 30 → 18 fps drop (−40%), lazy-capture-on-first-touch wrong for L→R decode. Disabled in 25 min.
 - **Run-to-run noise is real**: baseline probe this session ran stock at 29.9-30.0 fps on 434-frame LONG; M3'new' measured at 31.9-32.2 on same length. The final **A.1 (+0.3) + M3'new' (+0.3)** stack sits inside a ~1 fps noise band — honest framing is "31-32.2 fps", not a crisp 32.2
 - **Projection vs reality is systematically optimistic**: G0 projected **+6-10 fps**, delivered **+1.15**. M3'new' projected **+1 fps**, delivered **+0.3**. Consistent **3-10× optimism pattern** — fund on measured gates, never on estimates
@@ -398,6 +403,7 @@ The deepest agent-coding lever — on both NVIDIA and Apple — is the ability t
 | A.1 InplaceAddRmsNorm | 31.6 fps | 31.9 fps | **+0.3** *(within noise)* | LANDED, byte-identical on gate | 1 agent dispatch |
 | M3'new' pos 0+1 batched prefill | 31.9 fps | 32.2 fps | **+0.3** *(within noise)* | LANDED, byte-identical on gate; projected +1, delivered +0.3 | 1 agent dispatch |
 | M1.B FFNV3 integration | — | — | — | **CLOSED** — op rejects non-MoE runtime; not applicable to Qwen3-TTS dense FFN | 1 agent dispatch (RED probe) |
+| QKV `aclnnGroupedMatmulV3` | 32.2 fps | 32.5 fps (projected) | **+0.3** *(projected, ship-in-flight)* | **GREEN probe** — A16W8 accepted; 1-2 ULP vs reference; wiring agent in flight | ~3 hr probe + wiring |
 | **Single-card cumulative** | **~1 fps** | **31-32.2 fps** | **~32× (±1 fps error bars)** | tag `32fps-landed` | ~7 days wall |
 
 **Projection-vs-reality meta-pattern** (for Slide 9 Q&A):
