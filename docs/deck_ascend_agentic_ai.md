@@ -7,6 +7,7 @@
 CHANGELOG
 v3 polish (2026-04-21): sharpened baseline-noise honesty on Slide 9 (A.1 +0.3 and M3'new' +0.3 within ~1 fps run-to-run variance; final number is 31-32.2 fps band, not a crisp 32.2); folded Talker aclGraph scaffold probe (TALKER_CANN_GRAPH=1 → 30→18 fps, 40% regression from lazy-capture-on-first-touch) into Slide 5 failing-fast-as-feature list; reconciled projection-vs-reality meta-pattern (G0: +6-10 → +1.15; M3N: +1 → +0.3; ~3-10× optimism) as explicit Slide 9 meta-finding; Appendix B updated with A.1 / M3'new' / M1.B FFNV3 / CannFusion #26 rows marked as single source of truth for Q&A.
 v3.1 (2026-04-21): pie-project appendix + Slide 2/6/8/10 Pie-integration edits removed per PM directive; reverted to 5-layer stack and single hardware-scaling axis.
+v3.2 (2026-04-21): added Slide 7b (MLX vs Ascend as AI-coding targets — answers "why 9 MLX crates vs ~32 fps Ascend in same calendar window?" via DX-gap framing, not hardware-gap); added Appendix C (Qwen-Image-Edit-2512 forward-look — structurally-ported via tools/ominix_diffusion, not-yet-optimized, demonstrates playbook applies beyond autoregressive token gen to diffusion image/video); Appendix A artefact list adds tools/ominix_diffusion/ reference. Cross-references to Slide 3/9 stable; no existing numbering changed.
 -->
 
 ---
@@ -117,6 +118,42 @@ v3.1 (2026-04-21): pie-project appendix + Slide 2/6/8/10 Pie-integration edits r
 
 ---
 
+## Slide 7b — Platform DX: Why Agents Ship Faster on MLX Than Ascend
+
+**Title**: "Why MLX is AI-coding-friendly — and what's broken on the Ascend side beyond the hardware."
+
+- Slide 7 shows the *output* gap (9 MLX crates vs ~32 fps on one workload, same calendar window). This slide names the *input* cause: **developer experience, not ISA**.
+
+**MLX is AI-coding-friendly because**:
+- **Open-source primitives**: `mlx-rs`, `mlx` core, `mlx-sys` are all Apache-2.0 on GitHub — agents read source when docs fall short
+- **English-first docs + HuggingFace ecosystem** — both heavily represented in agent training corpora; pattern-matching is cheap
+- **Local dev loop**: compile + run + iterate on the Mac itself in seconds; no SSH tunnel, no shared host contention
+- **Well-characterised precision surface**: bf16 / f16 / f32 behave predictably; the 3 constraints we documented are stable, not whitelist-rejection
+- **Clean API surface**: `Array::save_safetensors()`, `mlx_sys::mlx_clear_cache()` compose with HuggingFace examples; no vendor-validator surprises
+
+**Ascend is AI-coding-hostile (beyond architecture) because**:
+- **Closed-source CANN runtime**: agents see only `aclnnop/` headers; runtime behaviour is a black box (e.g. FFNV3 rejects non-MoE INT8 at runtime — **header says yes, op says no**)
+- **Chinese-first docs, undersized LLM training corpus**: Ascend infra is underrepresented; agents hallucinate ops that don't exist or miss ones that do
+- **Remote-only dev**: everything runs on ac01 / ac02 / ac03 — SSH + CANN env sourcing + `LD_LIBRARY_PATH` wrangling per session, no local iteration
+- **Header-vs-runtime mismatches** — three for three: FFNV3 advertises W8 activation, runtime rejects no-expert branch; `aclnnApplyRotaryPosEmbV2` advertises GQA, packed-UB breaks on GQA shape; CannFusion codegen advertises composability, `validate.rs:141-163` hardcodes an A16W8 rejection
+- **717 aclnn headers, no curated index**: discovery = grep; vendor catalog is not an API
+- **Opaque error codes**: `EZ9999 161002`, `ACL_ERROR_RT_AICORE_EXCEPTION 507015` — agents can't pattern-match these to causes
+- **Toolchain churn**: CANN 8.3.RC1 vs 8.5.0 have different op availability; agent context is wrong for one or the other
+- **AscendC DSL has minimal public training material** vs CUDA — agents can edit existing kernels but struggle authoring novel ones
+- **Patch-file + PM-push friction**: our security mitigation (no fork push creds on ac01) is also a DX tax — every iteration has a PM human in the loop
+
+**What would close the gap (honest; most are Huawei/ecosystem moves, not ours)**:
+- Open-sourcing the CANN runtime (Huawei)
+- Local CANN SDK for Mac / Linux dev hosts (Huawei roadmap; unknown timeline)
+- English docs + more corpora coverage (ecosystem, years-scale)
+- Human-readable error code names (Huawei)
+- Vendor-curated fused-op catalog with capability probes (Huawei)
+- **What WE can do now**: treat FO-audit as a first-class CI step, keep probe-first contract discipline (we have it), file upstream issues (CannFusion GitCode #26 is the template) — **build the missing ecosystem one probe at a time**
+
+**Speaker notes**: This slide answers the question Slide 7 raises but doesn't resolve: in the same calendar window, why did the swarm ship nine MLX crates while the Ascend side landed a ~32× single-workload lift? The deck's thesis is that agentic AI coding crosses layer boundaries — but crossing boundaries still requires a tractable surface to cross. MLX gives agents that surface. CANN, today, does not. This is not a hardware comparison — Slide 7 already covered that, and Ascend's 800 GB/s HBM is genuinely 2× the M3 Max fabric. This slide is about the *texture of the agent session*. On the MLX side, when an agent hits an unknown, it reads `mlx-rs` source on github.com, finds a HuggingFace diffusers reference, pattern-matches the Rust signature, iterates locally, and ships. Wall time per iteration: seconds. On the Ascend side, when an agent hits an unknown — and "unknown" here means "does FFNV3 accept A16W8?", "why does `aclnnApplyRotaryPosEmbV2` reject our packed UB?", "what does EZ9999 161002 mean?" — the answer is usually "run a probe on ac01, wait for the CANN env to source, read the error, grep the 717 headers, maybe file an upstream issue, then iterate". Wall time per iteration: hours to days. None of this is about the 910B4 silicon. The silicon is excellent. It's about the platform above the silicon. Three concrete receipts from the project this session: (1) CannFusion F1 probe — the project's own source at `src/validate.rs:141-163` rejects the A16W8 dtype combo we need; the vendor documentation implied composability. We only found the negative test at `validate.rs:367-372` by reading source. GitCode issue #26 filed upstream — that's us paying back the ecosystem debt for the next agent. (2) M1.B FFNV3 — the op docstring in `aclnnop/` advertises W8 support; runtime rejects on the no-expert branch because our Qwen3-TTS dense FFN isn't MoE. Three-month lag from header ship to our discovery, the probe itself closed RED in one dispatch. (3) The Talker `TALKER_CANN_GRAPH=1` scaffold — shipped untested, silently regressed 30 → 18 fps on lazy-capture semantics that worked for CP (many visits amortise) but not Talker L→R decode (one visit, zero amortisation). 25-minute probe caught it; no existing test did. On the honest-disclaimer side: we should not overclaim the MLX side either. Nine crates is velocity-impressive, but they're Apple-only, single-user, no multi-tenant serving story, no cluster story. Production parity with Ascend's data-centre deployment is not the comparison being made here. What IS being made is a DX comparison at the agent-session layer — where the MLX side currently wins decisively, and where the Ascend side has real, nameable, closable gaps. The "what WE can do" bullet matters for the PM pitch: we are not waiting on Huawei. Every probe-first contract we write, every FO-audit CI job we automate, every upstream issue we file is a unit of ecosystem work that didn't exist before. The playbook generalises; so does the infrastructure work that supports it.
+
+---
+
 ## Slide 8 — Scale Trajectory: Single Card → Cluster
 
 **Title**: "The same mental model, one PR bigger."
@@ -174,6 +211,7 @@ v3.1 (2026-04-21): pie-project appendix + Slide 2/6/8/10 Pie-integration edits r
 - `docs/aclgraph_feasibility.md` — G0 projection vs reality
 - `docs/ascend_910b4_datasheet.md` — 20 AIC + 40 AIV, UB 192 KB, L0C 128 KB, 800 GB/s HBM
 - `tools/qwen_tts/cp_cann_engine.cpp` — 2657 LoC, integration target
+- `tools/ominix_diffusion/` — unified-ggml SD / Flux / Qwen-Image inference on CANN (Appendix C forward-look; structural port, not yet agent-coded for perf)
 - OminiX-MLX: `qwen3-tts-mlx/`, `flux-klein-mlx/`, `zimage-mlx/`, `gpt-sovits-mlx/`, `funasr-qwen4b-mlx/`, 9 production crates total
 
 ## Appendix B — Key Metrics (Single Source of Truth for Q&A)
@@ -210,6 +248,43 @@ Pattern: agent ceiling estimates are consistently 3-10× optimistic. Cause varie
 | Qwen3-TTS (frames/s) | 46 | 37 | 31-32.2 (band) |
 | FLUX.2-klein 1024² | production | production | not yet ported |
 | Z-Image 4-bit | production | production | not yet ported |
+
+---
+
+## Appendix C — Next Workload, Same Playbook: Qwen-Image-Edit-2512 on Ascend (Forward-Looking)
+
+**Title**: "Next workload, same playbook: Qwen-Image-Edit-2512 on Ascend."
+
+**Framing**: this is a **forward-looking design sketch**, not a shipped case study. No perf numbers, no contract, no gates yet. The point is to show the TTS-on-Ascend playbook applies to a *structurally different* workload class: a diffusion model with reference-image conditioning (image-in → image-out), not autoregressive token generation (audio-token-by-token).
+
+**What QIE-2512 is**:
+- Image-edit variant of **Qwen-Image-2512** (Dec 2025 release by Alibaba)
+- Workload shape: MMDiT-style denoising over latent with **text prompt + reference image** conditioning — the "edit" vs "text-to-image" delta is the `ref_images` pathway in the conditioner
+- MLX-side counterpart: `qwen-image-mlx` runs Qwen-Image-2512 text-to-image at BF16 57.7 GB / 8-bit 36.1 GB / 4-bit 25.9 GB on Apple Silicon; QIE adds ref-image conditioning on top
+
+**Current state on each OminiX-Ascend side**:
+- **Structurally ported, not perf-optimised.** `tools/ominix_diffusion/` landed as a **single commit** (`a9521b51 feat: add Stable-Diffusion inference module with unified ggml backend`), carrying SD1.5 / SD2.1 / SDXL / SD3 / Flux / Qwen-Image under one ggml-backend unified C++ module
+- Qwen-Image ops live in `src/qwen_image.hpp` (699 LoC); ref-image conditioning hook is at `src/conditioner.hpp:31` — literal comment: `std::vector<sd_image_t*> ref_images = {};  // for qwen image edit`
+- README advertises Ascend 910B2 (62 GB HBM, CANN 8.5.0) as the test platform — Qwen-Image Q8_0 1024² runs **20 steps in 32.04s (1.59 s/it)** with `GGML_CANN_ACL_GRAPH=1 GGML_CANN_QUANT_BF16=on` — baseline present, NOT agent-coded for 910B4 perf yet
+- **No CP-FPS-style contract, no FO-audit for diffusion ops, no probes.** This is the pre-agentic-coding state; the structural port got us to a working binary, nothing beyond
+
+**What the playbook port would look like** (the actual forward-looking sketch):
+- **Probe-first**: run QIE-2512 on 910B4 end-to-end, capture baseline s/iter and clean-quality gate (generated images eye-match MLX reference at same seed / prompt / reference)
+- **FO-audit for diffusion ops**: the op chain for image-conditioning has fundamentally different shape than TTS — MMDiT attention blocks, cross-attn with image tokens, UNet/DiT residuals, VAE encode/decode — instead of `aclnnMm` + `aclnnFusedInferAttentionScoreV2` + autoregressive KV-cache. Audit `aclnnop/` for **conv + attention + modulation** fused ops analogous to Phase A/B on TTS
+- **Fusion passes**: aclGraph (diffusion is naturally graph-shaped per denoising step, should be easier to capture than L→R decode), custom AscendC sublayer fusions, W3b-analogous Add+Norm consolidation
+- **Memory-budget pattern**: the MLX drop-after-encode pattern (load f32 text encoder → encode prompt → drop to free HBM → load 8-bit transformer → denoise) may directly apply to 910B4 HBM pressure at full precision — same invention, different platform
+- **Quality gate = user-eye verification** replaces user-ear; same discipline, different sense organ
+- **Honest wall-time estimate**: 1-2 agent-weeks to first-landing perf win, mirroring the TTS arc — no reason to believe this class of workload is faster or slower than the TTS port
+
+**Why this matters (the slide's one load-bearing claim)**:
+
+The OminiX-Ascend deck's core artefact is a **~32× lift on one autoregressive audio workload**. A sceptical external listener reasonably asks: *does this playbook only work for text / audio / anything-shaped-like-causal-decode?* Appendix C is the forward-looking answer: **the playbook is workload-class-agnostic**. Diffusion image-editing shares zero hot-path ops with Qwen3-TTS's CP decoder and yet the same five steps — probe, FO-audit, fuse, capture, gate — apply identically. We haven't shipped it. We've shipped the structural port and named the playbook port as the next milestone. That's what "forward-looking" means on this slide.
+
+**What this slide does NOT claim**:
+- No fps numbers on QIE-2512 / 910B4 (we have one baseline number from a different chip — 910B2 — and no optimised target)
+- No contract exists (`docs/contracts/` has no QIE entry)
+- No agent-coding arc has been run; `git log tools/ominix_diffusion/` shows exactly one structural-port commit
+- We're not promising QIE will show a 32× lift. We're promising the **same playbook discipline** will be applied to it, with the same receipts the TTS work produced
 
 ---
 
