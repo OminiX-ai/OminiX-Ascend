@@ -117,8 +117,9 @@ Mirror TTS `CpCannEngine` / `TalkerCannEngine` patterns. Build DiT decoder forwa
 - [ ] Q1.5 VAE encode (ref image → latent) + VAE decode (latent → output image)
 - [ ] Q1.6 Weight loading from GGUF (reuse llama.cpp GGUF parser for Q4)
 - [ ] Q1.7 Smoke gate: generate a canonical edit ("convert cat to black and white"), verify output image is recognizable
+- [ ] **Q1.8 RoPE pre-compute at session init (MUST-HAVE)** — inserted 2026-04-22 per Q0.5.3 verdict (`docs/qie_q0_5_rope_v2_layout.md`). Move `gen_qwen_image_pe(...)` out of per-step `build_graph` into session init. 3D-axial pe vector (16+56+56) pre-computed once, reused across all 20 steps × 60 blocks × 2 CFG. MLX-measured lift +10-25% per step; structural refactor, 2-3 engineer-days. **Supersedes retired RoPE-V2 lever** — V2 op cannot accept 3D-axial packed `[2,2,64,pos_len]` layout (LLM-decode op, scalar-pos + 1D cos/sin only).
 
-**Gate**: end-to-end native-engine generates valid output image on canonical task. steps/s within ~20% of ggml-cann baseline (not a lift yet — just parity proven on native path).
+**Gate**: end-to-end native-engine generates valid output image on canonical task. steps/s within ~20% of ggml-cann baseline (not a lift yet — just parity proven on native path). RoPE pre-compute verified at session init (not re-computed per step).
 
 ### Q2 — aclGraph step-keyed capture (1-2 weeks)
 
@@ -165,6 +166,8 @@ Classic diffusion trick: batch cond + uncond as batch=2, one forward per step in
 ### Q5 — Mm / QKV grouped fusion (1 week)
 
 DiT has QKV matmuls in each attention block. If TTS's GMM-wire (in flight) lands GREEN, directly transfer the `aclnnGroupedMatmulV3` pattern to DiT attention.
+
+**RoPE-V2 retired 2026-04-22** per Q0.5.3 verdict. V2 op is LLM-decode-shaped (scalar-pos + 1D cos/sin), cannot accept QIE's 3D-axial packed `[2,2,64,pos_len]` layout. TTS precedent: 3× contract closures on V2 wiring bugs. **RoPE pre-compute** promoted to Q2.8 as must-have captures the structural value (+10-25%/step MLX-measured) without V2 risk.
 
 - [ ] Q5.1 Wire grouped QKV matmul in DiT attention blocks
 - [ ] Q5.2 Gate: +5-10% step wall
