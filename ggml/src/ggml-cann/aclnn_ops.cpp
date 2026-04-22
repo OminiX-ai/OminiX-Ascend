@@ -2530,6 +2530,10 @@ static void aclnn_repeat_interleave(ggml_backend_cann_context & ctx,
  * @param dst The destination tensor where the result of the matrix
  * multiplication will be stored.
  */
+// Forward declare the CPU-dequant fallback so ggml_cann_mul_mat below can dispatch to it.
+static void ggml_cann_mul_mat_quant_cpu_dequant(ggml_backend_cann_context & ctx, ggml_tensor * dst,
+                                                const enum ggml_type type);
+
 static void ggml_cann_mat_mul_fp(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     ggml_tensor * weight = dst->src[0];  // weight
     ggml_tensor * input  = dst->src[1];  // input
@@ -2758,6 +2762,77 @@ static void ggml_cann_mul_mat_quant(ggml_backend_cann_context & ctx, ggml_tensor
     }
 }
 
+// CPU-dequantise fallback for mul_mat on quant types that don't have an aclnn-native path
+// (Q4_1, Q5_0/1, and all K-quants). Used for the small number of non-hot tensors that appear
+// in mixed-precision GGUF exports: e.g., 3x Q4_1 FFN-down weights in Qwen2.5-VL Q4_0,
+// 28x Q5_K block-0 attention weights in Qwen-Image-Edit-2509 Q4_0. Round-trips the weight
+// through host FP16 per op call; 2D shape only (the checked-in use cases are all 2D).
+// Kept deliberately simple — the hot quant path (Q4_0 / Q8_0) continues to use the native
+// aclnnWeightQuantBatchMatmulV2 code path in ggml_cann_mul_mat_quant().
+static void ggml_cann_mul_mat_quant_cpu_dequant(ggml_backend_cann_context & ctx, ggml_tensor * dst,
+                                                const enum ggml_type type) {
+    ggml_tensor * src0 = dst->src[0];  // weight (quantised)
+    ggml_tensor * src1 = dst->src[1];  // input (fp)
+
+    GGML_ASSERT(ggml_is_contiguous(src0));
+    // Supported-op predicate restricts this path to 2D weights/inputs.
+    GGML_ASSERT(src0->ne[2] == 1 && src0->ne[3] == 1);
+    GGML_ASSERT(src1->ne[2] == 1 && src1->ne[3] == 1);
+    GGML_ASSERT(dst->ne[2]  == 1 && dst->ne[3]  == 1);
+
+    const size_t n_elements     = ggml_nelements(src0);
+    const size_t device_q_bytes = ggml_nbytes(src0);
+
+    // Q4_1 / Q5_* / K-quants are NOT routed through ggml_backend_cann_transform_q4_0 at
+    // buffer-copy time, so the on-device layout matches block_<type> exactly. Pull the
+    // bytes back to host verbatim.
+    std::vector<uint8_t> host_quant(device_q_bytes);
+    ACL_CHECK(aclrtMemcpy(host_quant.data(), device_q_bytes, src0->data, device_q_bytes,
+                          ACL_MEMCPY_DEVICE_TO_HOST));
+
+    const auto * traits = ggml_get_type_traits(type);
+    GGML_ASSERT(traits && traits->to_float);
+
+    std::vector<float> fp32_buf(n_elements);
+    traits->to_float(host_quant.data(), fp32_buf.data(), (int64_t) n_elements);
+
+    // FP16 is the lowest-cost compute dtype aclnnMm will accept here (matches mat_mul_fp's
+    // 2D fast path). If the diffusion caller is in bf16 mode we still feed fp16 weights;
+    // aclnn promotes internally.
+    std::vector<ggml_fp16_t> fp16_buf(n_elements);
+    ggml_fp32_to_fp16_row(fp32_buf.data(), fp16_buf.data(), (int64_t) n_elements);
+
+    const size_t         fp16_bytes = n_elements * sizeof(ggml_fp16_t);
+    ggml_cann_pool_alloc weight_fp16_alloc(ctx.pool(), fp16_bytes);
+    ACL_CHECK(aclrtMemcpy(weight_fp16_alloc.get(), fp16_bytes, fp16_buf.data(), fp16_bytes,
+                          ACL_MEMCPY_HOST_TO_DEVICE));
+
+    // ggml stores these tensors as [K, M, 1, 1] (ne[0]=K row-fastest, ne[1]=M).
+    // ggml_cann_create_tensor(tensor) emits a 4D ACL tensor, but aclnnMm wants exactly 2D,
+    // so build strict 2D views by hand.
+    int64_t input_ne[2] = { src1->ne[0], src1->ne[1] };
+    size_t  input_nb[2] = { src1->nb[0], src1->nb[1] };
+    acl_tensor_ptr acl_input =
+        ggml_cann_create_tensor(src1->data, ggml_cann_type_mapping(src1->type), ggml_type_size(src1->type),
+                                input_ne, input_nb, 2);
+
+    // Weight FP16 buffer on device is native (K, N); aclnnMm expects (N, K) → swap ne/nb[0..1].
+    size_t fp16_nb[2] = { sizeof(ggml_fp16_t), sizeof(ggml_fp16_t) * (size_t) src0->ne[0] };
+    int64_t weight_t_ne[2] = { src0->ne[1], src0->ne[0] };
+    size_t  weight_t_nb[2] = { fp16_nb[1],   fp16_nb[0] };
+    acl_tensor_ptr acl_weight =
+        ggml_cann_create_tensor(weight_fp16_alloc.get(), ACL_FLOAT16, sizeof(ggml_fp16_t), weight_t_ne, weight_t_nb, 2);
+
+    int64_t dst_ne[2] = { dst->ne[0], dst->ne[1] };
+    size_t  dst_nb[2] = { dst->nb[0], dst->nb[1] };
+    acl_tensor_ptr acl_dst =
+        ggml_cann_create_tensor(dst->data, ggml_cann_type_mapping(dst->type), ggml_type_size(dst->type),
+                                dst_ne, dst_nb, 2);
+
+    // cubeMathType = 2 (ALLOW_FP32_DOWN_PRECISION): matches mat_mul_fp 2D path.
+    GGML_CANN_CALL_ACLNN_OP(ctx, Mm, acl_input.get(), acl_weight.get(), acl_dst.get(), 2);
+}
+
 void ggml_cann_mul_mat(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     const enum ggml_type type = dst->src[0]->type;
     switch (type) {
@@ -2769,6 +2844,20 @@ void ggml_cann_mul_mat(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q8_0:
             ggml_cann_mul_mat_quant(ctx, dst, type);
+            break;
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q2_K:
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+            // K-quants (super-block = 256 elements, packed scales/mins) and Q4_1/Q5_{0,1}
+            // don't map cleanly onto aclnnWeightQuantBatchMatmulV2's single-scale-per-32
+            // layout. Route through the CPU-dequant fallback; see comment on that function
+            // for why this is not on any diffusion hot path.
+            ggml_cann_mul_mat_quant_cpu_dequant(ctx, dst, type);
             break;
         default:
             GGML_ABORT("Unsupported type for mul_mat");
