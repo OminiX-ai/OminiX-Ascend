@@ -185,3 +185,32 @@
 | Qwen3-TTS (frames/s) | 46 | 37 | 30.5 |
 | FLUX.2-klein 1024² | production | production | not yet ported |
 | Z-Image 4-bit | production | production | not yet ported |
+
+---
+
+## Appendix C — Independent Data Point: pie-project (Yale, SOSP 2025)
+
+**Title**: "Same boundary, opposite direction — a research-side crosscheck."
+
+- **What it is**: Pie (`github.com/pie-project/pie`, SOSP 2025, Gim/Ma/Lee/Zhong @ Yale) is a **programmable LLM serving system** that replaces the monolithic prefill-decode loop (vLLM / SGLang / TGI) with **fine-grained API handlers** — `embed`, `forward`, `sample`, `alloc_kvpage`, `mask_kvpage`, `export_kvpage` — orchestrated by user-written **inferlets** that compile to WebAssembly. Thesis from their HotOS 2025 companion paper: *"serve programs, not prompts"*; LLM serving systems are the new OS, inferlets are the processes, KV pages are the pages.
+- **Published numbers** (Llama 3.2 1B, L40 GPU, vs vLLM / SGLang / LMQL / StreamingLLM):
+  - Text completion: **matches vLLM within 1.5–11% TPOT** (2.4% overhead at 8B, 11.4% at 1B)
+  - Agentic workflows: **1.1–2.4× lower latency, 1.3–3.4× higher throughput**
+  - Attention sink: **1.5× lower latency, 30× higher throughput** vs hand-built StreamingLLM
+  - Adaptive batcher: **17× throughput** vs eager, 8–40% vs fixed-rate policies
+- **Hardware**: NVIDIA (CUDA + FlashInfer) + Apple Metal. **No Ascend, no AMD, no TPU.** Single-node only; authors flag cluster scheduling as future work.
+- **Maturity**: Pre-release research prototype, Apache-2.0, v0.2.5. SOSP 2025 artifacts-evaluated (functional, available, reproducible). ~147 GitHub stars as of 2026-04-21.
+
+**Relation to our thesis**: **extends, does not reinforce.** Pie attacks a **different boundary** than we do — the *application↔serving-system* boundary, not the *framework↔engine↔ops↔kernel↔compiler* stack. Pie's contribution is a programming model (Wasm-sandboxed inferlets + 42-call API) that lets application code directly drive KV cache policy, decoding strategy, and tool/IO integration, replacing global serving policies with per-request ones. Our contribution is the opposite end: collapsing the *internal* layers of the stack via cross-dialect agent edits, so a single PM+swarm can move a workload across Rust/C++/aclnn/AscendC in one session. Both dissolve rigid abstractions, but Pie exposes a richer boundary *upward* to the user; we dissolve boundaries *downward* through the vendor stack. The two are composable: a future Pie-Ascend backend could sit on top of our native `CpCannEngine`, and our agent-swarm playbook could drive inferlet-authoring for agentic workloads on 910B4.
+
+**Honest caveats**:
+- Pie is **not an agentic-coding proof point** — it's a hand-authored Yale systems research project with `AGENTS.md` / `.agent/skills/pie/SKILL.md` *contributor runbooks* that assume Claude Code-style agents are working on the codebase. That's downstream-of-agents, not generated-by-agents.
+- Pie's 1.3–3.4× on agentic workloads is **measured against vLLM on L40 with Llama 3.2 1B**; our 32× is measured against llama.cpp+ggml-cann on Ascend 910B4 with Qwen3-TTS. Different denominators, different workloads — do not compose the multipliers.
+- Pie targets NVIDIA/Apple; they don't yet see the CANN surface area we've been mining.
+
+**What we should re-check in our own thesis after reading Pie**:
+1. Slide 2's layered-stack diagram currently stops at "framework (PyTorch)". Pie argues there's **another layer above** — *application-defined generation logic* — that is also locked behind a boundary, and the lock is also paid for in perf (1.1–2.4× latency). Our deck under-counts that layer.
+2. Slide 8 (scale trajectory) talks about cluster hardware scaling. Pie's agentic-workflow numbers suggest **workload-shape scaling is a parallel axis**: the same single card runs 3× more throughput if the application-layer abstraction cracks open. A co-design deck should probably argue for both axes together.
+3. Our "agent swarm crosses 5 layers in one session" frame is **syntactic boundary crossing** (edit Rust + C++ + aclnn + AscendC in one dispatch). Pie's frame is **semantic boundary crossing** (KV-cache reuse patterns that only the application knows are safe). Both are real, both compose; future OminiX work on tree-of-thought / speculative decoding on Ascend should borrow Pie's inferlet API shape as an input — not reinvent the vocabulary.
+
+**Citations**: Gim et al., *Pie: A Programmable Serving System for Emerging LLM Applications*, SOSP '25 (DOI 10.1145/3731569.3764814). Gim & Zhong, *Serve Programs, Not Prompts*, HoTOS '25 (DOI 10.1145/3713082.3730398). Repo: `github.com/pie-project/pie`. Standalone brief: `docs/pie_project_brief.md`.
