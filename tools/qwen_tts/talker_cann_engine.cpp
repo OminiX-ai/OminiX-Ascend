@@ -160,8 +160,15 @@ aclTensor *tensor_strided(void *buf, int64_t rank,
     return make_tensor(buf, rank, shape, strides, dtype);
 }
 
-// Pull tensor data out of a GGUF as float (handles F32 and F16 sources).
+// Pull tensor data out of a GGUF as float. Handles F32, F16, and any
+// block-quantized type (Q8_0, Q4_K, ...) via ggml's dequantization traits.
 // Returns empty vector on failure.
+//
+// A4: Q8_0 support. GGUF Q8_0 stores weights as 32-element blocks of INT8 +
+// one F16 scale per block. Dequantizing to F32 on host lets the existing
+// F16 upload and W8 per-channel calibration paths work unchanged — 1-2 ULP
+// of re-quant loss vs. the preferred per-group (antiquantGroupSize=32) path,
+// but keeps the patch surface minimal and WER-safe on canonical clips.
 std::vector<float> load_gguf_tensor_f32(ggml_context *ggml_ctx,
                                          const char *name,
                                          size_t expected_elems) {
@@ -184,9 +191,16 @@ std::vector<float> load_gguf_tensor_f32(ggml_context *ggml_ctx,
         const ggml_fp16_t *src = (const ggml_fp16_t *)t->data;
         for (size_t i = 0; i < n; ++i) out[i] = ggml_fp16_to_fp32(src[i]);
     } else {
-        fprintf(stderr, "[talker_cann] %s: unsupported dtype %d\n",
-                name, (int)t->type);
-        return {};
+        // Quantized block formats (Q8_0, Q4_K, ...). Use ggml's type traits
+        // dequantizer — same code llama.cpp's CPU backend uses, so the
+        // decoded values are bit-exact vs. the reference implementation.
+        const struct ggml_type_traits *tr = ggml_get_type_traits(t->type);
+        if (!tr || !tr->to_float) {
+            fprintf(stderr, "[talker_cann] %s: unsupported dtype %d "
+                    "(no to_float trait)\n", name, (int)t->type);
+            return {};
+        }
+        tr->to_float(t->data, out.data(), (int64_t)n);
     }
     return out;
 }

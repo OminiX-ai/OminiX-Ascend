@@ -150,6 +150,8 @@ bool AsrTextDecoderCannEngine::load_embedding_and_lm_head_(const std::string &gg
     }
 
     // Host-side F32 table (reused for per-token embedding lookup).
+    // A4: Q8_0 (and any block-quant format) is dequantized via ggml's type
+    // traits — matches llama.cpp's CPU dequantize path bit-for-bit.
     tok_embd_host_.resize(expected);
     if (t->type == GGML_TYPE_F32) {
         std::memcpy(tok_embd_host_.data(), t->data, expected * sizeof(float));
@@ -158,10 +160,15 @@ bool AsrTextDecoderCannEngine::load_embedding_and_lm_head_(const std::string &gg
         for (size_t i = 0; i < expected; ++i)
             tok_embd_host_[i] = ggml_fp16_to_fp32(src[i]);
     } else {
-        fprintf(stderr, "[asr_native] token_embd.weight unsupported type %d\n",
-                (int)t->type);
-        gguf_free(gg); ggml_free(ctx);
-        return false;
+        const struct ggml_type_traits *tr = ggml_get_type_traits(t->type);
+        if (!tr || !tr->to_float) {
+            fprintf(stderr,
+                    "[asr_native] token_embd.weight unsupported type %d "
+                    "(no to_float trait)\n", (int)t->type);
+            gguf_free(gg); ggml_free(ctx);
+            return false;
+        }
+        tr->to_float(t->data, tok_embd_host_.data(), (int64_t)expected);
     }
 
     // Upload as F16 lm_head weight [vocab, n_embd].
