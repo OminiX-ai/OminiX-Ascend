@@ -9,6 +9,7 @@ v3 polish (2026-04-21): sharpened baseline-noise honesty on Slide 9 (A.1 +0.3 an
 v3.1 (2026-04-21): pie-project appendix + Slide 2/6/8/10 Pie-integration edits removed per PM directive; reverted to 5-layer stack and single hardware-scaling axis.
 v3.2 (2026-04-21): added Slide 7b (MLX vs Ascend as AI-coding targets — answers "why 9 MLX crates vs ~32 fps Ascend in same calendar window?" via DX-gap framing, not hardware-gap); added Appendix C (Qwen-Image-Edit-2512 forward-look — structurally-ported via tools/ominix_diffusion, not-yet-optimized, demonstrates playbook applies beyond autoregressive token gen to diffusion image/video); Appendix A artefact list adds tools/ominix_diffusion/ reference. Cross-references to Slide 3/9 stable; no existing numbering changed.
 v3.3 (2026-04-21): Slide 7b "what closes the gap" gains CannFusion-as-CUTLASS-analogue subsection (aspirational, v0.2.5 pre-release, unblocked when upstream ships A16W8 — we filed GitCode #26, maintainer decomposed into #27-30); added Slide 9.5 "10 orchestration modes" between Slide 9 and Slide 10 (probe-first, parallel dispatch, gate-stop, patch-file review, contract-per-track, kill-cleanly, scaffold-probe, projection discount, noise-band characterization, frame-count identity gate — each with a project-receipt citation). Slide 9 closing bullet cross-references Slide 9.5. Main slide numbering preserved (Slide 7b, 9.5 suffix pattern).
+v3.4 (2026-04-21): added Slide 5.5 architecture map with mermaid flowchart + optimization heat-map table; no renumbering
 -->
 
 ---
@@ -89,6 +90,129 @@ v3.3 (2026-04-21): Slide 7b "what closes the gap" gains CannFusion-as-CUTLASS-an
 
 ---
 
+## Slide 5.5 — Architecture Map
+
+**Title**: "Architecture map: where every optimization landed."
+
+**Framing**: one visual slide anchoring the Qwen3-TTS inference pipeline and showing exactly where each landed / closed / pending track plugs in. This is the shared reference for Slide 3 (W1), Slide 4 (FO-audit), Slide 5 (Path C + Talker scaffold), and the composing-effect claim in Slide 6.
+
+- Pipeline: **text + ref** → encoder → **Talker 28-layer LLM** (group 0 token) → **CP 5-layer × 15-group autoregressive loop** (groups 1-14) → codec decoder → 24 kHz audio
+- **CP is the optimization target** — dominates generate wall (1732 ms stock), 80-op aclnn chain runs 15× per frame × N frames
+- **7 landed tracks** colocated on CP (W1, W3b, G2, A.1, M3N plus baseline native port)
+- **5 closed tracks** attempted further fusion inside CP (Path C, FFNV3, V2 RoPE, M3 group-collapse, Talker scaffold)
+- **2 pending / parked tracks** remain (M2 Talker aclGraph, W4 quant, CannFusion A16W8 upstream)
+
+**Diagram 1: top-level pipeline**
+
+```mermaid
+flowchart TB
+    classDef landed fill:#c8e6c9,stroke:#2e7d32,color:#000
+    classDef closed fill:#ffcdd2,stroke:#b71c1c,color:#000
+    classDef pending fill:#fff9c4,stroke:#f57f17,color:#000
+    classDef stock fill:#eceff1,stroke:#607d8b,color:#000
+
+    TXT["Text prompt"]
+    REF["Ref audio (xvec / ICL / CV)"]
+    ENC["Text Encoder"]
+    HID["hidden_states prefill"]
+    LOOP["Codec Frame Loop (N frames)"]
+
+    subgraph FRAME["Per frame"]
+        direction TB
+        TALK["Talker LLM 28 layers<br/>group 0 token"]
+        EMB["lookup codec_embeddings g-1"]
+        CPLOOP["CP forward loop<br/>g=1..14, 5 transformer layers"]
+        LMH["CP lm_head<br/>15 groups x Mm"]
+        TOK["15 codebook tokens"]
+        TALK --> EMB --> CPLOOP --> LMH --> TOK
+    end
+
+    DEC["Codec Decoder / VAE"]
+    AUD["24 kHz audio output"]
+
+    TXT --> ENC
+    REF --> ENC
+    ENC --> HID --> LOOP --> FRAME
+    FRAME --> DEC --> AUD
+
+    class TALK pending
+    class CPLOOP landed
+    class LMH landed
+    class TXT,REF,ENC,HID,LOOP,EMB,TOK,DEC,AUD stock
+
+    TALK -. "M2 Talker aclGraph PENDING +0.4-0.8 fps" .-> TALK
+    TALK -. "Talker scaffold CLOSED (30 to 18 fps)" .-> TALK
+    CPLOOP -. "G2 aclGraph LANDED +1.15 fps" .-> CPLOOP
+    CPLOOP -. "M3N pos 0+1 batch LANDED +0.3 fps" .-> CPLOOP
+    CPLOOP -. "M3 group-collapse CLOSED (RVQ strict)" .-> CPLOOP
+    LMH -. "W1 NPU port LANDED +8.3 fps" .-> LMH
+```
+
+**Diagram 2: zoom — CP layer internals, optimization heat map**
+
+```mermaid
+flowchart TB
+    classDef landed fill:#c8e6c9,stroke:#2e7d32,color:#000
+    classDef closed fill:#ffcdd2,stroke:#b71c1c,color:#000
+    classDef pending fill:#fff9c4,stroke:#f57f17,color:#000
+    classDef stock fill:#eceff1,stroke:#607d8b,color:#000
+
+    IN["input / residual from prev layer"]
+    QKV["QKV W8 matmul<br/>3 separate aclnnMm"]
+    QKN["q_norm / k_norm RmsNorm"]
+    ROPE["RoPE apply Q + K<br/>2 separate calls"]
+    ATTN["FIAv2 attention<br/>vendor-tuned"]
+    OPR["O-proj W8 matmul"]
+    TAIL1["Add + RmsNorm<br/>post-attn tail"]
+    FFN["Gate W8 + Up W8<br/>SiLU + mul + Down W8"]
+    TAIL2["Add + RmsNorm<br/>post-FFN tail"]
+    OUT["to next layer / lm_head"]
+
+    IN --> QKV --> QKN --> ROPE --> ATTN --> OPR --> TAIL1 --> FFN --> TAIL2 --> OUT
+
+    class ATTN stock
+    class IN,QKN,OUT stock
+    class QKV pending
+    class ROPE closed
+    class TAIL1 landed
+    class TAIL2 landed
+    class FFN closed
+    class OPR stock
+
+    QKV -. "FO-audit no fused QKV in CANN 8.3 PENDING" .-> QKV
+    ROPE -. "A.2 V2 RoPE CLOSED (GQA packed-UB incompat)" .-> ROPE
+    TAIL1 -. "W3b AddRmsNorm LANDED +0.66 fps" .-> TAIL1
+    TAIL1 -. "A.1 Inplace LANDED +0.3 fps" .-> TAIL1
+    TAIL2 -. "W3b + A.1 same fusion" .-> TAIL2
+    FFN -. "Path C W4.1 attn-fusion CLOSED (1949 drift)" .-> FFN
+    FFN -. "M1.B FFNV3 CLOSED (non-MoE rejected)" .-> FFN
+    FFN -. "CannFusion FFN Mm+epilogue PARKED (A16W8 upstream)" .-> FFN
+    OPR -. "W4 quant PENDING all W8 matmuls +2-5 fps" .-> OPR
+```
+
+**Legend**: green = LANDED, red = CLOSED, yellow = PENDING / PARKED, grey = stock (untouched).
+
+**Optimization heat map** (speaker reference):
+
+| # | Track | Targeted node | Status | Δ fps |
+|---|---|---|---|---|
+| 1 | W1 NPU lm_head | CP lm_head (after forward) | LANDED | +8.3 |
+| 2 | W3b AddRmsNorm | CP per-layer tails | LANDED | +0.66 |
+| 3 | G2 aclGraph | CP forward_one_token | LANDED | +1.15 |
+| 4 | A.1 InplaceAddRmsNorm | CP per-layer tails | LANDED | +0.3 (noise) |
+| 5 | M3N pos 0+1 batch | CP positions 0+1 prefill | LANDED | +0.3 (noise) |
+| 6 | M3 group-collapse | 15-group autoregressive loop | CLOSED | RVQ strict |
+| 7 | Path C W4.1 attn | CP attn sublayer | CLOSED | 1949 drift |
+| 8 | M1.B FFNV3 | CP FFN sublayer | CLOSED | non-MoE rejected |
+| 9 | A.2 V2 RoPE | CP RoPE Q+K | CLOSED | GQA packed-UB |
+| 10 | CannFusion | CP FFN Mm+epilogue | PARKED | A16W8 upstream |
+| 11 | M2 Talker aclGraph | Talker 28-layer forward | PENDING | +0.4-0.8 proj |
+| 12 | W4 quant | All W8 matmuls | PENDING | +2-5 (risky) |
+
+**Speaker notes**: Three dense stages — Talker 2024 ms, CP 1732 ms (biggest slice), codec decode (vocoder, separate story). CP is the target: 80-op aclnn chain runs 15× per frame × N frames — max amortisation surface. Walk the green nodes. W1 sits *between* CP forwards, not inside the layer — that's why it's +8.3 standalone: CPU-to-NPU migration of a 9.72 ms/frame cost, not an aclnn-chain optimisation. W3b and A.1 hit the same per-layer tails at different granularities; they compose because inplace bypasses a memcpy AddRmsNorm alone still pays. G2 captures the entire `forward_one_token_launch`, and the captured graph already contains W3b + A.1's fused nodes — aclGraph amortises dispatch *after* fusion collapses ops. M3N batches positions 0+1 at frame start — different axis from G2 (G2 amortises per-dispatch launch; M3N amortises prefill). Red nodes: every CLOSED track aimed further inside the CP layer, each failed for a **different** reason — Path C was 1949 drift, FFNV3 non-MoE runtime rejection, V2 RoPE GQA packed-UB, M3 RVQ strict dep. That variety validates probe-first: no single root cause to plan around. M2 Talker aclGraph and W4 quant are the two remaining structural levers; everything else hit a wall, cleanly.
+
+---
+
 ## Slide 6 — Beyond-Boundary Co-Design (aclGraph + W3b + lm_head)
 
 **Title**: "Three optimisations, one op chain, composed."
@@ -100,7 +224,7 @@ v3.3 (2026-04-21): Slide 7b "what closes the gap" gains CannFusion-as-CUTLASS-an
 - No conventional team would have shipped these as a single coherent plan in one quarter
 - Cumulative clean-quality result from first native engine: **22 fps → ~32 fps band**, user-ear verified (full arc from llama.cpp ~1 fps baseline = **~32× lift**, tag `32fps-landed`)
 
-**Speaker notes**: This slide shows the compounding effect. The CP engine's `forward_one_token_launch` is an 80-op aclnn chain. An agent with the end-to-end mental model sees three non-competing optimisations on the same chain: port lm_head CPU → NPU (W1), fuse the per-sublayer Add+RmsNorm tail (W3b), capture the whole thing as an aclGraph and replay per pos-key (G2). Conventional team dynamics would ship one per quarter, because each is owned by a different abstraction layer — dispatch, ops API, runtime. The agent composed them in one week. Gotcha: we projected +6 to +10 fps for aclGraph in the G0 feasibility probe; reality was +1.15 because `TASK_QUEUE_ENABLE=2` already amortized most launch overhead (the agent over-estimated the ceiling — see Slide 9 meta-pattern). The honest +1.15 fps on top of W1's +8.3 and W3b's +0.66 was user-ear verified at 31.6 fps with byte-identical parity on canonical xvec / ICL / CV benchmarks (G3.1: max_drift = 0 over 1680 tokens, output WAV md5 matches stock). That's the beyond-boundary co-design dividend.
+**Speaker notes**: This slide shows the compounding effect — see Slide 5.5 diagram for the architecture map where every track in this deck lands. The CP engine's `forward_one_token_launch` is an 80-op aclnn chain. An agent with the end-to-end mental model sees three non-competing optimisations on the same chain: port lm_head CPU → NPU (W1), fuse the per-sublayer Add+RmsNorm tail (W3b), capture the whole thing as an aclGraph and replay per pos-key (G2). Conventional team dynamics would ship one per quarter, because each is owned by a different abstraction layer — dispatch, ops API, runtime. The agent composed them in one week. Gotcha: we projected +6 to +10 fps for aclGraph in the G0 feasibility probe; reality was +1.15 because `TASK_QUEUE_ENABLE=2` already amortized most launch overhead (the agent over-estimated the ceiling — see Slide 9 meta-pattern). The honest +1.15 fps on top of W1's +8.3 and W3b's +0.66 was user-ear verified at 31.6 fps with byte-identical parity on canonical xvec / ICL / CV benchmarks (G3.1: max_drift = 0 over 1680 tokens, output WAV md5 matches stock). That's the beyond-boundary co-design dividend.
 
 ---
 
