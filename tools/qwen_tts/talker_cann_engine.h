@@ -400,6 +400,98 @@ private:
     bool use_w8_weights_ = false;
     bool w8_applied_     = false;
 
+    // ---- A4c Phase 1: aclnnGroupedMatmulV3 fused Q/K/V (TALKER_W8_GMM_QKV) --
+    // Direct transfer of the CP-path GMM-wire landing (commit 9d52177) to the
+    // Talker/ASR prefill block. When TALKER_W8_GMM_QKV=1 AND w8_applied_ AND
+    // g_cann.has_grouped_matmul_v3(), the three per-layer prefill QKV
+    // w8_matmul_ calls collapse into a single aclnnGroupedMatmulV3 dispatch
+    // with three groups sharing the same activation view. See the CP-side
+    // probe verdict (docs/qkv_grouped_probe_verdict.md, GREEN) for the
+    // runtime configuration (groupType=-1, splitItem=0, antiquantScale F16
+    // list, shared zero-F16 antiquantOffset list).
+    //
+    // Numerical footprint: 1-2 F16 ulp vs the 3-call reference (~1.7e-3
+    // relative). This is NOT bit-exact with A4b's per-projection path.
+    // Parity gate for A4c Phase 1 is ASR Tier-1 CER=0 (clip-level output
+    // identity), not per-layer tensor parity. Flag default OFF so
+    // TALKER_W8_QUANT=1 alone stays byte-identical to A4b.
+    //
+    // The shared zero-F16 antiquantOffset buffer is allocated once at init
+    // with length q_dim_ (= max of Nq/Nk/Nv). K/V groups wrap prefix views.
+    // Trivial memory cost (~4 KiB).
+    bool gmm_qkv_enabled_ = false;
+    bool gmm_qkv_applied_ = false;
+    void *antiquant_zero_offset_dev_ = nullptr;  // F16 [q_dim_] zero buffer
+
+    // ---- A4c Phase 2: batched RoPE (TALKER_W8_ROPE_BATCHED) ----------------
+    // Replaces the two per-row aclnnRotaryPositionEmbedding loops in
+    // forward_prefill with a single aclnnApplyRotaryPosEmbV2 dispatch
+    // across [1, seq_len, N, head_dim]. Q rotates in-place into
+    // attn_out_batch_dev_ (pre-staged via d2d from q_batch_dev_); K rotates
+    // in-place into the KV cache slot (pre-staged from k_batch_dev_).
+    //
+    // Numerical footprint: ~1 F16 ulp (max_abs 4.88e-4) vs the two-call
+    // NEOX reference on 16Q/8KV (see test_rope_v2_reopen.cpp probe).
+    // Parity gate: ASR Tier-1 CER=0 (clip-level).
+    //
+    // Flag defaults OFF so TALKER_W8_QUANT=1 alone stays byte-identical
+    // to A4b + A4c Phase 1. The applied_ bit also AND-s w8_applied_ and
+    // has_rope_v2() to keep the new branch off the F16 lane and off
+    // toolkits without the V2 op.
+    bool rope_batched_enabled_ = false;
+    bool rope_batched_applied_ = false;
+
+    // ---- A4c Phase 3: batched FIAS (TALKER_W8_FIAS_BATCHED) ----------------
+    // Replaces the per-row aclnnFusedInferAttentionScoreV2 loop (seq_len
+    // calls at S_q=1 each) with a single dispatch at S_q=seq_len, using a
+    // user-supplied F16 causal pseShift of shape
+    // [1, 1, seq_len, seq_len_total] broadcast across heads via stride[1]=0.
+    // Mask values: 0x0000 (kept) where Q_i abs-pos q_abs = start_pos + i
+    // has j <= q_abs; 0xFC00 (F16 -INF) elsewhere. Matches the Qwen2
+    // ggml-cann pseShift convention (aclnn_ops.cpp line 4370).
+    //
+    // Risk: batched FIAS with S_q>1 on GQA 16/8 previously produced
+    // cos-sim 0.28 vs iterative — see contract §4 and in-file comment
+    // "batched RoPE on [1, S, N, D] mis-rotates for S>1". Phase 3 re-tries
+    // under innerPrecise=2 + explicit pseShift (vs the old attempt's
+    // {sparseMode=0, nextTokens=0} / {sparseMode=1, nextTokens=65535}).
+    // fia_v34_probe_verdict.md re-validated FIAS V2 at S_q=1 (2026-04-21);
+    // parity under S_q>1 on our exact prod shape is what Phase 3's ac03
+    // sweep settles.
+    //
+    // Flag defaults OFF so TALKER_W8_QUANT=1 alone stays byte-identical.
+    // applied_ AND-s w8_applied_.
+    bool fias_batched_enabled_ = false;
+    bool fias_batched_applied_ = false;
+
+    // ---- A4c Phase 4: prefill aclGraph pre-record (TALKER_W8_PREFILL_ACLGRAPH)
+    // Capture-once / replay-many cache, keyed on prefill-chunk seq_len
+    // bucketed at `prefill_bucket_size_` (default 64) up through
+    // MAX_PREFILL. One slot per bucket in `prefill_graphs_`; null entries
+    // are uncaptured. Initial implementation: replay fires only when
+    // start_pos == 0 AND seq_len matches a bucket exactly (no padding).
+    // A follow-up ("Phase 4b") can add input padding to round arbitrary
+    // seq_lens up to the nearest bucket; that path needs careful
+    // handling of the RmsNorm over pad rows (zero in → zero out, which
+    // is safe, but the FFN + add chain sees extra rows so perf cost
+    // scales with bucket_len regardless of actual seq_len).
+    //
+    // Requires: fias_batched_applied_ + has_aclgraph() + w8_applied_. The
+    // per-row FIAS loop's per-row `kv_len` strides are not capturable as
+    // a single graph, so Phase 4 requires Phase 3.
+    //
+    // Parity gate: ASR Tier-1 CER=0 on BOTH cold (first-call capture) AND
+    // warm (replay) runs.
+    //
+    // Memory budget: ~100 MiB/graph × ≤ 8 buckets (64-granularity up to
+    // 512) ≈ 800 MiB. Within the 2 GiB budget called out in the A4c
+    // workplan.
+    bool prefill_aclgraph_enabled_ = false;
+    bool prefill_aclgraph_applied_ = false;
+    int  prefill_bucket_size_ = 64;            // tokens per bucket step
+    std::vector<int>       prefill_buckets_;   // seq_len values per slot
+    std::vector<aclmdlRI>  prefill_graphs_;    // captured graphs (null = uncaptured)
+
     // ---- Internal helpers ----
     void alloc_dev_(void **ptr, size_t bytes);
     void ensure_workspace_(size_t needed);
@@ -435,6 +527,29 @@ private:
     // Prefers V3 when available, falls back to V2.
     void w8_matmul_(const aclTensor *x, void *weight_dev, void *scale_dev,
                      int64_t out_n, int64_t in_k, const aclTensor *y);
+
+    // A4c Phase 1: fused Q/K/V GEMM via aclnnGroupedMatmulV3 for the prefill
+    // attention sublayer. Replaces the three sequential w8_matmul_ calls at
+    // the attention-sublayer entry with one grouped dispatch.
+    //
+    // Preconditions (caller's responsibility):
+    //   * gmm_qkv_applied_ == true
+    //   * antiquant_zero_offset_dev_ != nullptr
+    //   * layer_w_[il].{q,k,v}_proj_{w_i8,scale} populated (w8_applied_)
+    //
+    // Parameters:
+    //   * x_dev       F16 [seq_len, n_embd_] device activation (row-major).
+    //   * seq_len     M dimension (rows of x_dev / q_out / k_out / v_out).
+    //   * il          Layer index into layer_w_.
+    //   * q_out_dev   F16 [seq_len, q_dim_]  Q destination.
+    //   * k_out_dev   F16 [seq_len, kv_dim_] K destination.
+    //   * v_out_dev   F16 [seq_len, kv_dim_] V destination.
+    //
+    // Takes device pointers (not aclTensor handles) because
+    // aclDestroyTensorList consumes its contents; fresh views must be built
+    // internally per dispatch (see CP commit 9d52177's gmm_qkv_ helper).
+    void gmm_qkv_prefill_(void *x_dev, int64_t seq_len, int64_t il,
+                           void *q_out_dev, void *k_out_dev, void *v_out_dev);
 
     // Core decode kernel sequence — what used to be the body of forward_decode
     // between the input-upload/cast and the final-output readback. Broken out

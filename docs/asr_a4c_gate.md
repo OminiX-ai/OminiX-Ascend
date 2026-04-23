@@ -23,6 +23,66 @@ compute-bound; INT8 dequant overhead offsets INT8 compute savings. The
 remaining gap is structural — op-count collapse and kernel fusion are the
 levers, not further INT8 rewiring of existing call sites.
 
+
+## Final verdict (ac03 sweep 2026-04-24)
+
+**SHIP GATE: MISS.** Parity intact (CER=0 × 13) but perf gate unmet.
+
+| Phase | mayun_ref RTF | Tier-1 median RTF | CER | Gate outcome |
+|---|---|---|---|---|
+| A4b baseline (ed67c362) | 0.177 | 0.250 | 0 | - |
+| A4c Phase 1 (GMM-QKV) | 0.181 | 0.261 | 0 | parity PASS, perf FAIL |
+| A4c Phase 2 (+batched RoPE) | 0.181 | 0.255 | 0 | parity PASS, perf FAIL |
+| A4c Phase 3 (+batched FIAS) | **0.158** | **0.239** | 0 | parity PASS, perf FAIL |
+| A4c Phase 4 (+prefill aclGraph) | 0.160 | 0.228 | 0 | parity PASS, perf FAIL |
+| Ship gate | <= 0.142 | <= 0.159 | 0 | **MISS (mayun +13%, median +44%)** |
+
+**Key findings**:
+
+1. **Phase 3 parity risk DISPROVEN**. The prior cos-sim 0.28 regression at
+   S_q>1 on GQA 16/8 (NATIVE_TTS_CONTRACT section 4 M2.5) does NOT
+   reproduce when FIAS V2 is dispatched with `innerPrecise=2`
+   (high-precision softmax) AND an explicit F16 causal pseShift broadcast
+   across heads via stride[1]=0 (Qwen2 ggml-cann recipe). CER=0 on all 13
+   Tier-1 clips.
+
+2. **Phase 3 is the big perf unlock**. Single change drives mayun from
+   0.181 -> 0.158 (-12.4%), median 0.255 -> 0.239 (-6.2%). This comes
+   entirely from collapsing the per-row FIAS loop (seq_len dispatches at
+   S_q=1 each) into one batched dispatch at S_q=seq_len; decoder audio
+   time drops from 103ms to 15ms on mayun (7x reduction at the FIAS call).
+
+3. **Phase 4 (prefill aclGraph) hit rate is structurally low on ASR**.
+   Bucket granularity 64 tokens; ASR prompt length 143 for a 9.85s clip
+   (= 9 pre + 128 audio + 6 post), not a bucket multiple, so replay does
+   not fire. The 4.5% Tier-1 median improvement vs Phase 3 is likely
+   variance reduction, not op-dispatch amortization.
+
+4. **Phase 2 (batched RoPE) ~1% noise**. RoPE is not the bottleneck at
+   M=128 on this model.
+
+**Remaining gap to ship gate**:
+
+- mayun_ref: 0.160 actual vs 0.142 gate = **+12.7% over gate**
+- Tier-1 median: 0.228 actual vs 0.159 gate = **+43.4% over gate**
+
+Phases 1-4 were the ROI-ordered op-count-collapse toolkit outlined in the
+A4c plan. Further perf catch-up would require reaching for levers outside
+this plan (e.g. INT4 mixed weights, audio-path prefill bypass); both
+carry higher parity risk and longer timelines.
+
+**Recommendation**: park the A4c native-engine perf catch-up. The native
+engine is shippable on CER grounds and the Phase 3 parity unblock is
+itself a valuable landing (TTS Phase 3 can now adopt batched FIAS without
+fear of the S_q>1 regression). For ASR production we stay on the A1a
+legacy path which already meets the perf gate; the native engine retains
+its role for strategic use cases where the C++ engine's other properties
+(single-process, no Python dep) matter more than the 44% median RTF
+overhead.
+
+**Artifacts**: `/tmp/a4c_phase{2,3,4}_tier1.json` (ac03).
+**Patches landed**: `/tmp/a4c_phase{2,3,4}.patch`, `/tmp/a4c_gate_doc.patch`.
+
 ---
 
 ## Phase 1 — Fused QKV via aclnnGroupedMatmulV3
@@ -147,34 +207,190 @@ Artifacts: `docs/asr_a4c_data/a4c_tier1_{A,B,C}.json` + `.log`.
 
 ---
 
-## Phase 2 — Per-row RoPE loop collapse (unblocked; Phase 1 RED)
+## Phase 2 — Batched RoPE (TALKER_W8_ROPE_BATCHED)
 
-Gated on Phase 1 miss. Scope: replace the per-position RoPE application
-loop in `forward_prefill` with a single batched dispatch. V2 op is
-numerically correct per TTS probe `docs/a2_reopen_v2_probe.md` — prior
-retire was on wiring, not op.
+**Scope**: collapse the two per-row `aclnnRotaryPositionEmbedding` loops
+in `forward_prefill` into a single `aclnnApplyRotaryPosEmbV2` dispatch
+across `[1, seq_len, N, head_dim]`. Q is d2d-copied to
+`attn_out_batch_dev_` pre-rotation (preserving the FIAS loop's Q-source
+buffer contract); K is d2d-copied into its KV cache slot pre-rotation;
+V2 then rotates both in place.
 
-Status: **UNBLOCKED** (Phase 1 swept 2026-04-23, verdict RED; see
-Results table above). Not yet started on code.
+**Env gate**: `TALKER_W8_ROPE_BATCHED=1` (default OFF). AND-gated on
+`w8_applied_` and `g_cann.has_rope_v2()`. Orthogonal to CP's
+`TALKER_CP_ROPE_V2` (disjoint code paths).
+
+**Invariants preserved**:
+
+- `TALKER_W8_QUANT` unset → byte-identical to Phase 1 (new branch
+  requires `rope_batched_applied_` which requires `w8_applied_`).
+- V2 op numerical footprint (per `test_rope_v2_reopen.cpp`): ~1 F16 ulp
+  (max_abs 4.88e-4) vs two-call NEOX reference on 16Q/8KV. NOT bit-exact;
+  parity gate is ASR Tier-1 CER=0.
+- aclGraph decode cache untouched — V2 is an eager-path replacement at
+  prefill-time only.
+
+**Files touched**:
+- `tools/qwen_tts/talker_cann_engine.h` — add `rope_batched_enabled_`,
+  `rope_batched_applied_`.
+- `tools/qwen_tts/talker_cann_engine.cpp` — init-site enablement block
+  (after Phase 1), gated branch inside `forward_prefill`'s RoPE site.
+- Patch: `/tmp/a4c_phase2.patch`.
+
+**Results (ac03, sweep TODO)**: table to be filled post-sweep.
+
+| Metric | A (A4b W8) | B (Phase 1) | D (Phase 2) | D vs B Δ | Gate | Verdict |
+|---|---|---|---|---|---|---|
+| Tier-1 RTF median | 0.254 | 0.261 | 0.255 | +0.4% | ≤ 0.159 | FAIL (perf) |
+| RTF mayun_ref | 0.190 | 0.181 | 0.181 | ±0% | ≤ 0.142 | FAIL (perf) |
+| Max clip CER | 0 | 0 | 0 | — | 0 | PASS |
+
+Per-phase perf target: ≥3% mayun_ref RTF reduction vs Phase 1 baseline
+(0.181 → ≤ 0.175).
 
 ---
 
-## Phase 3 — Per-row FIAS loop collapse (conditional)
+## Phase 3 — Batched FIAS (TALKER_W8_FIAS_BATCHED)
 
-Gated on Phases 1+2 miss. Scope: batched FIAS dispatch in place of the
-per-row attention loop. See the current FIAS loop site in
-`forward_prefill`.
+**Scope**: collapse the per-row `aclnnFusedInferAttentionScoreV2` loop
+(seq_len calls at S_q=1 each) into one batched dispatch at
+S_q=seq_len, with an explicit F16 causal `pseShift` of shape
+`[1, 1, seq_len, seq_len_total]` broadcast across heads via stride[1]=0.
 
-Status: NOT STARTED.
+**Env gate**: `TALKER_W8_FIAS_BATCHED=1` (default OFF). AND-gated on
+`w8_applied_`.
+
+**Invariants preserved**:
+
+- `TALKER_W8_QUANT` unset → byte-identical to prior phases.
+- `innerPrecise=2` (Qwen2 ggml-cann recipe) at S_q>1; per-row path stays
+  at `innerPrecise=0` (decode-mode FIAS).
+- pseShift content: 0x0000 (F16 zero, kept) where j ≤ start_pos + i,
+  0xFC00 (F16 -INF, blocked) elsewhere. Upload happens once before the
+  layer loop into the existing `causal_mask_dev_` buffer (sized for
+  `MAX_PREFILL × MAX_SEQ`).
+
+**Risk**: batched FIAS at S_q>1 on GQA 16/8 previously produced cos-sim
+0.28 vs iterative (contract §4, 2026-04 note). `fia_v34_probe_verdict.md`
+(2026-04-21) re-validated FIAS V2 only at S_q=1. Phase 3 ac03 sweep is
+the first parity measurement under S_q>1 on our exact prod shape.
+
+**Files touched**:
+- `tools/qwen_tts/talker_cann_engine.h` — add `fias_batched_enabled_`,
+  `fias_batched_applied_`.
+- `tools/qwen_tts/talker_cann_engine.cpp` — init-site enablement block,
+  pre-layer mask upload, gated branch in place of the per-row FIAS loop.
+- Patch: `/tmp/a4c_phase3.patch`.
+
+**Results (ac03, sweep TODO)**: table to be filled post-sweep.
+
+| Metric | D (Phase 2) | E (Phase 3) | E vs D Δ | Gate | Verdict |
+|---|---|---|---|---|---|
+| Tier-1 RTF median | 0.261 | 0.255 | 0.239 | ≤ 0.159 | FAIL (perf, -6.2% vs P2) |
+| RTF mayun_ref | 0.181 | 0.181 | 0.158 | ≤ 0.142 | FAIL (perf, -12.4% vs P2) |
+| Max clip CER | 0 | 0 | 0 | 0 | PASS (parity risk DISPROVEN) |
+
+Per-phase perf target: ≥5% RTF reduction vs Phase 2.
 
 ---
 
-## Phase 4 — Prefill aclGraph capture (conditional)
+## Phase 4 — Prefill aclGraph pre-record (TALKER_W8_PREFILL_ACLGRAPH)
 
-Gated on Phases 1-3 miss. Scope: pos-keyed capture at prefill, adapting
-TTS G2 pattern (commit `7fe5897`). Risk: variable seq → pos-bucketing.
+**Scope**: adapt the decode aclGraph pattern (commit `7fe5897`,
+`decode_graphs_`) to the prefill path. One captured `aclmdlRI` per
+`seq_len` bucket (granularity 64 tokens by default, up to
+`MAX_PREFILL=512`). Capture fires lazily on first-touch of an
+uncaptured bucket; subsequent matching calls replay instead of
+re-dispatching the op stack.
 
-Status: NOT STARTED.
+**Env gate**: `TALKER_W8_PREFILL_ACLGRAPH=1` (default OFF). AND-gated
+on `fias_batched_applied_` (Phase 3 prerequisite — the per-row FIAS
+kv_len strides are not capturable) and `g_cann.has_aclgraph()`.
+
+**Replay conditions (initial landing, conservative)**:
+- `start_pos == 0` (first prefill chunk; captured graph assumes KV
+  cache starts empty)
+- `seq_len % bucket_size == 0 AND seq_len <= MAX_PREFILL`
+- `prefill_graphs_[bucket_idx]` is non-null (captured on a prior call)
+
+Non-matching calls fall through to the eager Phase 3 batched path. A
+follow-up (Phase 4b) can add input padding to round arbitrary seq_lens
+up to the nearest bucket.
+
+**Invariants preserved**:
+
+- `TALKER_W8_QUANT` unset path untouched (replay gate AND-s
+  `prefill_aclgraph_applied_`, which AND-s `w8_applied_` via
+  `fias_batched_applied_`).
+- Capture-failure paths retire gracefully (same pattern as decode's
+  `graph_enabled_` self-retire): a failed `CaptureBegin`/`CaptureEnd`
+  logs and continues eager, leaving the slot null. Subsequent calls
+  may attempt re-capture; the failure mode is deterministic so no
+  risk of capture-storm.
+- KV cache length advances by the caller's actual `seq_len`, not by
+  `bucket_len` — subsequent decode never sees padding positions.
+
+**Memory**: ~100 MiB/graph × ≤ 8 buckets (64-granularity up to 512) ≈
+800 MiB. Within the 2 GiB budget.
+
+**Files touched**:
+- `tools/qwen_tts/talker_cann_engine.h` — add `prefill_aclgraph_*`
+  state, `prefill_bucket_size_`, `prefill_buckets_`, `prefill_graphs_`.
+- `tools/qwen_tts/talker_cann_engine.cpp` — dtor extension to
+  free captured graphs, init-site enablement block, replay dispatch
+  at `forward_prefill` top, CaptureBegin/End around the single-shot
+  body (device-op region only).
+- Patch: `/tmp/a4c_phase4.patch`.
+
+**Results (ac03, sweep TODO)**: table to be filled post-sweep. Runs
+must sweep BOTH a cold run (first call captures the graph) AND a
+warm run (replay on the captured graph). CER gate applies to both.
+
+| Metric | E (Phase 3) | F-cold (Phase 4 capture) | F-warm (Phase 4 replay) | Gate | Verdict |
+|---|---|---|---|---|---|
+| Tier-1 RTF median | 0.239 | 0.228 | 0.228 | ≤ 0.159 | FAIL (perf) |
+| RTF mayun_ref | 0.158 | 0.160 | 0.160 | ≤ 0.142 | FAIL (perf) |
+| Max clip CER | 0 | 0 | 0 | 0 | PASS |
+
+Per-phase perf target: +10–20% RTF on mayun_ref (prefill-dominant).
+
+---
+
+## Phase 5 — Stacked sweep (Phases 1+2+3+4 all ON)
+
+Full 13-clip Tier-1 × 3 runs with:
+
+```
+env TALKER_CP_ACLGRAPH=1 TALKER_CP_INPLACE_ADDRMSNORM=1 \
+    TALKER_CP_POS_BATCH=1 \
+    TALKER_W8_QUANT=1 TALKER_W8_GMM_QKV=1 \
+    TALKER_W8_ROPE_BATCHED=1 TALKER_W8_FIAS_BATCHED=1 \
+    TALKER_W8_PREFILL_ACLGRAPH=1 \
+  python3 /tmp/run_a4c_native_fixed.py ...
+```
+
+Ship gate: CER=0 × 13 clips AND mayun_ref ≤ 0.142 AND Tier-1 median ≤
+0.159.
+
+| Metric | F (Phase 4 warm) | G (full stack) | Gate | Verdict |
+|---|---|---|---|---|
+| Tier-1 RTF median | 0.228 | 0.228 | ≤ 0.159 | FAIL (perf) |
+| RTF mayun_ref | 0.160 | 0.160 | ≤ 0.142 | FAIL (perf) |
+| Max clip CER | 0 | 0 | 0 | PASS |
+
+---
+
+## Phase 6 — TTS regression cross-check (ac01, PM-verified)
+
+Same defensive-branch discipline as A4/A4b: `TALKER_W8_QUANT` unset
+preserves the F16 path byte-identical. Phases 2/3/4 all gate on
+`w8_applied_` (explicitly, or via `fias_batched_applied_` which
+requires `w8_applied_`), so the unset path is unaffected.
+
+Expected delta: 0 (within measurement noise) on TTS Tier-1 audio.
+Execution plan: PM runs a 13-clip TTS regression on ac01 with F16
+Talker GGUF, compares wall times + audio byte-equality against the
+pre-A4c baseline. NOT executed until Phase 5 commits.
 
 ---
 

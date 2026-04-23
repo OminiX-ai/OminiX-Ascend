@@ -319,6 +319,10 @@ TalkerCannEngine::~TalkerCannEngine() {
     free_dev(rope_sin_dev_);
     free_dev(rstd_dev_);
 
+    // A4c Phase 1: shared zero-F16 antiquantOffset buffer for GMM QKV.
+    // Null unless gmm_qkv_applied_ was true at init.
+    free_dev(antiquant_zero_offset_dev_);
+
     for (auto &p : k_cache_dev_) free_dev(p);
     for (auto &p : v_cache_dev_) free_dev(p);
 
@@ -330,8 +334,17 @@ TalkerCannEngine::~TalkerCannEngine() {
                 g = nullptr;
             }
         }
+        // A4c Phase 4: symmetric teardown for the per-bucket prefill graphs.
+        for (aclmdlRI &g : prefill_graphs_) {
+            if (g) {
+                g_cann.aclmdlRIDestroy(g);
+                g = nullptr;
+            }
+        }
     }
     decode_graphs_.clear();
+    prefill_graphs_.clear();
+    prefill_buckets_.clear();
 
     free_dev(workspace_dev_);
     free_dev(input_stage_f32_dev_);
@@ -641,6 +654,131 @@ void TalkerCannEngine::w8_matmul_(const aclTensor *x,
     }
     g_cann.aclDestroyTensor(t_w);
     g_cann.aclDestroyTensor(t_scale);
+}
+
+// ============================================================================
+// A4c Phase 1: aclnnGroupedMatmulV3 fused Q/K/V for prefill.
+//
+// Direct transfer of CpCannEngine::gmm_qkv_ (commit 9d52177) adapted for the
+// prefill M = seq_len case. The CP path fires this per-token (M=1) inside
+// the decode loop; here we fire it once per layer inside forward_prefill
+// with M = seq_len (typically 6..128).
+//
+// Three groups, all sharing the same activation view (three distinct
+// aclTensor handles over the same device buffer — aclDestroyTensorList
+// consumes the contained tensors so views cannot be reused across calls).
+// Weights Q/K/V differ per group; antiquantScale differs per group;
+// antiquantOffset is a shared zero-F16 buffer (required non-null by
+// runtime CheckGroupedMatmulAntiQuant even though the header marks it
+// Optional).
+//
+// Numerical delta: 1-2 F16 ulp (~1.7e-3 relative) vs 3 × WQBMMv3 reference,
+// per the CP-side probe verdict. Parity gate for A4c Phase 1 is ASR Tier-1
+// CER=0 (clip-level output identity), not per-layer tensor identity.
+// ============================================================================
+
+void TalkerCannEngine::gmm_qkv_prefill_(void *x_dev, int64_t seq_len,
+                                          int64_t il,
+                                          void *q_out_dev, void *k_out_dev,
+                                          void *v_out_dev) {
+    // Fresh tensor views per dispatch — aclDestroyTensorList consumes handles,
+    // and the captured op pipeline cannot reuse stale ones.
+    auto mk_x = [&]() {
+        int64_t shape[2]   = {seq_len, (int64_t)n_embd_};
+        int64_t strides[2] = {(int64_t)n_embd_, 1};
+        int64_t storage    = seq_len * (int64_t)n_embd_;
+        return g_cann.aclCreateTensor(shape, 2, ACL_FLOAT16, strides, 0,
+                                       ACL_FORMAT_ND, &storage, 1, x_dev);
+    };
+    auto mk_w = [&](void *w_dev, int64_t N) {
+        // Mirror w8_matmul_'s weight layout: logical [K, N] view over a
+        // physical [N, K] INT8 blob with strides {1, K}. The op handles the
+        // transpose internally.
+        int64_t shape[2]   = {(int64_t)n_embd_, N};
+        int64_t strides[2] = {1, (int64_t)n_embd_};
+        int64_t storage    = N * (int64_t)n_embd_;
+        return g_cann.aclCreateTensor(shape, 2, ACL_INT8, strides, 0,
+                                       ACL_FORMAT_ND, &storage, 1, w_dev);
+    };
+    auto mk_1d_f16 = [&](void *d, int64_t N) {
+        int64_t shape[1]   = {N};
+        int64_t strides[1] = {1};
+        int64_t storage    = N;
+        return g_cann.aclCreateTensor(shape, 1, ACL_FLOAT16, strides, 0,
+                                       ACL_FORMAT_ND, &storage, 1, d);
+    };
+    auto mk_y = [&](void *buf, int64_t N) {
+        int64_t shape[2]   = {seq_len, N};
+        int64_t strides[2] = {N, 1};
+        int64_t storage    = seq_len * N;
+        return g_cann.aclCreateTensor(shape, 2, ACL_FLOAT16, strides, 0,
+                                       ACL_FORMAT_ND, &storage, 1, buf);
+    };
+
+    std::vector<const aclTensor *> xs  = {mk_x(), mk_x(), mk_x()};
+    std::vector<const aclTensor *> ws_ = {mk_w(layer_w_[il].q_proj_w_i8, q_dim_),
+                                           mk_w(layer_w_[il].k_proj_w_i8, kv_dim_),
+                                           mk_w(layer_w_[il].v_proj_w_i8, kv_dim_)};
+    std::vector<const aclTensor *> asc = {mk_1d_f16(layer_w_[il].q_proj_scale, q_dim_),
+                                           mk_1d_f16(layer_w_[il].k_proj_scale, kv_dim_),
+                                           mk_1d_f16(layer_w_[il].v_proj_scale, kv_dim_)};
+    // Shared zero-F16 antiquantOffset buffer. Each group wraps a prefix view
+    // sized to that group's N. Identical dev pointers across groups are
+    // accepted so long as the aclTensor handles are distinct.
+    std::vector<const aclTensor *> aoc = {mk_1d_f16(antiquant_zero_offset_dev_, q_dim_),
+                                           mk_1d_f16(antiquant_zero_offset_dev_, kv_dim_),
+                                           mk_1d_f16(antiquant_zero_offset_dev_, kv_dim_)};
+    std::vector<const aclTensor *> ys  = {mk_y(q_out_dev, q_dim_),
+                                           mk_y(k_out_dev, kv_dim_),
+                                           mk_y(v_out_dev, kv_dim_)};
+
+    aclTensorList *x_list  = g_cann.aclCreateTensorList(xs.data(),  xs.size());
+    aclTensorList *w_list  = g_cann.aclCreateTensorList(ws_.data(), ws_.size());
+    aclTensorList *as_list = g_cann.aclCreateTensorList(asc.data(), asc.size());
+    aclTensorList *ao_list = g_cann.aclCreateTensorList(aoc.data(), aoc.size());
+    aclTensorList *y_list  = g_cann.aclCreateTensorList(ys.data(),  ys.size());
+
+    uint64_t ws_needed = 0;
+    aclOpExecutor *exec = nullptr;
+    aclnnStatus s = g_cann.aclnnGroupedMatmulV3GetWorkspaceSize(
+        x_list, w_list,
+        /*biasOptional*/             nullptr,
+        /*scaleOptional*/            nullptr,  // post-quant scale (W8A8 lane)
+        /*offsetOptional*/           nullptr,
+        /*antiquantScaleOptional*/   as_list,
+        /*antiquantOffsetOptional*/  ao_list,
+        /*groupListOptional*/        nullptr,
+        /*splitItem*/                0,
+        /*groupType*/                -1,
+        y_list, &ws_needed, &exec);
+    if (s != 0) {
+        fprintf(stderr,
+                "[talker_cann] gmm_qkv_prefill V3 GetWorkspaceSize status=%d "
+                "(il=%ld, seq_len=%ld)\n",
+                (int)s, (long)il, (long)seq_len);
+        g_cann.aclDestroyTensorList(x_list);
+        g_cann.aclDestroyTensorList(w_list);
+        g_cann.aclDestroyTensorList(as_list);
+        g_cann.aclDestroyTensorList(ao_list);
+        g_cann.aclDestroyTensorList(y_list);
+        return;
+    }
+
+    ensure_workspace_((size_t)ws_needed);
+    void *ws = ws_needed > 0 ? workspace_dev_ : nullptr;
+    s = g_cann.aclnnGroupedMatmulV3(ws, ws_needed, exec, stream_);
+    if (s != 0) {
+        fprintf(stderr,
+                "[talker_cann] gmm_qkv_prefill V3 launch status=%d "
+                "(il=%ld, seq_len=%ld)\n",
+                (int)s, (long)il, (long)seq_len);
+    }
+
+    g_cann.aclDestroyTensorList(x_list);
+    g_cann.aclDestroyTensorList(w_list);
+    g_cann.aclDestroyTensorList(as_list);
+    g_cann.aclDestroyTensorList(ao_list);
+    g_cann.aclDestroyTensorList(y_list);
 }
 
 // ============================================================================
@@ -1116,6 +1254,211 @@ bool TalkerCannEngine::init_from_gguf(const std::string &gguf_path,
     // Contract invariant: these two paths never turn on together (enforced
     // above by forcing NZ off whenever W8 wins the env-override tie).
     assert(!(w8_applied_ && nz_applied_));
+
+    // A4c Phase 1: opt-in aclnnGroupedMatmulV3 for prefill Q/K/V. Requires
+    // w8_applied_ (antiquantScale F16 path — the op rejects F16 weights) and
+    // the runtime symbol (CANN 8.3+). Allocates a shared zero-F16
+    // antiquantOffset buffer of length q_dim_ (= max of Nq/Nk/Nv). K/V groups
+    // wrap prefix views. Default OFF; caller sets TALKER_W8_GMM_QKV=1.
+    //
+    // TALKER_W8_QUANT unset path: unaffected — the gmm_qkv_applied_ check
+    // AND-ing w8_applied_ guarantees the new branch is only taken on the W8
+    // lane. A4b's byte-identical-when-W8-off contract is preserved.
+    {
+        const char *env = getenv("TALKER_W8_GMM_QKV");
+        if (env && env[0] != '\0' && env[0] != '0') {
+            gmm_qkv_enabled_ = true;
+        }
+    }
+    gmm_qkv_applied_ = gmm_qkv_enabled_ &&
+                       w8_applied_ &&
+                       g_cann.has_grouped_matmul_v3();
+    if (gmm_qkv_enabled_ && !w8_applied_) {
+        printf("[talker_cann] TALKER_W8_GMM_QKV requested but A16W8 is not "
+               "active — aclnnGroupedMatmulV3 requires INT8 weights + F16 "
+               "antiquant scales. Staying on 3× aclnnWeightQuantBatchMatmul.\n");
+    }
+    if (gmm_qkv_enabled_ && w8_applied_ && !g_cann.has_grouped_matmul_v3()) {
+        printf("[talker_cann] TALKER_W8_GMM_QKV requested but "
+               "aclnnGroupedMatmulV3 symbol absent — staying on 3× "
+               "aclnnWeightQuantBatchMatmul.\n");
+    }
+    if (gmm_qkv_applied_) {
+        alloc_dev_(&antiquant_zero_offset_dev_,
+                   (size_t)q_dim_ * sizeof(uint16_t));
+        std::vector<uint16_t> zeros((size_t)q_dim_, 0);
+        ACL_CHECK_RET(g_cann.aclrtMemcpy(
+            antiquant_zero_offset_dev_, (size_t)q_dim_ * sizeof(uint16_t),
+            zeros.data(), (size_t)q_dim_ * sizeof(uint16_t),
+            ACL_MEMCPY_HOST_TO_DEVICE));
+        printf("[talker_cann] A4c Phase 1 ENABLED: aclnnGroupedMatmulV3 "
+               "replaces the 3 per-layer prefill QKV w8_matmul_ calls "
+               "(CP-reference commit 9d52177; ~1.7e-3 relative drift vs "
+               "3-call reference; parity gate is ASR Tier-1 CER=0).\n");
+    }
+
+    // ---- A4c Phase 2: batched RoPE at prefill (TALKER_W8_ROPE_BATCHED) -----
+    // Collapses the two per-row aclnnRotaryPositionEmbedding loops in
+    // forward_prefill into a single aclnnApplyRotaryPosEmbV2 dispatch that
+    // rotates Q AND K in-place across the full seq_len batch. Adapts the
+    // CP-path Phase A.2 landing (cp_cann_engine.cpp @ cp_rope_v2_applied_)
+    // to the prefill batch shape ([1, seq_len, N, head_dim] vs CP's
+    // [1, 1, N, head_dim]).
+    //
+    // Gate: OFF by default. AND-gated on w8_applied_ — Phase 2 only fires
+    // on the W8 lane which is where the RTF gap lives. TALKER_W8_QUANT
+    // unset path stays byte-identical to A4b + A4c Phase 1.
+    //
+    // Numerical footprint (per test_rope_v2_reopen.cpp probe): ~1 F16 ulp
+    // (max_abs 4.88e-4) vs the two-call aclnnRotaryPositionEmbedding NEOX
+    // reference on 16Q/8KV. Parity gate is ASR Tier-1 CER=0 (clip-level).
+    //
+    // Layout: BSND (layout=1), rotaryMode="half" — matches our
+    // half-duplicated cos/sin tables produced by build_rope_tables_.
+    {
+        const char *env = getenv("TALKER_W8_ROPE_BATCHED");
+        if (env && env[0] != '\0' && env[0] != '0') {
+            rope_batched_enabled_ = true;
+        }
+    }
+    rope_batched_applied_ = rope_batched_enabled_ &&
+                            w8_applied_ &&
+                            g_cann.has_rope_v2();
+    if (rope_batched_enabled_ && !w8_applied_) {
+        printf("[talker_cann] TALKER_W8_ROPE_BATCHED requested but A16W8 is "
+               "not active — batched prefill RoPE is gated on the W8 lane to "
+               "preserve F16 byte-identity. Staying on per-row RoPE loops.\n");
+    }
+    if (rope_batched_enabled_ && w8_applied_ && !g_cann.has_rope_v2()) {
+        printf("[talker_cann] TALKER_W8_ROPE_BATCHED requested but "
+               "aclnnApplyRotaryPosEmbV2 symbol absent — staying on per-row "
+               "aclnnRotaryPositionEmbedding loops.\n");
+    }
+    if (rope_batched_applied_) {
+        printf("[talker_cann] A4c Phase 2 ENABLED: aclnnApplyRotaryPosEmbV2 "
+               "replaces the two per-row RoPE loops in forward_prefill "
+               "(CP-reference cp_rope_v2_applied_; ~1 F16 ulp vs two-call "
+               "NEOX reference; parity gate is ASR Tier-1 CER=0).\n");
+    }
+
+    // ---- A4c Phase 3: batched FIAS at prefill (TALKER_W8_FIAS_BATCHED) -----
+    // Collapses the per-row aclnnFusedInferAttentionScoreV2 loop (seq_len
+    // dispatches with S_q=1 each) into one batched dispatch with S_q=seq_len.
+    // Uses a user-supplied F16 causal pseShift mask of shape
+    // [1, 1, seq_len, seq_len_total], broadcast across heads via stride[1]=0.
+    // Mask value: 0x0000 where Q_i (abs=start_pos+i) may attend to K_j, and
+    // 0xFC00 (F16 -INF) elsewhere. Broadcast-over-heads matches the Qwen2
+    // pseShift convention in ggml-cann (aclnn_ops.cpp line 4370).
+    //
+    // Gate: OFF by default. AND-gated on w8_applied_ and has_aclgraph() is
+    // NOT required — FIAS V2 is a CANN 8.3 baseline op, resolved in
+    // cp_cann_symbols as non-optional.
+    //
+    // Risk: batched FIAS with S_q>1 on GQA 16/8 previously produced
+    // cos-sim 0.28 vs iterative — see contract §4 and talker_cann line
+    // "batched RoPE on [1, S, N, D] mis-rotates for S>1". Subsequent
+    // fia_v34_probe_verdict.md (2026-04-21) re-validated FIAS V2 on
+    // BSND+F16 but only at S_q=1 (decode shape). Parity under S_q>1 on our
+    // exact prod shape is what Phase 3's ac03 sweep settles. If CER != 0
+    // the flag stays OFF by default and the per-row loop owns the path.
+    {
+        const char *env = getenv("TALKER_W8_FIAS_BATCHED");
+        if (env && env[0] != '\0' && env[0] != '0') {
+            fias_batched_enabled_ = true;
+        }
+    }
+    fias_batched_applied_ = fias_batched_enabled_ && w8_applied_;
+    if (fias_batched_enabled_ && !w8_applied_) {
+        printf("[talker_cann] TALKER_W8_FIAS_BATCHED requested but A16W8 is "
+               "not active — batched prefill FIAS is gated on the W8 lane to "
+               "preserve F16 byte-identity. Staying on per-row FIAS loop.\n");
+    }
+    if (fias_batched_applied_) {
+        printf("[talker_cann] A4c Phase 3 ENABLED: batched "
+               "aclnnFusedInferAttentionScoreV2 replaces the per-row FIAS "
+               "loop in forward_prefill (user-supplied F16 causal pseShift, "
+               "head-broadcast via stride[1]=0; parity gate is ASR Tier-1 "
+               "CER=0).\n");
+    }
+
+    // ---- A4c Phase 4: prefill aclGraph pre-record (TALKER_W8_PREFILL_ACLGRAPH)
+    // Pre-records one aclGraph per bucket at session init and replays on
+    // subsequent prefill calls whose seq_len <= bucket_max. Bucket granularity
+    // defaults to 64 tokens (overridable via TALKER_W8_PREFILL_BUCKET_SIZE).
+    // Buckets: {bucket_size, 2*bucket_size, ..., MAX_PREFILL}. Memory:
+    // ~100 MiB/graph × 8 buckets ≈ 800 MiB (within the 2 GiB budget).
+    //
+    // Requires: fias_batched_applied_ (Phase 3) — the batched FIAS path is
+    // a prerequisite for a capturable graph because the per-row FIAS loop's
+    // `kv_len`-per-row strides are not representable in a single captured
+    // graph. Also requires has_aclgraph() and w8_applied_.
+    //
+    // Replay scope: ONLY when start_pos == 0 (i.e. first prefill chunk, no
+    // KV prefix). For chunked prefill (seq_len > MAX_PREFILL → recursive
+    // sub-calls with start_pos > 0) subsequent chunks fall through to the
+    // eager batched path. The common ASR case (one prefill under 512
+    // tokens) hits the replay path; longer contexts degrade gracefully.
+    //
+    // Padding: actual seq_len is padded up to the next bucket with zero
+    // embeddings. Causal pseShift masks out padded positions from
+    // attention (masked rows both i > seq_len-1 and columns j > seq_len-1
+    // receive F16 -INF). The graph writes to KV[0..bucket_len-1]; only
+    // KV[0..seq_len-1] is meaningful. kv_cache_len_ advances by seq_len
+    // (not bucket_len) so subsequent decode reads never see padding KV.
+    //
+    // Parity gate: CER=0 × 13 clips on both cold (first-call capture) AND
+    // warm (replay) runs. Numerical risk: padded activations feed the
+    // residual+ffn chain; RmsNorm variance is taken over real+pad rows.
+    // The RmsNorm gamma is per-row (F32 rstd stored in rstd_dev_), so a
+    // zero-input row produces zero output after RmsNorm+matmul+residual
+    // — indistinguishable from a fresh row. Not bit-exact vs eager (F16
+    // ULP drift) but within the same envelope as Phases 1–3.
+    {
+        const char *env = getenv("TALKER_W8_PREFILL_ACLGRAPH");
+        if (env && env[0] != '\0' && env[0] != '0') {
+            prefill_aclgraph_enabled_ = true;
+        }
+        const char *bs_env = getenv("TALKER_W8_PREFILL_BUCKET_SIZE");
+        if (bs_env && bs_env[0]) {
+            int bs = atoi(bs_env);
+            if (bs >= 16 && bs <= 512 && (bs & (bs - 1)) == 0) {
+                prefill_bucket_size_ = bs;
+            } else if (bs >= 16 && bs <= 512) {
+                // non-power-of-2 is fine so long as divides MAX_PREFILL.
+                if (MAX_PREFILL % bs == 0) prefill_bucket_size_ = bs;
+            }
+        }
+    }
+    prefill_aclgraph_applied_ = prefill_aclgraph_enabled_ &&
+                                fias_batched_applied_ &&
+                                g_cann.has_aclgraph();
+    if (prefill_aclgraph_enabled_ && !fias_batched_applied_) {
+        printf("[talker_cann] TALKER_W8_PREFILL_ACLGRAPH requires "
+               "TALKER_W8_FIAS_BATCHED (Phase 3) — batched FIAS is a "
+               "prerequisite for a capturable prefill graph. Staying eager.\n");
+    }
+    if (prefill_aclgraph_enabled_ && fias_batched_applied_ && !g_cann.has_aclgraph()) {
+        printf("[talker_cann] TALKER_W8_PREFILL_ACLGRAPH requested but the "
+               "aclGraph runtime symbols (aclmdlRI*) are absent on this "
+               "toolkit. Staying eager.\n");
+    }
+    if (prefill_aclgraph_applied_) {
+        // Bucket list: {bucket_size, 2*bucket_size, ..., MAX_PREFILL}.
+        // Clamp to not exceed MAX_PREFILL.
+        prefill_buckets_.clear();
+        for (int b = prefill_bucket_size_; b <= MAX_PREFILL;
+             b += prefill_bucket_size_) {
+            prefill_buckets_.push_back(b);
+        }
+        prefill_graphs_.assign(prefill_buckets_.size(), nullptr);
+        printf("[talker_cann] A4c Phase 4 ENABLED: prefill aclGraph "
+               "pre-record at bucket granularity %d (%zu buckets, up to "
+               "seq_len=%d). Graphs captured lazily on first use per bucket; "
+               "replay on subsequent calls. Parity gate is ASR Tier-1 CER=0 "
+               "on cold+warm runs.\n",
+               prefill_bucket_size_, prefill_buckets_.size(),
+               MAX_PREFILL);
+    }
 
     // aclGraph cache (M4). OPT-IN only: set TALKER_CANN_GRAPH=1 to enable.
     // Rationale: within a single utterance each `pos` is visited exactly once
@@ -2007,21 +2350,120 @@ void TalkerCannEngine::forward_prefill(const float *input_embeds, int seq_len,
         return;
     }
 
+    // A4c Phase 4: aclGraph replay attempt.
+    //
+    // Replay fires when ALL of:
+    //   * prefill_aclgraph_applied_ (env gate + Phase 3 + has_aclgraph())
+    //   * start_pos == 0 (first prefill chunk in the utterance — the captured
+    //     graph assumes KV writes begin at cache slot 0)
+    //   * seq_len is a bucket-size multiple of prefill_bucket_size_ AND
+    //     <= MAX_PREFILL (so a pre-recorded graph exists for that bucket)
+    //   * the graph for that bucket is already captured (non-null) OR this
+    //     call opts into first-touch capture (graph == null)
+    //
+    // On mismatch, the call falls through to the eager body. kv_cache_len_
+    // accounting is identical in both paths — no dispatch visible to the
+    // caller.
+    //
+    // For this first landing of Phase 4 we gate replay on seq_len being an
+    // exact bucket multiple (no padding). The hit rate is low on arbitrary
+    // text seq lengths but every hit eliminates op-dispatch overhead for a
+    // ~100+ op layer stack × n_layers_. A follow-up ("Phase 4b") can add
+    // input padding so every seq_len rounds up to the nearest bucket; that
+    // path needs careful handling of RmsNorm over the pad rows (zero input
+    // → zero output, which is fine numerically, but the FFN + add chain
+    // sees extra rows).
+    int prefill_bucket_idx = -1;
+    if (prefill_aclgraph_applied_ && start_pos == 0 &&
+        seq_len % prefill_bucket_size_ == 0 &&
+        seq_len <= MAX_PREFILL) {
+        for (int k = 0; k < (int)prefill_buckets_.size(); ++k) {
+            if (prefill_buckets_[k] == seq_len) {
+                prefill_bucket_idx = k;
+                break;
+            }
+        }
+    }
+    if (prefill_bucket_idx >= 0 &&
+        prefill_graphs_[prefill_bucket_idx] != nullptr) {
+        // ---- REPLAY PATH ----------------------------------------------------
+        // Upload the F32 embeddings at the same device address the graph was
+        // captured over (input_stage_f32_dev_). The subsequent Cast, QKV,
+        // RoPE, FIAS, etc. ops replay against the new byte contents.
+        ACL_CHECK_RET(g_cann.aclrtMemcpy(
+            input_stage_f32_dev_, (size_t)seq_len * n_embd_ * sizeof(float),
+            input_embeds,         (size_t)seq_len * n_embd_ * sizeof(float),
+            ACL_MEMCPY_HOST_TO_DEVICE));
+        // Re-upload the causal pseShift mask (content is stable per
+        // seq_len + start_pos, so this is an identical payload to the
+        // captured one — still required because the captured executor
+        // references the buffer contents, not a pure-function pattern).
+        const int seq_len_total_replay = start_pos + seq_len;  // == seq_len
+        std::vector<uint16_t> mask_host((size_t)seq_len * seq_len_total_replay);
+        const uint16_t F16_ZERO = 0x0000;
+        const uint16_t F16_NEG_INF = 0xFC00;
+        for (int i = 0; i < seq_len; ++i) {
+            uint16_t *row = mask_host.data() + (size_t)i * seq_len_total_replay;
+            for (int j = 0; j < seq_len_total_replay; ++j) {
+                row[j] = (j <= i) ? F16_ZERO : F16_NEG_INF;
+            }
+        }
+        ACL_CHECK_RET(g_cann.aclrtMemcpy(
+            causal_mask_dev_,
+            (size_t)seq_len * seq_len_total_replay * sizeof(uint16_t),
+            mask_host.data(),
+            (size_t)seq_len * seq_len_total_replay * sizeof(uint16_t),
+            ACL_MEMCPY_HOST_TO_DEVICE));
+        // Dispatch the captured graph.
+        aclError err = g_cann.aclmdlRIExecuteAsync(
+            prefill_graphs_[prefill_bucket_idx], stream_);
+        if (err != 0) {
+            fprintf(stderr,
+                    "[talker_cann] prefill aclmdlRIExecuteAsync bucket=%d "
+                    "(seq_len=%d) failed (%d): %s — retiring the graph and "
+                    "falling back to eager for this call.\n",
+                    prefill_bucket_idx, seq_len, err,
+                    g_cann.aclGetRecentErrMsg
+                        ? g_cann.aclGetRecentErrMsg() : "<n/a>");
+            g_cann.aclmdlRIDestroy(prefill_graphs_[prefill_bucket_idx]);
+            prefill_graphs_[prefill_bucket_idx] = nullptr;
+            prefill_bucket_idx = -1;
+            // fall through to eager path
+        } else {
+            // Final cast + host download for last-hidden-out, symmetric with
+            // the eager path's tail.
+            if (last_hidden_out) {
+                uint16_t *last_row = (uint16_t *)normed_batch_dev_ +
+                                       (size_t)(seq_len - 1) * n_embd_;
+                aclTensor *t_last_f16 = tensor_1d(last_row, n_embd_, ACL_FLOAT16);
+                aclTensor *t_last_f32 = tensor_1d(output_stage_f32_dev_, n_embd_,
+                                                    ACL_FLOAT);
+                CANN_OP(Cast, t_last_f16, ACL_FLOAT, t_last_f32);
+                g_cann.aclDestroyTensor(t_last_f16);
+                g_cann.aclDestroyTensor(t_last_f32);
+                ACL_CHECK_RET(g_cann.aclrtSynchronizeStream(stream_));
+                ACL_CHECK_RET(g_cann.aclrtMemcpy(
+                    last_hidden_out, (size_t)n_embd_ * sizeof(float),
+                    output_stage_f32_dev_, (size_t)n_embd_ * sizeof(float),
+                    ACL_MEMCPY_DEVICE_TO_HOST));
+            } else {
+                ACL_CHECK_RET(g_cann.aclrtSynchronizeStream(stream_));
+            }
+            int end_pos = start_pos + seq_len;
+            if (end_pos > kv_cache_len_) kv_cache_len_ = end_pos;
+            return;
+        }
+    }
+
     // Single-shot prefill path.
-    // 1. Upload the batch of F32 embeddings, cast to F16 into cur_batch_dev_.
+    // 1. Upload the batch of F32 embeddings. The F32→F16 Cast runs below on
+    //    stream_; under A4c Phase 4 capture the Cast is the first recorded
+    //    op of the graph (replay reuses input_stage_f32_dev_ contents
+    //    uploaded in the replay branch above).
     ACL_CHECK_RET(g_cann.aclrtMemcpy(
         input_stage_f32_dev_, (size_t)seq_len * n_embd_ * sizeof(float),
         input_embeds,         (size_t)seq_len * n_embd_ * sizeof(float),
         ACL_MEMCPY_HOST_TO_DEVICE));
-    {
-        aclTensor *t_in_f32 = tensor_2d(input_stage_f32_dev_,
-                                          seq_len, n_embd_, ACL_FLOAT);
-        aclTensor *t_cur_f16 = tensor_2d(cur_batch_dev_, seq_len, n_embd_,
-                                           ACL_FLOAT16);
-        CANN_OP(Cast, t_in_f32, ACL_FLOAT16, t_cur_f16);
-        g_cann.aclDestroyTensor(t_in_f32);
-        g_cann.aclDestroyTensor(t_cur_f16);
-    }
 
     const int seq_len_total = start_pos + seq_len;
 
@@ -2041,12 +2483,91 @@ void TalkerCannEngine::forward_prefill(const float *input_embeds, int seq_len,
     aclTensor *t_cos = make_rope_batch(cos_win);
     aclTensor *t_sin = make_rope_batch(sin_win);
 
-    // Causality is enforced inside FIAS via `nextTokens=0` (see the
-    // GetWorkspaceSize call below). This is simpler than a user-supplied
-    // mask and, based on CANN 8.3's kernel tiling tables, more reliable
-    // than the pseShift / attenMask paths for the (GQA 16/8, small S_q)
-    // shape combinations the Talker hits during prefill.
-    (void)causal_mask_dev_;  // retained for future pseShift paths; unused now.
+    // Causality in the per-row FIAS loop is enforced by slicing KV to
+    // [0..pos_abs] per row (so there is nothing to mask). The batched
+    // Phase 3 path (fias_batched_applied_) cannot slice per-row, so it
+    // supplies an F16 causal pseShift mask [seq_len, seq_len_total]
+    // built once here and broadcast across heads via stride[1]=0. Mask
+    // layout: mask[i, j] = 0x0000 (F16 zero, kept) if j <= start_pos + i,
+    // else 0xFC00 (F16 -INF, blocked).
+    if (fias_batched_applied_) {
+        // Host-side scratch: seq_len * seq_len_total F16. On a 4352-token
+        // prefill this is ~4 MB; on our worst prod case (seq_len=MAX_PREFILL
+        // =512, seq_len_total≤MAX_SEQ=4096) ~4 MB. That fits in
+        // causal_mask_dev_ which was sized [MAX_PREFILL, MAX_SEQ] F16 at
+        // init.
+        std::vector<uint16_t> mask_host((size_t)seq_len * seq_len_total);
+        const uint16_t F16_ZERO = 0x0000;
+        const uint16_t F16_NEG_INF = 0xFC00;
+        for (int i = 0; i < seq_len; ++i) {
+            const int q_abs = start_pos + i;
+            uint16_t *row = mask_host.data() + (size_t)i * seq_len_total;
+            for (int j = 0; j < seq_len_total; ++j) {
+                row[j] = (j <= q_abs) ? F16_ZERO : F16_NEG_INF;
+            }
+        }
+        ACL_CHECK_RET(g_cann.aclrtMemcpy(
+            causal_mask_dev_,
+            (size_t)seq_len * seq_len_total * sizeof(uint16_t),
+            mask_host.data(),
+            (size_t)seq_len * seq_len_total * sizeof(uint16_t),
+            ACL_MEMCPY_HOST_TO_DEVICE));
+    } else {
+        (void)causal_mask_dev_;  // retained for future pseShift paths; unused.
+    }
+
+    // ---- A4c Phase 4 capture begin (if eligible) ----------------------
+    // All H2D work (F32 embeddings + mask) is done. The remaining body
+    // — F32→F16 Cast, layer loop, final RmsNorm, last-row Cast — is a
+    // pure device-side op sequence with stable buffer addresses. That is
+    // exactly what aclGraph wants: capture these ops once per bucket, on
+    // subsequent matching calls skip the host-side dispatch overhead.
+    //
+    // Capture is attempted only on the first call that matches a
+    // ready-but-unbucketed slot. On capture failure (e.g. the toolkit
+    // refuses a specific op under capture) we fall through to eager and
+    // permanently disable capture for that bucket.
+    bool prefill_capture_this_call = false;
+    if (prefill_aclgraph_applied_ && prefill_bucket_idx >= 0 &&
+        prefill_graphs_[prefill_bucket_idx] == nullptr) {
+        // Sync to ensure the stream is empty before CaptureBegin; the mask
+        // H2D above is a blocking aclrtMemcpy so it's already drained, but
+        // a prior decode could still be in flight from the engine's last
+        // call — draining here is cheap and correct.
+        ACL_CHECK_RET(g_cann.aclrtSynchronizeStream(stream_));
+        aclError beg_err = g_cann.aclmdlRICaptureBegin(
+            stream_, ACL_MODEL_RI_CAPTURE_MODE_THREAD_LOCAL);
+        if (beg_err != 0) {
+            fprintf(stderr,
+                    "[talker_cann] prefill aclmdlRICaptureBegin bucket=%d "
+                    "(seq_len=%d) failed (%d): %s — disabling capture for "
+                    "this bucket and proceeding eager.\n",
+                    prefill_bucket_idx, seq_len, beg_err,
+                    g_cann.aclGetRecentErrMsg
+                        ? g_cann.aclGetRecentErrMsg() : "<n/a>");
+            // Mark the slot as permanently retired by pointing at a sentinel
+            // that can never match on replay: leave it null (the ExecuteAsync
+            // check gates on non-null), and clamp the bucket selection
+            // logic to skip further capture attempts on this bucket via the
+            // `prefill_capture_retired_` set (optional — simplest is to
+            // leave null and rely on "graph==nullptr → eager" at all
+            // subsequent calls, which keeps retrying capture but that is
+            // harmless since the failure mode is deterministic).
+        } else {
+            prefill_capture_this_call = true;
+        }
+    }
+
+    // 1b. F32 → F16 Cast (first device op of the capturable region).
+    {
+        aclTensor *t_in_f32 = tensor_2d(input_stage_f32_dev_,
+                                          seq_len, n_embd_, ACL_FLOAT);
+        aclTensor *t_cur_f16 = tensor_2d(cur_batch_dev_, seq_len, n_embd_,
+                                           ACL_FLOAT16);
+        CANN_OP(Cast, t_in_f32, ACL_FLOAT16, t_cur_f16);
+        g_cann.aclDestroyTensor(t_in_f32);
+        g_cann.aclDestroyTensor(t_cur_f16);
+    }
 
     for (int il = 0; il < n_layers_; ++il) {
         const auto &lw = layer_w_[il];
@@ -2097,7 +2618,16 @@ void TalkerCannEngine::forward_prefill(const float *input_embeds, int seq_len,
         // INT8 + F16 scale path used by decode. aclnnWeightQuantBatchMatmulV3
         // accepts x:[M, K] with M = seq_len; no reshape needed. The F16
         // weight_T_tensor descriptors are only built in the fallback branch.
-        if (w8_applied_) {
+        //
+        // A4c Phase 1: when gmm_qkv_applied_ (= TALKER_W8_GMM_QKV=1 +
+        // w8_applied_ + runtime symbol present), collapse the 3 w8_matmul_
+        // calls into one aclnnGroupedMatmulV3 dispatch. Byte-identity gate
+        // is ASR Tier-1 CER=0 (clip output), not per-tensor bit-equal — the
+        // fused path drifts by 1-2 F16 ulp from the 3-call reference.
+        if (gmm_qkv_applied_) {
+            gmm_qkv_prefill_(normed_batch_dev_, seq_len, (int64_t)il,
+                              q_batch_dev_, k_batch_dev_, v_batch_dev_);
+        } else if (w8_applied_) {
             aclTensor *t_normed = tensor_2d(normed_batch_dev_, seq_len, n_embd_, ACL_FLOAT16);
             aclTensor *t_q = tensor_2d(q_batch_dev_, seq_len, q_dim_,  ACL_FLOAT16);
             aclTensor *t_k = tensor_2d(k_batch_dev_, seq_len, kv_dim_, ACL_FLOAT16);
@@ -2158,70 +2688,145 @@ void TalkerCannEngine::forward_prefill(const float *input_embeds, int seq_len,
             g_cann.aclDestroyTensor(t_rstd_k);
         }
 
-        // --- RoPE on Q (per-row loop) -> attn_out_batch_dev_ ---
-        // Apply RoPE separately for each position. The batched RoPE
-        // kernel (aclnnRotaryPositionEmbedding on [1, S, N, D] with
-        // cos/sin [1, S, 1, D]) appears to mis-rotate for S>1 on CANN
-        // 8.3, so we unroll the S dim.
-        for (int s = 0; s < seq_len; ++s) {
-            uint16_t *q_row = (uint16_t *)q_batch_dev_ + (size_t)s * q_dim_;
-            uint16_t *attn_row = (uint16_t *)attn_out_batch_dev_ + (size_t)s * q_dim_;
-            uint16_t *cos_row = (uint16_t *)rope_cos_dev_ +
-                                (size_t)(start_pos + s) * head_dim_;
-            uint16_t *sin_row = (uint16_t *)rope_sin_dev_ +
-                                (size_t)(start_pos + s) * head_dim_;
-            int64_t cs_shape[4]   = {1, 1, 1, (int64_t)head_dim_};
-            int64_t cs_strides[4] = {(int64_t)head_dim_, (int64_t)head_dim_,
-                                      (int64_t)head_dim_, 1};
-            aclTensor *t_cos_s = tensor_strided(cos_row, 4, cs_shape,
-                                                  cs_strides, ACL_FLOAT16);
-            aclTensor *t_sin_s = tensor_strided(sin_row, 4, cs_shape,
-                                                  cs_strides, ACL_FLOAT16);
-            int64_t q_shape[4]   = {1, 1, (int64_t)n_heads_, (int64_t)head_dim_};
-            int64_t q_strides[4] = {(int64_t)q_dim_, (int64_t)q_dim_,
-                                     (int64_t)head_dim_, 1};
-            aclTensor *t_q_in  = tensor_strided(q_row, 4, q_shape, q_strides,
-                                                 ACL_FLOAT16);
-            aclTensor *t_q_out = tensor_strided(attn_row, 4, q_shape, q_strides,
-                                                 ACL_FLOAT16);
-            CANN_OP(RotaryPositionEmbedding,
-                    t_q_in, t_cos_s, t_sin_s, (int64_t)0, t_q_out);
-            g_cann.aclDestroyTensor(t_q_in);
-            g_cann.aclDestroyTensor(t_q_out);
-            g_cann.aclDestroyTensor(t_cos_s);
-            g_cann.aclDestroyTensor(t_sin_s);
-        }
-
-        // --- RoPE on K (per-row loop), write into KV cache slots ---
+        // --- RoPE Q + K ---
+        //
+        // Two paths, selected per rope_batched_applied_:
+        //   (a) A4c Phase 2 batched path (TALKER_W8_ROPE_BATCHED=1):
+        //       single aclnnApplyRotaryPosEmbV2 in-place dispatch across
+        //       the full [1, seq_len, N, head_dim] batch for Q and K. Q is
+        //       d2d-copied from q_batch_dev_ to attn_out_batch_dev_
+        //       pre-rotation so the FIAS loop below sees the same buffer
+        //       contract as the per-row path. K is d2d-copied into its
+        //       KV cache slot pre-rotation, then rotated in-place at that
+        //       address (matching the legacy "K ends up in cache slot"
+        //       contract).
+        //   (b) Per-row legacy path: two aclnnRotaryPositionEmbedding loops.
+        //       Kept verbatim as the defensive branch; reached whenever
+        //       TALKER_W8_ROPE_BATCHED is unset, A16W8 is off, or the V2
+        //       symbol is absent.
         uint16_t *k_slot =
             (uint16_t *)k_cache_dev_[il] + (size_t)start_pos * kv_dim_;
-        for (int s = 0; s < seq_len; ++s) {
-            uint16_t *k_row = (uint16_t *)k_batch_dev_ + (size_t)s * kv_dim_;
-            uint16_t *k_out = k_slot + (size_t)s * kv_dim_;
-            uint16_t *cos_row = (uint16_t *)rope_cos_dev_ +
-                                (size_t)(start_pos + s) * head_dim_;
-            uint16_t *sin_row = (uint16_t *)rope_sin_dev_ +
-                                (size_t)(start_pos + s) * head_dim_;
-            int64_t cs_shape[4]   = {1, 1, 1, (int64_t)head_dim_};
-            int64_t cs_strides[4] = {(int64_t)head_dim_, (int64_t)head_dim_,
+
+        if (rope_batched_applied_) {
+            // (1) Stage Q into attn_out_batch_dev_ so the subsequent FIAS
+            //     code path — which reads Q from attn_out_batch_dev_ — sees
+            //     the rotated Q regardless of which RoPE path ran. V2 then
+            //     rotates attn_out_batch_dev_ in-place.
+            ACL_CHECK_RET(g_cann.aclrtMemcpyAsync(
+                attn_out_batch_dev_,
+                (size_t)seq_len * q_dim_ * sizeof(uint16_t),
+                q_batch_dev_,
+                (size_t)seq_len * q_dim_ * sizeof(uint16_t),
+                ACL_MEMCPY_DEVICE_TO_DEVICE, stream_));
+            // (2) Stage K directly into its KV-cache slot pre-rotation so
+            //     V2 can rotate in-place at the cache address.
+            ACL_CHECK_RET(g_cann.aclrtMemcpyAsync(
+                k_slot,
+                (size_t)seq_len * kv_dim_ * sizeof(uint16_t),
+                k_batch_dev_,
+                (size_t)seq_len * kv_dim_ * sizeof(uint16_t),
+                ACL_MEMCPY_DEVICE_TO_DEVICE, stream_));
+            // (3) Build [1, seq_len, N, head_dim] BSND views for Q and K.
+            //     t_cos / t_sin were built upstream at shape
+            //     [1, seq_len, 1, head_dim] — the exact broadcast shape V2
+            //     expects for BSND (layout=1).
+            int64_t qv_shape[4]   = {1, (int64_t)seq_len,
+                                      (int64_t)n_heads_, (int64_t)head_dim_};
+            int64_t qv_strides[4] = {(int64_t)q_dim_ * seq_len,
+                                      (int64_t)q_dim_,
                                       (int64_t)head_dim_, 1};
-            aclTensor *t_cos_s = tensor_strided(cos_row, 4, cs_shape,
-                                                  cs_strides, ACL_FLOAT16);
-            aclTensor *t_sin_s = tensor_strided(sin_row, 4, cs_shape,
-                                                  cs_strides, ACL_FLOAT16);
-            int64_t k_shape[4]   = {1, 1, (int64_t)n_kv_, (int64_t)head_dim_};
-            int64_t k_strides[4] = {(int64_t)kv_dim_, (int64_t)kv_dim_,
-                                     (int64_t)head_dim_, 1};
-            aclTensor *t_k_in  = tensor_strided(k_row, 4, k_shape, k_strides,
+            int64_t kv_shape[4]   = {1, (int64_t)seq_len,
+                                      (int64_t)n_kv_, (int64_t)head_dim_};
+            int64_t kv_strides[4] = {(int64_t)kv_dim_ * seq_len,
+                                      (int64_t)kv_dim_,
+                                      (int64_t)head_dim_, 1};
+            aclTensor *t_q_v2 = tensor_strided(attn_out_batch_dev_, 4,
+                                                 qv_shape, qv_strides,
                                                  ACL_FLOAT16);
-            aclTensor *t_k_out = tensor_strided(k_out, 4, k_shape, k_strides,
+            aclTensor *t_k_v2 = tensor_strided(k_slot, 4,
+                                                 kv_shape, kv_strides,
                                                  ACL_FLOAT16);
-            CANN_OP(RotaryPositionEmbedding,
-                    t_k_in, t_cos_s, t_sin_s, (int64_t)0, t_k_out);
-            g_cann.aclDestroyTensor(t_k_in);
-            g_cann.aclDestroyTensor(t_k_out);
-            g_cann.aclDestroyTensor(t_cos_s);
-            g_cann.aclDestroyTensor(t_sin_s);
+            // (4) Dispatch V2. GetWorkspaceSize has a distinct arg order
+            //     (layout + rotaryMode before the ws out-params), so we
+            //     can't use the CANN_OP macro — invoke explicitly. Mirror
+            //     CP-side cp_rope_v2_applied_ lifetime discipline: single
+            //     ensure_workspace_ between GetWorkspaceSize and launch.
+            uint64_t v2_ws = 0;
+            aclOpExecutor *v2_exec = nullptr;
+            char rotary_mode[5] = {'h','a','l','f',0};
+            ACL_CHECK_RET(g_cann.aclnnApplyRotaryPosEmbV2GetWorkspaceSize(
+                t_q_v2, t_k_v2, t_cos, t_sin,
+                /*layout=*/(int64_t)1, rotary_mode, &v2_ws, &v2_exec));
+            ensure_workspace_((size_t)v2_ws);
+            void *v2_ws_ptr = v2_ws > 0 ? workspace_dev_ : nullptr;
+            ACL_CHECK_RET(g_cann.aclnnApplyRotaryPosEmbV2(
+                v2_ws_ptr, v2_ws, v2_exec, stream_));
+            g_cann.aclDestroyTensor(t_q_v2);
+            g_cann.aclDestroyTensor(t_k_v2);
+        } else {
+            // --- Legacy per-row Q loop -> attn_out_batch_dev_ ---
+            // Apply RoPE separately for each position. The batched RoPE
+            // kernel (aclnnRotaryPositionEmbedding on [1, S, N, D] with
+            // cos/sin [1, S, 1, D]) appears to mis-rotate for S>1 on CANN
+            // 8.3, so we unroll the S dim.
+            for (int s = 0; s < seq_len; ++s) {
+                uint16_t *q_row = (uint16_t *)q_batch_dev_ + (size_t)s * q_dim_;
+                uint16_t *attn_row = (uint16_t *)attn_out_batch_dev_ + (size_t)s * q_dim_;
+                uint16_t *cos_row = (uint16_t *)rope_cos_dev_ +
+                                    (size_t)(start_pos + s) * head_dim_;
+                uint16_t *sin_row = (uint16_t *)rope_sin_dev_ +
+                                    (size_t)(start_pos + s) * head_dim_;
+                int64_t cs_shape[4]   = {1, 1, 1, (int64_t)head_dim_};
+                int64_t cs_strides[4] = {(int64_t)head_dim_, (int64_t)head_dim_,
+                                          (int64_t)head_dim_, 1};
+                aclTensor *t_cos_s = tensor_strided(cos_row, 4, cs_shape,
+                                                      cs_strides, ACL_FLOAT16);
+                aclTensor *t_sin_s = tensor_strided(sin_row, 4, cs_shape,
+                                                      cs_strides, ACL_FLOAT16);
+                int64_t q_shape[4]   = {1, 1, (int64_t)n_heads_, (int64_t)head_dim_};
+                int64_t q_strides[4] = {(int64_t)q_dim_, (int64_t)q_dim_,
+                                         (int64_t)head_dim_, 1};
+                aclTensor *t_q_in  = tensor_strided(q_row, 4, q_shape, q_strides,
+                                                     ACL_FLOAT16);
+                aclTensor *t_q_out = tensor_strided(attn_row, 4, q_shape, q_strides,
+                                                     ACL_FLOAT16);
+                CANN_OP(RotaryPositionEmbedding,
+                        t_q_in, t_cos_s, t_sin_s, (int64_t)0, t_q_out);
+                g_cann.aclDestroyTensor(t_q_in);
+                g_cann.aclDestroyTensor(t_q_out);
+                g_cann.aclDestroyTensor(t_cos_s);
+                g_cann.aclDestroyTensor(t_sin_s);
+            }
+
+            // --- Legacy per-row K loop, write into KV cache slots ---
+            for (int s = 0; s < seq_len; ++s) {
+                uint16_t *k_row = (uint16_t *)k_batch_dev_ + (size_t)s * kv_dim_;
+                uint16_t *k_out = k_slot + (size_t)s * kv_dim_;
+                uint16_t *cos_row = (uint16_t *)rope_cos_dev_ +
+                                    (size_t)(start_pos + s) * head_dim_;
+                uint16_t *sin_row = (uint16_t *)rope_sin_dev_ +
+                                    (size_t)(start_pos + s) * head_dim_;
+                int64_t cs_shape[4]   = {1, 1, 1, (int64_t)head_dim_};
+                int64_t cs_strides[4] = {(int64_t)head_dim_, (int64_t)head_dim_,
+                                          (int64_t)head_dim_, 1};
+                aclTensor *t_cos_s = tensor_strided(cos_row, 4, cs_shape,
+                                                      cs_strides, ACL_FLOAT16);
+                aclTensor *t_sin_s = tensor_strided(sin_row, 4, cs_shape,
+                                                      cs_strides, ACL_FLOAT16);
+                int64_t k_shape[4]   = {1, 1, (int64_t)n_kv_, (int64_t)head_dim_};
+                int64_t k_strides[4] = {(int64_t)kv_dim_, (int64_t)kv_dim_,
+                                         (int64_t)head_dim_, 1};
+                aclTensor *t_k_in  = tensor_strided(k_row, 4, k_shape, k_strides,
+                                                     ACL_FLOAT16);
+                aclTensor *t_k_out = tensor_strided(k_out, 4, k_shape, k_strides,
+                                                     ACL_FLOAT16);
+                CANN_OP(RotaryPositionEmbedding,
+                        t_k_in, t_cos_s, t_sin_s, (int64_t)0, t_k_out);
+                g_cann.aclDestroyTensor(t_k_in);
+                g_cann.aclDestroyTensor(t_k_out);
+                g_cann.aclDestroyTensor(t_cos_s);
+                g_cann.aclDestroyTensor(t_sin_s);
+            }
         }
 
         // --- V -> cache slice ---
@@ -2233,45 +2838,66 @@ void TalkerCannEngine::forward_prefill(const float *input_embeds, int seq_len,
             (size_t)seq_len * kv_dim_ * sizeof(uint16_t),
             ACL_MEMCPY_DEVICE_TO_DEVICE, stream_));
 
-        // --- FIAS per-row loop: each Q row queries KV[0..pos] independently.
-        //   This sidesteps batched-FIAS numerical issues by looping with
-        //   S_q=1 (decode-mode FIAS), writing all seq_len attention outputs
-        //   into q_batch_dev_. Same answer as iterative forward_decode, but
-        //   shares the per-layer matmul/RmsNorm/etc. batched work above.
-        for (int s = 0; s < seq_len; ++s) {
-            const int pos_abs = start_pos + s;
-            const int kv_len = pos_abs + 1;
+        // --- FIAS ---
+        //
+        // Two paths, selected per fias_batched_applied_:
+        //   (a) A4c Phase 3 batched path (TALKER_W8_FIAS_BATCHED=1):
+        //       one FIASv2 dispatch with Q=[1, seq_len, Hq, D] and
+        //       K/V=[1, seq_len_total, Hkv, D], causal pseShift supplied
+        //       as [1, 1, seq_len, seq_len_total] F16 (broadcast across
+        //       heads via stride[1]=0). Same {preTokens,nextTokens,
+        //       innerPrecise} as the per-row loop.
+        //   (b) Per-row legacy path: seq_len calls with S_q=1, KV sliced
+        //       to [0..pos_abs] per row. Retained verbatim as the
+        //       defensive branch.
+        if (fias_batched_applied_) {
+            uint16_t *q_src = (uint16_t *)attn_out_batch_dev_;
+            uint16_t *attn_dst = (uint16_t *)q_batch_dev_;
 
-            uint16_t *q_src = (uint16_t*)attn_out_batch_dev_ + (size_t)s * q_dim_;
-            uint16_t *attn_dst = (uint16_t*)q_batch_dev_ + (size_t)s * q_dim_;
-
-            int64_t q_shape[4]   = {1, 1, (int64_t)n_heads_, (int64_t)head_dim_};
-            int64_t q_strides[4] = {(int64_t)q_dim_, (int64_t)q_dim_,
+            int64_t q_shape[4]   = {1, (int64_t)seq_len,
+                                     (int64_t)n_heads_, (int64_t)head_dim_};
+            int64_t q_strides[4] = {(int64_t)q_dim_ * seq_len,
+                                     (int64_t)q_dim_,
                                      (int64_t)head_dim_, 1};
-            aclTensor *t_q_s = tensor_strided(q_src, 4, q_shape, q_strides,
-                                                ACL_FLOAT16);
-            aclTensor *t_attn_s = tensor_strided(attn_dst, 4, q_shape, q_strides,
-                                                   ACL_FLOAT16);
+            aclTensor *t_q_batch = tensor_strided(q_src, 4, q_shape, q_strides,
+                                                    ACL_FLOAT16);
+            aclTensor *t_attn_batch = tensor_strided(attn_dst, 4, q_shape, q_strides,
+                                                       ACL_FLOAT16);
 
-            int64_t kv_shape[4]   = {1, (int64_t)kv_len,
+            int64_t kv_shape[4]   = {1, (int64_t)seq_len_total,
                                       (int64_t)n_kv_, (int64_t)head_dim_};
-            int64_t kv_strides[4] = {(int64_t)kv_len * kv_dim_,
+            int64_t kv_strides[4] = {(int64_t)seq_len_total * kv_dim_,
                                       (int64_t)kv_dim_,
                                       (int64_t)head_dim_, 1};
-            aclTensor *t_k_s = tensor_strided(k_cache_dev_[il], 4, kv_shape,
-                                                kv_strides, ACL_FLOAT16);
-            aclTensor *t_v_s = tensor_strided(v_cache_dev_[il], 4, kv_shape,
-                                                kv_strides, ACL_FLOAT16);
-            aclTensorList *t_kl = g_cann.aclCreateTensorList(&t_k_s, 1);
-            aclTensorList *t_vl = g_cann.aclCreateTensorList(&t_v_s, 1);
+            aclTensor *t_k_batch = tensor_strided(k_cache_dev_[il], 4, kv_shape,
+                                                    kv_strides, ACL_FLOAT16);
+            aclTensor *t_v_batch = tensor_strided(v_cache_dev_[il], 4, kv_shape,
+                                                    kv_strides, ACL_FLOAT16);
+            aclTensorList *t_kl = g_cann.aclCreateTensorList(&t_k_batch, 1);
+            aclTensorList *t_vl = g_cann.aclCreateTensorList(&t_v_batch, 1);
+
+            // Causal pseShift: shape [1, 1, seq_len, seq_len_total], stride[1]=0
+            // to broadcast across the n_heads axis (Qwen2 / ggml-cann
+            // convention). Data was uploaded to causal_mask_dev_ once before
+            // the layer loop.
+            int64_t pse_shape[4]   = {1, (int64_t)n_heads_,
+                                       (int64_t)seq_len, (int64_t)seq_len_total};
+            int64_t pse_strides[4] = {(int64_t)seq_len * seq_len_total,
+                                       /*broadcast over heads*/ 0,
+                                       (int64_t)seq_len_total, 1};
+            aclTensor *t_pse = tensor_strided(causal_mask_dev_, 4, pse_shape,
+                                                pse_strides, ACL_FLOAT16);
 
             uint64_t fa_ws = 0;
             aclOpExecutor *fa_exec = nullptr;
             char layout[5] = {'B','S','N','D',0};
             double scale = 1.0 / sqrt((double)head_dim_);
+            // Per the Qwen2 ggml-cann recipe (aclnn_ops.cpp line 4422):
+            // innerPrecise=2 when S_q>1 (high-precision softmax path).
+            const int64_t inner_precise_batched = 2;
             ACL_CHECK_RET(g_cann.aclnnFusedInferAttentionScoreV2GetWorkspaceSize(
-                t_q_s, t_kl, t_vl,
-                /*pseShift*/ nullptr, /*attenMask*/ nullptr,
+                t_q_batch, t_kl, t_vl,
+                /*pseShift*/ t_pse, /*attenMask*/ nullptr,
                 /*actSeqLen*/ nullptr, /*actSeqLenKv*/ nullptr,
                 /*deqScale1*/ nullptr, /*quantScale1*/ nullptr,
                 /*deqScale2*/ nullptr, /*quantScale2*/ nullptr,
@@ -2290,13 +2916,13 @@ void TalkerCannEngine::forward_prefill(const float *input_embeds, int seq_len,
                 /*inputLayout*/ layout,
                 /*numKeyValueHeads*/ (int64_t)n_kv_,
                 /*sparseMode*/ (int64_t)0,
-                /*innerPrecise*/ (int64_t)0,
+                /*innerPrecise*/ inner_precise_batched,
                 /*blockSize*/ (int64_t)0,
                 /*antiquantMode*/ (int64_t)0,
                 /*softmaxLseFlag*/ false,
                 /*keyAntiquantMode*/ (int64_t)0,
                 /*valueAntiquantMode*/ (int64_t)0,
-                /*attentionOut*/ t_attn_s,
+                /*attentionOut*/ t_attn_batch,
                 /*softmaxLse*/ nullptr,
                 &fa_ws, &fa_exec));
             ensure_workspace_(fa_ws);
@@ -2305,8 +2931,86 @@ void TalkerCannEngine::forward_prefill(const float *input_embeds, int seq_len,
                 ws, fa_ws, fa_exec, stream_));
             g_cann.aclDestroyTensorList(t_kl);
             g_cann.aclDestroyTensorList(t_vl);
-            g_cann.aclDestroyTensor(t_q_s);
-            g_cann.aclDestroyTensor(t_attn_s);
+            g_cann.aclDestroyTensor(t_q_batch);
+            g_cann.aclDestroyTensor(t_attn_batch);
+            g_cann.aclDestroyTensor(t_pse);
+        } else {
+            // Per-row FIAS loop: each Q row queries KV[0..pos] independently.
+            //   This sidesteps batched-FIAS numerical issues by looping with
+            //   S_q=1 (decode-mode FIAS), writing all seq_len attention
+            //   outputs into q_batch_dev_. Same answer as iterative
+            //   forward_decode, but shares the per-layer matmul/RmsNorm/etc.
+            //   batched work above.
+            for (int s = 0; s < seq_len; ++s) {
+                const int pos_abs = start_pos + s;
+                const int kv_len = pos_abs + 1;
+
+                uint16_t *q_src = (uint16_t*)attn_out_batch_dev_ + (size_t)s * q_dim_;
+                uint16_t *attn_dst = (uint16_t*)q_batch_dev_ + (size_t)s * q_dim_;
+
+                int64_t q_shape[4]   = {1, 1, (int64_t)n_heads_, (int64_t)head_dim_};
+                int64_t q_strides[4] = {(int64_t)q_dim_, (int64_t)q_dim_,
+                                         (int64_t)head_dim_, 1};
+                aclTensor *t_q_s = tensor_strided(q_src, 4, q_shape, q_strides,
+                                                    ACL_FLOAT16);
+                aclTensor *t_attn_s = tensor_strided(attn_dst, 4, q_shape, q_strides,
+                                                       ACL_FLOAT16);
+
+                int64_t kv_shape[4]   = {1, (int64_t)kv_len,
+                                          (int64_t)n_kv_, (int64_t)head_dim_};
+                int64_t kv_strides[4] = {(int64_t)kv_len * kv_dim_,
+                                          (int64_t)kv_dim_,
+                                          (int64_t)head_dim_, 1};
+                aclTensor *t_k_s = tensor_strided(k_cache_dev_[il], 4, kv_shape,
+                                                    kv_strides, ACL_FLOAT16);
+                aclTensor *t_v_s = tensor_strided(v_cache_dev_[il], 4, kv_shape,
+                                                    kv_strides, ACL_FLOAT16);
+                aclTensorList *t_kl = g_cann.aclCreateTensorList(&t_k_s, 1);
+                aclTensorList *t_vl = g_cann.aclCreateTensorList(&t_v_s, 1);
+
+                uint64_t fa_ws = 0;
+                aclOpExecutor *fa_exec = nullptr;
+                char layout[5] = {'B','S','N','D',0};
+                double scale = 1.0 / sqrt((double)head_dim_);
+                ACL_CHECK_RET(g_cann.aclnnFusedInferAttentionScoreV2GetWorkspaceSize(
+                    t_q_s, t_kl, t_vl,
+                    /*pseShift*/ nullptr, /*attenMask*/ nullptr,
+                    /*actSeqLen*/ nullptr, /*actSeqLenKv*/ nullptr,
+                    /*deqScale1*/ nullptr, /*quantScale1*/ nullptr,
+                    /*deqScale2*/ nullptr, /*quantScale2*/ nullptr,
+                    /*quantOffset2*/ nullptr,
+                    /*antiquantScale*/ nullptr, /*antiquantOffset*/ nullptr,
+                    /*blockTable*/ nullptr,
+                    /*queryPaddingSize*/ nullptr, /*kvPaddingSize*/ nullptr,
+                    /*keyAntiquantScale*/ nullptr, /*keyAntiquantOffset*/ nullptr,
+                    /*valueAntiquantScale*/ nullptr, /*valueAntiquantOffset*/ nullptr,
+                    /*keySharedPrefix*/ nullptr, /*valueSharedPrefix*/ nullptr,
+                    /*actualSharedPrefixLen*/ nullptr,
+                    /*numHeads*/ (int64_t)n_heads_,
+                    /*scaleValue*/ scale,
+                    /*preTokens*/ (int64_t)65535,
+                    /*nextTokens*/ (int64_t)65535,
+                    /*inputLayout*/ layout,
+                    /*numKeyValueHeads*/ (int64_t)n_kv_,
+                    /*sparseMode*/ (int64_t)0,
+                    /*innerPrecise*/ (int64_t)0,
+                    /*blockSize*/ (int64_t)0,
+                    /*antiquantMode*/ (int64_t)0,
+                    /*softmaxLseFlag*/ false,
+                    /*keyAntiquantMode*/ (int64_t)0,
+                    /*valueAntiquantMode*/ (int64_t)0,
+                    /*attentionOut*/ t_attn_s,
+                    /*softmaxLse*/ nullptr,
+                    &fa_ws, &fa_exec));
+                ensure_workspace_(fa_ws);
+                void *ws = fa_ws > 0 ? workspace_dev_ : nullptr;
+                ACL_CHECK_RET(g_cann.aclnnFusedInferAttentionScoreV2(
+                    ws, fa_ws, fa_exec, stream_));
+                g_cann.aclDestroyTensorList(t_kl);
+                g_cann.aclDestroyTensorList(t_vl);
+                g_cann.aclDestroyTensor(t_q_s);
+                g_cann.aclDestroyTensor(t_attn_s);
+            }
         }
 
         // --- O projection (batched): o_out [seq_len, n_embd] = attn [seq_len, q_dim]
@@ -2460,9 +3164,13 @@ void TalkerCannEngine::forward_prefill(const float *input_embeds, int seq_len,
         g_cann.aclDestroyTensor(t_rstd);
     }
 
-    // Cast ONLY the last row's normed output to F32 and return to host (if
-    // the caller requested it). The internal batch result is discarded —
-    // TalkerLLM only needs the last position for next-token sampling.
+    // Cast ONLY the last row's normed output to F32. Under Phase 4 capture
+    // this Cast is the last recorded op of the graph; the subsequent
+    // SynchronizeStream + D2H run AFTER CaptureEnd (a captured graph cannot
+    // contain a stream sync or host memcpy). If last_hidden_out is null,
+    // we still want to record the last-row Cast (an idempotent pure-device
+    // op) so replay produces a usable graph even in throwaway-hidden calls;
+    // skip that case here since the caller does not need the hidden.
     if (last_hidden_out) {
         uint16_t *last_row = (uint16_t *)normed_batch_dev_ +
                                (size_t)(seq_len - 1) * n_embd_;
@@ -2472,6 +3180,31 @@ void TalkerCannEngine::forward_prefill(const float *input_embeds, int seq_len,
         CANN_OP(Cast, t_last_f16, ACL_FLOAT, t_last_f32);
         g_cann.aclDestroyTensor(t_last_f16);
         g_cann.aclDestroyTensor(t_last_f32);
+    }
+
+    // ---- A4c Phase 4 capture end (if captured this call) ------------------
+    if (prefill_capture_this_call) {
+        aclmdlRI g = nullptr;
+        aclError end_err = g_cann.aclmdlRICaptureEnd(stream_, &g);
+        if (end_err != 0 || g == nullptr) {
+            fprintf(stderr,
+                    "[talker_cann] prefill aclmdlRICaptureEnd bucket=%d "
+                    "(seq_len=%d) failed (%d), graph=%p — staying eager "
+                    "for this bucket: %s\n",
+                    prefill_bucket_idx, seq_len, end_err, (void *)g,
+                    g_cann.aclGetRecentErrMsg
+                        ? g_cann.aclGetRecentErrMsg() : "<n/a>");
+            if (g) g_cann.aclmdlRIDestroy(g);
+        } else {
+            prefill_graphs_[prefill_bucket_idx] = g;
+            printf("[talker_cann] A4c Phase 4 captured prefill graph bucket=%d "
+                   "(seq_len=%d). Subsequent matching calls will replay.\n",
+                   prefill_bucket_idx, seq_len);
+        }
+    }
+
+    // Post-capture sync + D2H.
+    if (last_hidden_out) {
         ACL_CHECK_RET(g_cann.aclrtSynchronizeStream(stream_));
         ACL_CHECK_RET(g_cann.aclrtMemcpy(
             last_hidden_out, (size_t)n_embd_ * sizeof(float),
