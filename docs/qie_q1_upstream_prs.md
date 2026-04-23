@@ -82,3 +82,13 @@ Searched `ggml-org/llama.cpp` for ggml-cann PR turnaround (for future planning):
 - Patches: `/tmp/upstream-patches/*.patch` (format-patched from the 3 source commits)
 - Source fork remote: `fork https://github.com/ymote/OminiX-Ascend.git`
 - Test receipt for PR bodies: `docs/qie_q1_baseline.md` (910B4, CANN 8.3.RC1, Q4_0 QIE, 2-step 256×256, valid cat PNG, 145s wall)
+
+---
+
+## DECISION 2026-04-23: SKIP UPSTREAM
+
+PM opted to keep the 3 fixes fork-only rather than attempt upstream filing.
+Rationale: CONTRIBUTING.md AI-authored-PR prohibition creates reputation
+risk on `ymote` account with uncertain reviewer-tolerance payoff. Branches
+remain pushed at `ymote/llama.cpp` for future human-authored submission
+if scope changes.
