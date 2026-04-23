@@ -114,6 +114,11 @@ bool load_once() {
     ok &= resolve(h_base, "aclDestroyTensor",         g_cann.aclDestroyTensor);
     ok &= resolve(h_base, "aclCreateScalar",          g_cann.aclCreateScalar);
     ok &= resolve(h_base, "aclDestroyScalar",         g_cann.aclDestroyScalar);
+    // IntArray helpers (QIE Q2.3 LayerNorm); optional — absence is only
+    // fatal at a LayerNorm call site, and the capability flag has_layer_norm()
+    // keeps that isolated.
+    resolve_optional(h_base, "aclCreateIntArray",     g_cann.aclCreateIntArray);
+    resolve_optional(h_base, "aclDestroyIntArray",    g_cann.aclDestroyIntArray);
 
     // ops (libopapi)
     ok &= resolve(h_op,   "aclnnMmGetWorkspaceSize",
@@ -265,6 +270,32 @@ bool load_once() {
                      g_cann.aclnnApplyRotaryPosEmbV2GetWorkspaceSize);
     resolve_optional(h_op, "aclnnApplyRotaryPosEmbV2",
                      g_cann.aclnnApplyRotaryPosEmbV2);
+
+    // Required for QIE Q2.3 block forward — aclnnMul (broadcast elementwise),
+    // aclnnLayerNorm (affine-off block norm), aclnnGelu/GeluV2 (FFN
+    // activation), aclnnSigmoid (convenience). CANN 8.3+. Marked
+    // `resolve_optional` so a missing symbol doesn't brick the unrelated
+    // TTS paths; QIE-specific callers check the capability helpers.
+    resolve_optional(h_op, "aclnnMulGetWorkspaceSize",
+                     g_cann.aclnnMulGetWorkspaceSize);
+    resolve_optional(h_op, "aclnnMul",
+                     g_cann.aclnnMul);
+    resolve_optional(h_op, "aclnnLayerNormGetWorkspaceSize",
+                     g_cann.aclnnLayerNormGetWorkspaceSize);
+    resolve_optional(h_op, "aclnnLayerNorm",
+                     g_cann.aclnnLayerNorm);
+    resolve_optional(h_op, "aclnnGeluV2GetWorkspaceSize",
+                     g_cann.aclnnGeluV2GetWorkspaceSize);
+    resolve_optional(h_op, "aclnnGeluV2",
+                     g_cann.aclnnGeluV2);
+    resolve_optional(h_op, "aclnnGeluGetWorkspaceSize",
+                     g_cann.aclnnGeluGetWorkspaceSize);
+    resolve_optional(h_op, "aclnnGelu",
+                     g_cann.aclnnGelu);
+    resolve_optional(h_op, "aclnnSigmoidGetWorkspaceSize",
+                     g_cann.aclnnSigmoidGetWorkspaceSize);
+    resolve_optional(h_op, "aclnnSigmoid",
+                     g_cann.aclnnSigmoid);
 
     if (!ok) {
         // Wipe partial state so is_ready() reports false.

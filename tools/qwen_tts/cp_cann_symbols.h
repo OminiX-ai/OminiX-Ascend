@@ -50,6 +50,10 @@ struct CannSyms {
     aclnnStatus (*aclDestroyTensor)(const aclTensor *);
     aclScalar *(*aclCreateScalar)(void *, aclDataType);
     aclnnStatus (*aclDestroyScalar)(const aclScalar *);
+    // IntArray helpers (needed for aclnnLayerNorm normalizedShape, and
+    // future ops that take int-array metadata).
+    aclIntArray *(*aclCreateIntArray)(const int64_t *value, uint64_t size);
+    aclnnStatus (*aclDestroyIntArray)(const aclIntArray *array);
 
     // ---- aclnn ops (libopapi.so) ----
     aclnnStatus (*aclnnMmGetWorkspaceSize)(const aclTensor *, const aclTensor *,
@@ -149,6 +153,63 @@ struct CannSyms {
                                               const aclScalar *, aclTensor *,
                                               uint64_t *, aclOpExecutor **);
     aclnnStatus (*aclnnMuls)(void *, uint64_t, aclOpExecutor *, aclrtStream);
+
+    // ---- Mul (elementwise, broadcast-capable) ------------------------------
+    // Required by QIE Q2.3 block forward for the modulation `x * (1 + scale)`
+    // multiply where `scale` is [B, hidden] and broadcasts over seq. aclnnMul
+    // follows numpy-style broadcast per aclnn_mul.h.
+    aclnnStatus (*aclnnMulGetWorkspaceSize)(const aclTensor *self,
+                                             const aclTensor *other,
+                                             aclTensor *out,
+                                             uint64_t *workspaceSize,
+                                             aclOpExecutor **executor);
+    aclnnStatus (*aclnnMul)(void *, uint64_t, aclOpExecutor *, aclrtStream);
+
+    // ---- LayerNorm (affine-off supported via nullptr gamma/beta) -----------
+    // QIE DiT uses LayerNorm with `affine=false` on img_norm1/2 + txt_norm1/2
+    // — per `tools/ominix_diffusion/src/qwen_image.hpp:205-213`. Signature
+    // follows aclnn_layer_norm.h: gamma/beta passed as optional tensors so
+    // callers can pass nullptr for the affine-off case. `normalizedShape`
+    // is an aclIntArray giving the trailing dims to reduce over.
+    aclnnStatus (*aclnnLayerNormGetWorkspaceSize)(
+        const aclTensor *input, const aclIntArray *normalizedShape,
+        const aclTensor *weightOptional, const aclTensor *biasOptional,
+        double eps, aclTensor *out, aclTensor *meanOutOptional,
+        aclTensor *rstdOutOptional, uint64_t *workspaceSize,
+        aclOpExecutor **executor);
+    aclnnStatus (*aclnnLayerNorm)(void *workspace, uint64_t workspaceSize,
+                                   aclOpExecutor *executor, aclrtStream stream);
+
+    // ---- GELU (approximate="tanh" to match ggml CPU reference) -------------
+    // QIE DiT FFN activation is GELU. The CPU reference (tools/ominix_diffusion
+    // via ggml_gelu) uses the tanh approximation
+    //   0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+    // aclnnGeluV2 takes an `approximate` string parameter accepting "none"
+    // (exact erf form) or "tanh" (matches ggml). We dispatch V2 with "tanh"
+    // for numerical parity with CPU reference in Q2.3 smoke.
+    //
+    // Older CANN without V2: dispatch aclnnGelu (defaults to exact erf on
+    // current 8.3; will drift from CPU reference by ~1e-3 cos_sim). Callers
+    // gate on has_gelu_v2(); absence triggers the "warn + exact" fallback.
+    aclnnStatus (*aclnnGeluV2GetWorkspaceSize)(const aclTensor *self,
+                                                int64_t approximate,
+                                                aclTensor *out,
+                                                uint64_t *workspaceSize,
+                                                aclOpExecutor **executor);
+    aclnnStatus (*aclnnGeluV2)(void *, uint64_t, aclOpExecutor *, aclrtStream);
+    aclnnStatus (*aclnnGeluGetWorkspaceSize)(const aclTensor *self,
+                                              aclTensor *out,
+                                              uint64_t *workspaceSize,
+                                              aclOpExecutor **executor);
+    aclnnStatus (*aclnnGelu)(void *, uint64_t, aclOpExecutor *, aclrtStream);
+
+    // ---- Sigmoid (used in some paths; QIE uses gate direct-multiply so this
+    //     is parked but resolved for convenience). ---------------------------
+    aclnnStatus (*aclnnSigmoidGetWorkspaceSize)(const aclTensor *self,
+                                                 aclTensor *out,
+                                                 uint64_t *workspaceSize,
+                                                 aclOpExecutor **executor);
+    aclnnStatus (*aclnnSigmoid)(void *, uint64_t, aclOpExecutor *, aclrtStream);
 
     // Non-destructive rotary position embedding (single tensor at a time).
     // `mode`: 0 = NEOX half-rotated, 1 = GPT-J interleaved. We use mode 0.
@@ -528,6 +589,24 @@ struct CannSyms {
     bool has_rope_v2() const {
         return aclnnApplyRotaryPosEmbV2GetWorkspaceSize != nullptr &&
                aclnnApplyRotaryPosEmbV2                 != nullptr;
+    }
+
+    // Capability flag for aclnnGeluV2 (Q2.3 / QIE DiT FFN). When present,
+    // callers dispatch with approximate="tanh" to match the ggml CPU
+    // reference. Absence means only the exact-erf aclnnGelu is available
+    // and callers accept a ~1e-3 cos_sim drift vs CPU reference (still
+    // above 0.99 in practice).
+    bool has_gelu_v2() const {
+        return aclnnGeluV2GetWorkspaceSize != nullptr &&
+               aclnnGeluV2                 != nullptr;
+    }
+
+    // Capability flag for aclnnLayerNorm (Q2.3 / QIE block norms). Required
+    // for the DiT block's img_norm1/2 + txt_norm1/2. Absence is fatal for
+    // QIE Phase 3; we ship a loud error rather than a silent wrong-norm.
+    bool has_layer_norm() const {
+        return aclnnLayerNormGetWorkspaceSize != nullptr &&
+               aclnnLayerNorm                 != nullptr;
     }
 };
 

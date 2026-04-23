@@ -323,6 +323,14 @@ public:
                         const ImageDiffusionConfig &cfg,
                         int device = 0);
 
+    // Test-only variant: open the device, allocate scratch + RoPE tables,
+    // but DO NOT load any weights. The caller's probe is expected to
+    // populate `layer_w_[il]` via `mutable_layer_weights(il)` with its
+    // own synthetic device buffers. Used by the Q2.3 Phase 3 smoke (which
+    // generates random F16 weights on-host and uploads them directly,
+    // avoiding the ~18 GiB full-GGUF resident cost on ac03).
+    bool init_for_smoke(const ImageDiffusionConfig &cfg, int device = 0);
+
     // Full denoising: run `cfg_.num_inference_steps` Euler-flow steps of
     // joint-attention DiT forward on `initial_noise` conditioned on `cond_emb`
     // (text-encoder features) and `ref_latents` (VAE-encoded input image).
@@ -363,6 +371,23 @@ public:
     const ImageDiffusionConfig &config() const { return cfg_; }
     const DiTInitStats &stats() const { return stats_; }
 
+    // Test-only hook: dispatch one block (by layer index) for smoke probes.
+    // Phase 3 gate uses this to isolate a single block forward vs CPU
+    // reference without running the full 60-block stack. Private
+    // implementation is called via forward(), but this hook lets a
+    // probe run block 0 in isolation.
+    bool forward_block_test(int il,
+                             void *img_hidden, int64_t img_seq,
+                             void *txt_hidden, int64_t txt_seq,
+                             void *t_emb,
+                             void *pe);
+
+    // Test-only hook: mutable access to DiTLayerWeights[il] so a probe can
+    // populate synthetic weights without a real GGUF. Returns nullptr if
+    // `il` is out of range or the engine has not allocated its layer
+    // vector yet.
+    DiTLayerWeights *mutable_layer_weights(int il);
+
 private:
     // --- State ---
     bool  ready_                 = false;
@@ -378,13 +403,33 @@ private:
     // --- Intermediate scratch (single-request; no request-level concurrency) ---
     // Sized at init for the worst case (max_img_seq + max_txt_seq at
     // cfg_.hidden_size). Reused every step.
-    void *scratch_q_dev_    = nullptr;  // F16 [seq, hidden]
-    void *scratch_k_dev_    = nullptr;  // F16 [seq, hidden]
-    void *scratch_v_dev_    = nullptr;  // F16 [seq, hidden]
-    void *scratch_attn_dev_ = nullptr;  // F16 [seq, hidden]
-    void *scratch_mlp_dev_  = nullptr;  // F16 [seq, ff_dim]
-    void *scratch_mod_dev_  = nullptr;  // F16 [6 · hidden] per stream, per block
-    void *rstd_dev_         = nullptr;  // F32 [max_heads · seq] (RMSNorm rstd)
+    //
+    // Q2.3 Phase 3 refines the scratch layout: within a block we need
+    //   - separate Q/K/V staging for the joint (img+txt) attention input
+    //     so concat is a pair of memcpys into a common buffer
+    //   - a normed+modulated activation buffer per stream (img, txt)
+    //   - an attention-output buffer big enough for joint seq
+    //   - an FFN-intermediate buffer at [seq, ff_dim] per stream
+    // Shared buffers (single-request, no intra-block concurrency) are fine.
+    void *scratch_q_dev_    = nullptr;  // F16 [seq_total, hidden]  (txt||img)
+    void *scratch_k_dev_    = nullptr;  // F16 [seq_total, hidden]
+    void *scratch_v_dev_    = nullptr;  // F16 [seq_total, hidden]
+    void *scratch_attn_dev_ = nullptr;  // F16 [seq_total, hidden]  (attn out)
+    void *scratch_mlp_dev_  = nullptr;  // F16 [max_seq,   ff_dim]
+    void *scratch_mod_dev_  = nullptr;  // F16 [12 · hidden] (6 img + 6 txt)
+    void *rstd_dev_         = nullptr;  // F32 [heads · seq] (RMSNorm rstd)
+
+    // Q2.3 additional scratch for block intermediates. These are small
+    // (multiples of hidden × max_seq) and cheap to reserve up-front.
+    void *scratch_img_norm_dev_ = nullptr;  // F16 [img_seq, hidden]
+    void *scratch_txt_norm_dev_ = nullptr;  // F16 [txt_seq, hidden]
+    void *scratch_img_out_dev_  = nullptr;  // F16 [img_seq, hidden] (attn/ffn out per-stream)
+    void *scratch_txt_out_dev_  = nullptr;  // F16 [txt_seq, hidden]
+    void *mean_dev_             = nullptr;  // F32 [max_seq]  (LayerNorm mean)
+    void *ln_rstd_dev_          = nullptr;  // F32 [max_seq]  (LayerNorm rstd)
+    // Affine-off LayerNorm helpers: since aclnnLayerNorm takes optional
+    // gamma/beta we can pass nullptr. Reserved for future probe fallbacks
+    // that need explicit constant tensors.
 
     // CFG duplicates — cond + uncond pass share weights, need separate
     // activation scratch. Phase 4 wires these.
@@ -424,11 +469,63 @@ private:
     //
     // Phase 3 target: ~15 aclnn op dispatches per block (6 matmul + 4 norm +
     // RoPE + attention + 2 FFN matmuls + residual adds + gates).
-    void forward_block_(const DiTLayerWeights &lw,
+    // Returns true on success (every dispatch returned 0). False aborts
+    // the outer `forward` / `denoise` caller with a logged error.
+    bool forward_block_(const DiTLayerWeights &lw,
                         void *img_hidden, int64_t img_seq,
                         void *txt_hidden, int64_t txt_seq,
                         void *t_emb,
                         void *pe);
+
+    // Matmul dispatch wrapper (Q2.3). Branches on `weight_scale_dev`:
+    //   non-null → aclnnWeightQuantBatchMatmulV3 (Q4 packed + F16 scale,
+    //              antiquantGroupSize=32 per Q2.1 probe)
+    //   null      → aclnnMm (F16 fallback: Q4_1/Q5_K/BF16 source upload)
+    //
+    // Activation `x_f16` has logical shape [M, K]; weight has logical shape
+    // [K, N]; output `y_f16` has logical shape [M, N]. M can be seq_len ×
+    // batch collapsed. `bias_f16_dev` is applied post-matmul if non-null
+    // (F16 1D [N]). Returns false on any aclnn status != 0.
+    bool dispatch_matmul_(void *x_f16_dev, void *weight_dev,
+                          void *weight_scale_dev, void *bias_f16_dev,
+                          int64_t M, int64_t K, int64_t N,
+                          void *y_f16_dev);
+
+    // Apply element-wise `x = x * (1 + scale) + shift` with scale/shift
+    // broadcasting over the seq dim. `x_f16_dev` is [B, seq, hidden];
+    // scale/shift are F16 [B, hidden]. In-place on x. Phase 3 uses B=1.
+    bool modulate_(void *x_f16_dev, const void *scale_f16_dev,
+                   const void *shift_f16_dev,
+                   int64_t B, int64_t seq, int64_t hidden);
+
+    // Apply `x = x + src * gate` with gate broadcasting over seq.
+    // `x_f16_dev` and `src_f16_dev` are [B, seq, hidden]; gate is F16
+    // [B, hidden]. In-place on x (residual add with gated residual).
+    bool gated_residual_add_(void *x_f16_dev, const void *src_f16_dev,
+                             const void *gate_f16_dev,
+                             int64_t B, int64_t seq, int64_t hidden);
+
+    // aclnnLayerNorm dispatch: out = LayerNorm(x, normalizedShape=[hidden],
+    // gamma=null, beta=null, eps=cfg_.layernorm_eps). Input/output are F16
+    // [B, seq, hidden].
+    bool layer_norm_(void *x_f16_dev, void *out_f16_dev,
+                     int64_t B, int64_t seq, int64_t hidden);
+
+    // aclnnRmsNorm dispatch over the last dim `head_dim`. Input/output are
+    // F16 [B, seq, n_heads, head_dim]; gamma is F32 [head_dim]. For QIE Q2.3
+    // we reshape to `[B * seq * n_heads, head_dim]` as required by the op.
+    bool rms_norm_head_(void *x_f16_dev, void *out_f16_dev, void *gamma_f32_dev,
+                        int64_t rows, int64_t head_dim);
+
+    // Apply 3D-axial RoPE to a Q or K tensor using the pre-computed pe
+    // table. `x_f16_dev` has layout [B, seq, n_heads, head_dim] F16.
+    // `pe_f16_dev` layout matches `Rope::apply_rope` expectations:
+    // [seq_pe_max, head_dim/2, 2, 2]. `pe_row_offset` is the starting row
+    // inside pe to apply (0 for txt stream, ctx_len for img stream).
+    // Output is in-place on x.
+    bool apply_rope_(void *x_f16_dev,
+                     const void *pe_f16_dev, int64_t pe_row_offset,
+                     int64_t B, int64_t seq, int64_t n_heads, int64_t head_dim);
 
     // One Euler-flow scheduler step: given the DiT's predicted velocity
     // `model_out` (NPU buffer), the current latent, and the Euler-flow

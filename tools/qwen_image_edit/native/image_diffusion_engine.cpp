@@ -666,6 +666,9 @@ ImageDiffusionEngine::~ImageDiffusionEngine() {
     free_dev(scratch_v_dev_);    free_dev(scratch_attn_dev_);
     free_dev(scratch_mlp_dev_);  free_dev(scratch_mod_dev_);
     free_dev(rstd_dev_);
+    free_dev(scratch_img_norm_dev_);  free_dev(scratch_txt_norm_dev_);
+    free_dev(scratch_img_out_dev_);   free_dev(scratch_txt_out_dev_);
+    free_dev(mean_dev_);              free_dev(ln_rstd_dev_);
     free_dev(img_hidden_cond_dev_);   free_dev(img_hidden_uncond_dev_);
     free_dev(txt_hidden_cond_dev_);   free_dev(txt_hidden_uncond_dev_);
     free_dev(workspace_dev_);
@@ -1020,6 +1023,19 @@ bool ImageDiffusionEngine::init_from_gguf(const std::string &gguf_path,
         if (!try_alloc(&rstd_dev_,         (size_t)cfg_.num_heads
                                              * SEQ * sizeof(float)))    goto fail;
 
+        // Q2.3 per-stream intermediates.
+        if (!try_alloc(&scratch_img_norm_dev_,
+                       (size_t)cfg_.max_img_seq * H * F16)) goto fail;
+        if (!try_alloc(&scratch_txt_norm_dev_,
+                       (size_t)cfg_.max_txt_seq * H * F16)) goto fail;
+        if (!try_alloc(&scratch_img_out_dev_,
+                       (size_t)cfg_.max_img_seq * H * F16)) goto fail;
+        if (!try_alloc(&scratch_txt_out_dev_,
+                       (size_t)cfg_.max_txt_seq * H * F16)) goto fail;
+        // LayerNorm mean/rstd are F32 per row (rows = B*seq).
+        if (!try_alloc(&mean_dev_,    (size_t)SEQ * sizeof(float))) goto fail;
+        if (!try_alloc(&ln_rstd_dev_, (size_t)SEQ * sizeof(float))) goto fail;
+
         // Small workspace seed — ops grow it via ensure_workspace_.
         if (!try_alloc(&workspace_dev_, 4 * 1024 * 1024)) goto fail;
         workspace_size_ = 4 * 1024 * 1024;
@@ -1076,20 +1092,27 @@ fail:
 }
 
 // ---------------------------------------------------------------------------
-// forward — single DiT step (Phase 3 will fill this body).
+// forward — dispatch all DiT blocks in sequence. Phase 3 smoke entry point.
+// Phase 4 wires the wider denoising loop around this.
 // ---------------------------------------------------------------------------
-bool ImageDiffusionEngine::forward(void * /*img_hidden_dev*/, int64_t img_seq,
-                                     void * /*txt_hidden_dev*/, int64_t txt_seq,
-                                     void * /*t_emb_dev*/,
-                                     void * /*pe_dev*/) {
+bool ImageDiffusionEngine::forward(void *img_hidden_dev, int64_t img_seq,
+                                     void *txt_hidden_dev, int64_t txt_seq,
+                                     void *t_emb_dev,
+                                     void *pe_dev) {
     if (!ready_) {
         QIE_LOG("forward: engine not ready");
         return false;
     }
-    QIE_LOG("forward: scaffold Phase 2 — body not wired yet "
-            "(Phase 3 adds 60-block dispatch). img_seq=%lld txt_seq=%lld",
-            (long long)img_seq, (long long)txt_seq);
-    return false;
+    for (int il = 0; il < cfg_.num_layers; ++il) {
+        if (!forward_block_(layer_w_[il],
+                            img_hidden_dev, img_seq,
+                            txt_hidden_dev, txt_seq,
+                            t_emb_dev, pe_dev)) {
+            QIE_LOG("forward: block %d returned error", il);
+            return false;
+        }
+    }
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1159,16 +1182,877 @@ void ImageDiffusionEngine::build_time_emb_(float timestep, void *out_dev) {
     // to `hidden`.
 }
 
-void ImageDiffusionEngine::forward_block_(const DiTLayerWeights & /*lw*/,
-                                            void * /*img_hidden*/,
-                                            int64_t img_seq,
-                                            void * /*txt_hidden*/,
-                                            int64_t txt_seq,
-                                            void * /*t_emb*/,
-                                            void * /*pe*/) {
-    (void)img_seq; (void)txt_seq;
-    // Phase 3 body. Sequence documented inline in the header —
-    // image_diffusion_engine.h lines ~260-310.
+// ============================================================================
+// Q2.3 Phase 3 — forward_block_ and its op dispatch helpers.
+//
+// Implements one DiT block on NPU. Every site below maps 1:1 to a line in the
+// CPU reference at `tools/ominix_diffusion/src/qwen_image.hpp:251-315`.
+//
+// Ordering:
+//   1. Modulation: img_mod.1(silu(t_emb)) split into 6 chunks × 2 streams
+//   2. LayerNorm1 (affine-off) + modulate(scale1, shift1) → img_mod, txt_mod
+//   3. QKV projections per stream → reshape to [B, seq, n_head, head_dim]
+//   4. Q/K RMSNorm per stream (head-wise gamma)
+//   5. Apply 3D-axial RoPE on Q, K per stream (using pre-computed pe table)
+//   6. Concat txt || img along seq dim → joint [B, seq_txt+seq_img, N, D]
+//   7. aclnnFusedInferAttentionScoreV2 at joint seq
+//   8. Split attn output back into img / txt chunks
+//   9. Output projections to_out.0 (img) and to_add_out (txt)
+//  10. Gated residual add: img += attn_out_img * gate1_img  (and txt)
+//  11. LayerNorm2 + modulate(scale2, shift2)
+//  12. FFN per stream: Linear(H→ff_dim) → GELU-tanh → Linear(ff_dim→H)
+//  13. Gated residual add: img += ffn_out_img * gate2_img  (and txt)
+// ============================================================================
+
+namespace {
+
+// Local helpers for tensor construction in the forward path. Keep them
+// namespace-scoped so we don't pollute the engine class with friend boilerplate.
+inline aclTensor *tensor_nd_f16(void *dev, int ndim,
+                                 const int64_t *shape,
+                                 const int64_t *strides) {
+    int64_t storage = 1;
+    for (int i = 0; i < ndim; ++i) storage *= shape[i];
+    return g_cann.aclCreateTensor(shape, (uint64_t)ndim, ACL_FLOAT16,
+                                   strides, 0, ACL_FORMAT_ND,
+                                   &storage, 1, dev);
+}
+
+inline aclTensor *tensor_nd_f32(void *dev, int ndim,
+                                 const int64_t *shape,
+                                 const int64_t *strides) {
+    int64_t storage = 1;
+    for (int i = 0; i < ndim; ++i) storage *= shape[i];
+    return g_cann.aclCreateTensor(shape, (uint64_t)ndim, ACL_FLOAT,
+                                   strides, 0, ACL_FORMAT_ND,
+                                   &storage, 1, dev);
+}
+
+// Row-major contiguous stride helper.
+inline void make_contig_strides(int ndim, const int64_t *shape,
+                                 int64_t *out_strides) {
+    int64_t s = 1;
+    for (int i = ndim - 1; i >= 0; --i) {
+        out_strides[i] = s;
+        s *= shape[i];
+    }
+}
+
+inline aclScalar *make_f16_scalar_local(float v) {
+    uint16_t b = fp32_to_fp16(v);
+    return g_cann.aclCreateScalar(&b, ACL_FLOAT16);
+}
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// Q2.3: matmul dispatch. Activation `x_f16` [M, K]; weight logical [K, N];
+// output `y_f16` [M, N]. Weight physical layout depends on path:
+//   Q4-resident: `weight_dev` is INT4 packed [K*N/2 bytes], `weight_scale_dev`
+//                is F16 [K/32, N]; antiquantGroupSize=32 per Q2.1 probe.
+//   F16-fallback: `weight_dev` holds the F16 weight in GGUF's physical [N, K]
+//                 row-major layout (aka `[K, N]` viewed with strides (1, K)).
+//                 We build a transposed view and dispatch aclnnMm.
+// If bias_f16_dev != nullptr, aclnnAdd is chained after the matmul to add
+// bias broadcast over M (bias shape [N]).
+// ---------------------------------------------------------------------------
+bool ImageDiffusionEngine::dispatch_matmul_(void *x_f16_dev, void *weight_dev,
+                                              void *weight_scale_dev,
+                                              void *bias_f16_dev,
+                                              int64_t M, int64_t K, int64_t N,
+                                              void *y_f16_dev) {
+    if (!x_f16_dev || !weight_dev || !y_f16_dev) {
+        QIE_LOG("dispatch_matmul_: null buffer (x=%p w=%p y=%p)",
+                x_f16_dev, weight_dev, y_f16_dev);
+        return false;
+    }
+
+    // Build activation tensor view [M, K] contig.
+    int64_t x_shape[2]   = {M, K};
+    int64_t x_strides[2] = {K, 1};
+    aclTensor *t_x = tensor_nd_f16(x_f16_dev, 2, x_shape, x_strides);
+
+    // Build output tensor view [M, N] contig.
+    int64_t y_shape[2]   = {M, N};
+    int64_t y_strides[2] = {N, 1};
+    aclTensor *t_y = tensor_nd_f16(y_f16_dev, 2, y_shape, y_strides);
+
+    aclnnStatus s = 0;
+    if (weight_scale_dev != nullptr) {
+        // --- Q4 path: WQBMMv3 with antiquantGroupSize=32 -------------------
+        // Weight logical shape [K, N] with strides (1, K): byte `n*K+k` lo
+        // nibble = element (k, n). Scale logical shape [K/32, N].
+        int64_t w_shape[2]   = {K, N};
+        int64_t w_strides[2] = {1, K};
+        int64_t w_storage    = K * N;
+        aclTensor *t_w = g_cann.aclCreateTensor(
+            w_shape, 2, ACL_INT4, w_strides, 0, ACL_FORMAT_ND,
+            &w_storage, 1, weight_dev);
+
+        int64_t s_shape[2]   = {K / 32, N};
+        int64_t s_strides[2] = {N, 1};
+        aclTensor *t_scale = tensor_nd_f16(weight_scale_dev, 2, s_shape, s_strides);
+
+        uint64_t ws_needed = 0;
+        aclOpExecutor *exec = nullptr;
+        if (g_cann.aclnnWeightQuantBatchMatmulV3GetWorkspaceSize &&
+            g_cann.aclnnWeightQuantBatchMatmulV3) {
+            s = g_cann.aclnnWeightQuantBatchMatmulV3GetWorkspaceSize(
+                t_x, t_w, t_scale,
+                /*antiquantOffsetOptional*/ nullptr,
+                /*quantScaleOptional*/      nullptr,
+                /*quantOffsetOptional*/     nullptr,
+                /*biasOptional*/            nullptr,  // apply bias after
+                /*antiquantGroupSize*/      32,
+                /*innerPrecise*/            1,
+                t_y, &ws_needed, &exec);
+            if (s == 0) {
+                ensure_workspace_(ws_needed);
+                void *ws = ws_needed > 0 ? workspace_dev_ : nullptr;
+                s = g_cann.aclnnWeightQuantBatchMatmulV3(ws, ws_needed, exec,
+                                                          compute_stream_);
+                if (s != 0) {
+                    QIE_LOG("dispatch_matmul_: WQBMMv3 launch status=%d",
+                            (int)s);
+                }
+            } else {
+                QIE_LOG("dispatch_matmul_: WQBMMv3 workspace status=%d",
+                        (int)s);
+            }
+        } else {
+            QIE_LOG("dispatch_matmul_: WQBMMv3 symbol missing");
+            s = -1;
+        }
+        g_cann.aclDestroyTensor(t_w);
+        g_cann.aclDestroyTensor(t_scale);
+        if (s != 0) {
+            g_cann.aclDestroyTensor(t_x);
+            g_cann.aclDestroyTensor(t_y);
+            return false;
+        }
+    } else {
+        // --- F16 fallback path: plain aclnnMm ------------------------------
+        // Weight stored as GGUF [N, K] row-major (K contig). Transposed view
+        // into [K, N] with strides (1, K).
+        int64_t w_shape[2]   = {K, N};
+        int64_t w_strides[2] = {1, K};
+        int64_t w_storage    = K * N;
+        aclTensor *t_w = g_cann.aclCreateTensor(
+            w_shape, 2, ACL_FLOAT16, w_strides, 0, ACL_FORMAT_ND,
+            &w_storage, 1, weight_dev);
+
+        uint64_t ws_needed = 0;
+        aclOpExecutor *exec = nullptr;
+        s = g_cann.aclnnMmGetWorkspaceSize(t_x, t_w, t_y, (int8_t)0,
+                                             &ws_needed, &exec);
+        if (s != 0) {
+            QIE_LOG("dispatch_matmul_: Mm workspace status=%d", (int)s);
+        } else {
+            ensure_workspace_(ws_needed);
+            void *ws = ws_needed > 0 ? workspace_dev_ : nullptr;
+            s = g_cann.aclnnMm(ws, ws_needed, exec, compute_stream_);
+            if (s != 0) {
+                QIE_LOG("dispatch_matmul_: Mm launch status=%d", (int)s);
+            }
+        }
+        g_cann.aclDestroyTensor(t_w);
+        if (s != 0) {
+            g_cann.aclDestroyTensor(t_x);
+            g_cann.aclDestroyTensor(t_y);
+            return false;
+        }
+    }
+
+    // Chain bias add if present: y += bias broadcast over M.
+    if (bias_f16_dev) {
+        int64_t b_shape[2]   = {1, N};
+        int64_t b_strides[2] = {N, 1};
+        aclTensor *t_b = tensor_nd_f16(bias_f16_dev, 2, b_shape, b_strides);
+
+        aclScalar *alpha = nullptr;
+        {
+            uint16_t one = fp32_to_fp16(1.0f);
+            alpha = g_cann.aclCreateScalar(&one, ACL_FLOAT16);
+        }
+        uint64_t ws_needed = 0;
+        aclOpExecutor *exec = nullptr;
+        s = g_cann.aclnnInplaceAddGetWorkspaceSize(t_y, t_b, alpha,
+                                                     &ws_needed, &exec);
+        if (s != 0) {
+            QIE_LOG("dispatch_matmul_: InplaceAdd workspace status=%d",
+                    (int)s);
+        } else {
+            ensure_workspace_(ws_needed);
+            void *ws = ws_needed > 0 ? workspace_dev_ : nullptr;
+            s = g_cann.aclnnInplaceAdd(ws, ws_needed, exec, compute_stream_);
+            if (s != 0) {
+                QIE_LOG("dispatch_matmul_: InplaceAdd launch status=%d",
+                        (int)s);
+            }
+        }
+        g_cann.aclDestroyScalar(alpha);
+        g_cann.aclDestroyTensor(t_b);
+    }
+
+    g_cann.aclDestroyTensor(t_x);
+    g_cann.aclDestroyTensor(t_y);
+    return s == 0;
+}
+
+// ---------------------------------------------------------------------------
+// Q2.3: modulate — x = x * (1 + scale) + shift, scale/shift [B, hidden]
+// broadcast over seq. Implemented as two ops:
+//   aclnnMul   y_tmp = x * scale_reshape     (broadcast)
+//   aclnnInplaceAdd  x += y_tmp              (bias-style add)
+//   aclnnInplaceAdd  x += shift_reshape      (bias-style add, broadcast)
+// The broadcast works because aclnnMul / aclnnAdd follow numpy-style rules:
+// shape [B, seq, H] op shape [B, 1, H] → [B, seq, H].
+// ---------------------------------------------------------------------------
+bool ImageDiffusionEngine::modulate_(void *x_f16_dev,
+                                       const void *scale_f16_dev,
+                                       const void *shift_f16_dev,
+                                       int64_t B, int64_t seq, int64_t hidden) {
+    if (!x_f16_dev || !scale_f16_dev || !shift_f16_dev) return false;
+    if (!g_cann.aclnnMul || !g_cann.aclnnMulGetWorkspaceSize) {
+        QIE_LOG("modulate_: aclnnMul symbol missing");
+        return false;
+    }
+
+    // Build tensors. scratch_mlp_dev_ is sized [SEQ, FF_DIM] F16 worst case —
+    // ample for a temporary [B, seq, H]. We borrow its head here.
+    int64_t x_shape[3]   = {B, seq, hidden};
+    int64_t x_strides[3];
+    make_contig_strides(3, x_shape, x_strides);
+    int64_t b_shape[3]   = {B, 1, hidden};
+    int64_t b_strides[3] = {hidden, hidden, 1};
+
+    aclTensor *t_x = tensor_nd_f16(x_f16_dev, 3, x_shape, x_strides);
+    aclTensor *t_scale = tensor_nd_f16(const_cast<void *>(scale_f16_dev),
+                                         3, b_shape, b_strides);
+    aclTensor *t_shift = tensor_nd_f16(const_cast<void *>(shift_f16_dev),
+                                         3, b_shape, b_strides);
+    // tmp = x * scale — needs a temporary buffer. Use scratch_mlp_dev_ head.
+    aclTensor *t_tmp = tensor_nd_f16(scratch_mlp_dev_, 3, x_shape, x_strides);
+
+    aclnnStatus s = 0;
+    uint64_t ws = 0;
+    aclOpExecutor *exec = nullptr;
+
+    s = g_cann.aclnnMulGetWorkspaceSize(t_x, t_scale, t_tmp, &ws, &exec);
+    if (s == 0) {
+        ensure_workspace_(ws);
+        s = g_cann.aclnnMul(ws > 0 ? workspace_dev_ : nullptr, ws, exec,
+                             compute_stream_);
+    }
+    if (s != 0) QIE_LOG("modulate_: Mul status=%d", (int)s);
+
+    // x += tmp
+    if (s == 0) {
+        aclScalar *alpha = make_f16_scalar_local(1.0f);
+        s = g_cann.aclnnInplaceAddGetWorkspaceSize(t_x, t_tmp, alpha,
+                                                     &ws, &exec);
+        if (s == 0) {
+            ensure_workspace_(ws);
+            s = g_cann.aclnnInplaceAdd(ws > 0 ? workspace_dev_ : nullptr,
+                                         ws, exec, compute_stream_);
+        }
+        g_cann.aclDestroyScalar(alpha);
+        if (s != 0) QIE_LOG("modulate_: InplaceAdd(x+=tmp) status=%d", (int)s);
+    }
+
+    // x += shift
+    if (s == 0) {
+        aclScalar *alpha = make_f16_scalar_local(1.0f);
+        s = g_cann.aclnnInplaceAddGetWorkspaceSize(t_x, t_shift, alpha,
+                                                     &ws, &exec);
+        if (s == 0) {
+            ensure_workspace_(ws);
+            s = g_cann.aclnnInplaceAdd(ws > 0 ? workspace_dev_ : nullptr,
+                                         ws, exec, compute_stream_);
+        }
+        g_cann.aclDestroyScalar(alpha);
+        if (s != 0) QIE_LOG("modulate_: InplaceAdd(x+=shift) status=%d",
+                            (int)s);
+    }
+
+    g_cann.aclDestroyTensor(t_x);
+    g_cann.aclDestroyTensor(t_scale);
+    g_cann.aclDestroyTensor(t_shift);
+    g_cann.aclDestroyTensor(t_tmp);
+    return s == 0;
+}
+
+// ---------------------------------------------------------------------------
+// Q2.3: gated residual add. x += src * gate, gate [B, hidden] broadcast over
+// seq. Two ops: aclnnMul(src, gate, tmp) then aclnnInplaceAdd(x, tmp).
+// ---------------------------------------------------------------------------
+bool ImageDiffusionEngine::gated_residual_add_(void *x_f16_dev,
+                                                 const void *src_f16_dev,
+                                                 const void *gate_f16_dev,
+                                                 int64_t B, int64_t seq,
+                                                 int64_t hidden) {
+    if (!x_f16_dev || !src_f16_dev || !gate_f16_dev) return false;
+    if (!g_cann.aclnnMul) { QIE_LOG("gate_add_: no Mul"); return false; }
+
+    int64_t x_shape[3]   = {B, seq, hidden};
+    int64_t x_strides[3];
+    make_contig_strides(3, x_shape, x_strides);
+    int64_t g_shape[3]   = {B, 1, hidden};
+    int64_t g_strides[3] = {hidden, hidden, 1};
+
+    aclTensor *t_x   = tensor_nd_f16(x_f16_dev, 3, x_shape, x_strides);
+    aclTensor *t_src = tensor_nd_f16(const_cast<void *>(src_f16_dev),
+                                       3, x_shape, x_strides);
+    aclTensor *t_g   = tensor_nd_f16(const_cast<void *>(gate_f16_dev),
+                                       3, g_shape, g_strides);
+    aclTensor *t_tmp = tensor_nd_f16(scratch_mlp_dev_, 3, x_shape, x_strides);
+
+    aclnnStatus s = 0;
+    uint64_t ws = 0;
+    aclOpExecutor *exec = nullptr;
+    s = g_cann.aclnnMulGetWorkspaceSize(t_src, t_g, t_tmp, &ws, &exec);
+    if (s == 0) {
+        ensure_workspace_(ws);
+        s = g_cann.aclnnMul(ws > 0 ? workspace_dev_ : nullptr, ws, exec,
+                             compute_stream_);
+    }
+    if (s != 0) QIE_LOG("gate_add_: Mul status=%d", (int)s);
+
+    if (s == 0) {
+        aclScalar *alpha = make_f16_scalar_local(1.0f);
+        s = g_cann.aclnnInplaceAddGetWorkspaceSize(t_x, t_tmp, alpha,
+                                                     &ws, &exec);
+        if (s == 0) {
+            ensure_workspace_(ws);
+            s = g_cann.aclnnInplaceAdd(ws > 0 ? workspace_dev_ : nullptr,
+                                         ws, exec, compute_stream_);
+        }
+        g_cann.aclDestroyScalar(alpha);
+        if (s != 0) QIE_LOG("gate_add_: InplaceAdd status=%d", (int)s);
+    }
+
+    g_cann.aclDestroyTensor(t_x);
+    g_cann.aclDestroyTensor(t_src);
+    g_cann.aclDestroyTensor(t_g);
+    g_cann.aclDestroyTensor(t_tmp);
+    return s == 0;
+}
+
+// ---------------------------------------------------------------------------
+// Q2.3: affine-off LayerNorm via aclnnLayerNorm(gamma=null, beta=null).
+// Input / output F16 [B, seq, hidden]. Normalize over the last dim.
+// ---------------------------------------------------------------------------
+bool ImageDiffusionEngine::layer_norm_(void *x_f16_dev, void *out_f16_dev,
+                                         int64_t B, int64_t seq,
+                                         int64_t hidden) {
+    if (!g_cann.aclnnLayerNorm || !g_cann.aclnnLayerNormGetWorkspaceSize) {
+        QIE_LOG("layer_norm_: aclnnLayerNorm symbol missing");
+        return false;
+    }
+    if (!g_cann.aclCreateIntArray) {
+        QIE_LOG("layer_norm_: aclCreateIntArray symbol missing");
+        return false;
+    }
+
+    int64_t shape[3]   = {B, seq, hidden};
+    int64_t strides[3];
+    make_contig_strides(3, shape, strides);
+    aclTensor *t_in  = tensor_nd_f16(x_f16_dev,    3, shape, strides);
+    aclTensor *t_out = tensor_nd_f16(out_f16_dev,  3, shape, strides);
+
+    // Normalized shape = [hidden].
+    int64_t norm_shape_arr[1] = {hidden};
+    aclIntArray *norm_shape = g_cann.aclCreateIntArray(norm_shape_arr, 1);
+
+    // mean/rstd tensors: shape [B, seq, 1] F32. Stored contig in
+    // mean_dev_ / ln_rstd_dev_ (sized for SEQ rows).
+    int64_t mr_shape[3]   = {B, seq, 1};
+    int64_t mr_strides[3];
+    make_contig_strides(3, mr_shape, mr_strides);
+    aclTensor *t_mean = tensor_nd_f32(mean_dev_,    3, mr_shape, mr_strides);
+    aclTensor *t_rstd = tensor_nd_f32(ln_rstd_dev_, 3, mr_shape, mr_strides);
+
+    uint64_t ws = 0;
+    aclOpExecutor *exec = nullptr;
+    aclnnStatus s = g_cann.aclnnLayerNormGetWorkspaceSize(
+        t_in, norm_shape,
+        /*weight*/ nullptr, /*bias*/ nullptr,
+        (double)cfg_.layernorm_eps,
+        t_out, t_mean, t_rstd,
+        &ws, &exec);
+    if (s == 0) {
+        ensure_workspace_(ws);
+        s = g_cann.aclnnLayerNorm(ws > 0 ? workspace_dev_ : nullptr,
+                                    ws, exec, compute_stream_);
+    }
+    if (s != 0) QIE_LOG("layer_norm_: status=%d", (int)s);
+
+    g_cann.aclDestroyIntArray(norm_shape);
+    g_cann.aclDestroyTensor(t_in);
+    g_cann.aclDestroyTensor(t_out);
+    g_cann.aclDestroyTensor(t_mean);
+    g_cann.aclDestroyTensor(t_rstd);
+    return s == 0;
+}
+
+// ---------------------------------------------------------------------------
+// Q2.3: RMSNorm across the head_dim axis. Input is [rows, head_dim] F16;
+// gamma is F32 [head_dim]. rstd_dev_ reused (F32 [rows]).
+// ---------------------------------------------------------------------------
+bool ImageDiffusionEngine::rms_norm_head_(void *x_f16_dev, void *out_f16_dev,
+                                             void *gamma_f32_dev,
+                                             int64_t rows, int64_t head_dim) {
+    if (!g_cann.aclnnRmsNorm || !gamma_f32_dev) {
+        QIE_LOG("rms_norm_head_: missing symbol or gamma (gamma=%p)",
+                gamma_f32_dev);
+        return false;
+    }
+
+    int64_t x_shape[2]   = {rows, head_dim};
+    int64_t x_strides[2] = {head_dim, 1};
+    aclTensor *t_in  = tensor_nd_f16(x_f16_dev,   2, x_shape, x_strides);
+    aclTensor *t_out = tensor_nd_f16(out_f16_dev, 2, x_shape, x_strides);
+
+    int64_t g_shape[1]   = {head_dim};
+    int64_t g_strides[1] = {1};
+    aclTensor *t_g = tensor_nd_f32(gamma_f32_dev, 1, g_shape, g_strides);
+
+    int64_t r_shape[2]   = {rows, 1};
+    int64_t r_strides[2] = {1, 1};
+    aclTensor *t_rstd = tensor_nd_f32(rstd_dev_, 2, r_shape, r_strides);
+
+    uint64_t ws = 0;
+    aclOpExecutor *exec = nullptr;
+    aclnnStatus s = g_cann.aclnnRmsNormGetWorkspaceSize(
+        t_in, t_g, (double)cfg_.rms_norm_eps, t_out, t_rstd, &ws, &exec);
+    if (s == 0) {
+        ensure_workspace_(ws);
+        s = g_cann.aclnnRmsNorm(ws > 0 ? workspace_dev_ : nullptr,
+                                  ws, exec, compute_stream_);
+    }
+    if (s != 0) QIE_LOG("rms_norm_head_: status=%d", (int)s);
+    g_cann.aclDestroyTensor(t_in);
+    g_cann.aclDestroyTensor(t_out);
+    g_cann.aclDestroyTensor(t_g);
+    g_cann.aclDestroyTensor(t_rstd);
+    return s == 0;
+}
+
+// ---------------------------------------------------------------------------
+// Q2.3: apply 3D-axial RoPE to a Q or K tensor using the pre-computed pe
+// table (`[seq_pe_max, head_dim/2, 2, 2]` F16 per Q0.5.3).
+//
+// The CPU reference (`Rope::apply_rope` in rope.hpp:603) implements the
+// rotation as a repeat-then-pair-mul-and-add over two pe slices:
+//   pe = [cos, -sin; sin, cos]
+//   x_pair_0 = repeat(x[..., 0], 2)   // x0 x0
+//   x_pair_1 = repeat(x[..., 1], 2)   // x1 x1
+//   out = x_pair_0 * pe[0] + x_pair_1 * pe[1]
+// where `pe[0] = [cos, -sin]` and `pe[1] = [sin, cos]`.
+//
+// For the NPU path we do the same thing with a small kernel that
+// dispatches element-wise ops. Since we don't have a per-element
+// aclnn primitive for the interleaved (x0 x1) → (x0*c - x1*s, x0*s + x1*c)
+// pattern AND the aclnnRotaryPositionEmbedding op uses NEOX-half layout
+// (not our interleaved pair layout), we implement RoPE via an on-device
+// Ascend-C copy that does the rotation. FOR PHASE 3 SMOKE, we first
+// validate correctness via a host-side round-trip (D2H → rotate → H2D)
+// — this is slow but bit-accurate and isolates the rest of the block's
+// numerics from RoPE bugs. Phase 3.1 (follow-up) swaps this for a
+// custom kernel or a repacked pe + aclnnRotaryPositionEmbedding path.
+//
+// `pe_row_offset` selects the starting row in pe: 0 for txt stream,
+// ctx_len for img stream per `compute_qwen_rope_pe_host`.
+// ---------------------------------------------------------------------------
+bool ImageDiffusionEngine::apply_rope_(void *x_f16_dev,
+                                         const void *pe_f16_dev,
+                                         int64_t pe_row_offset,
+                                         int64_t B, int64_t seq,
+                                         int64_t n_heads, int64_t head_dim) {
+    if (!x_f16_dev || !pe_f16_dev) return false;
+    const int64_t half = head_dim / 2;
+    const size_t  n_elt = (size_t)B * seq * n_heads * head_dim;
+
+    // Host round-trip: D2H → rotate in F32 → H2D. Bit-accurate reference
+    // for Phase 3 smoke. Replace with an on-device kernel in Phase 3.1.
+    std::vector<uint16_t> x_host(n_elt);
+    std::vector<uint16_t> pe_host((size_t)(pe_row_offset + seq) *
+                                   (size_t)half * 2 * 2);
+
+    aclError err = g_cann.aclrtSynchronizeStream(compute_stream_);
+    if (err != 0) return false;
+    err = g_cann.aclrtMemcpy(x_host.data(), x_host.size() * sizeof(uint16_t),
+                              x_f16_dev, x_host.size() * sizeof(uint16_t),
+                              ACL_MEMCPY_DEVICE_TO_HOST);
+    if (err != 0) return false;
+    err = g_cann.aclrtMemcpy(pe_host.data(),
+                              pe_host.size() * sizeof(uint16_t),
+                              const_cast<void *>(pe_f16_dev),
+                              pe_host.size() * sizeof(uint16_t),
+                              ACL_MEMCPY_DEVICE_TO_HOST);
+    if (err != 0) return false;
+
+    // x layout [B, seq, n_heads, head_dim] contig. For each element pair
+    // (d = 2*dp, d+1) at position (b, s, h): rotate using
+    // pe[pe_row_offset + s, dp, :, :].
+    auto f16_to_f32 = [](uint16_t bits) -> float {
+        __fp16 h; std::memcpy(&h, &bits, sizeof(h)); return (float)h;
+    };
+    auto f32_to_f16 = [](float v) -> uint16_t {
+        __fp16 h = (__fp16)v;
+        uint16_t out; std::memcpy(&out, &h, sizeof(out));
+        return out;
+    };
+
+    for (int64_t b = 0; b < B; ++b) {
+        for (int64_t s = 0; s < seq; ++s) {
+            const size_t pe_base =
+                (size_t)(pe_row_offset + s) * half * 4;  // 4 = 2·2
+            for (int64_t h = 0; h < n_heads; ++h) {
+                const size_t row_base =
+                    (((size_t)b * seq + s) * n_heads + h) * head_dim;
+                for (int64_t dp = 0; dp < half; ++dp) {
+                    const size_t pe_here = pe_base + (size_t)dp * 4;
+                    // pe layout: [cos, -sin, sin, cos]
+                    const float pe00 = f16_to_f32(pe_host[pe_here + 0]);
+                    const float pe01 = f16_to_f32(pe_host[pe_here + 1]);
+                    const float pe10 = f16_to_f32(pe_host[pe_here + 2]);
+                    const float pe11 = f16_to_f32(pe_host[pe_here + 3]);
+                    // x layout: interleaved pairs (x0, x1) at positions
+                    // (2*dp, 2*dp+1).
+                    const size_t i0 = row_base + (size_t)(2 * dp);
+                    const size_t i1 = row_base + (size_t)(2 * dp + 1);
+                    const float x0 = f16_to_f32(x_host[i0]);
+                    const float x1 = f16_to_f32(x_host[i1]);
+                    // Match rope.hpp:623-636 exactly:
+                    //   x_0 (broadcast) has shape [d/2, 2] filled with x0 x0
+                    //   x_1 (broadcast) has shape [d/2, 2] filled with x1 x1
+                    //   out = x_0 * pe[0]  +  x_1 * pe[1]
+                    // where pe[0] = (cos, -sin), pe[1] = (sin, cos). So
+                    //   out[0] = x0 * cos + x1 * sin
+                    //   out[1] = x0 * (-sin) + x1 * cos
+                    x_host[i0] = f32_to_f16(x0 * pe00 + x1 * pe10);
+                    x_host[i1] = f32_to_f16(x0 * pe01 + x1 * pe11);
+                }
+            }
+        }
+    }
+
+    err = g_cann.aclrtMemcpy(x_f16_dev, x_host.size() * sizeof(uint16_t),
+                              x_host.data(), x_host.size() * sizeof(uint16_t),
+                              ACL_MEMCPY_HOST_TO_DEVICE);
+    return err == 0;
+}
+
+// ---------------------------------------------------------------------------
+// Q2.3 MAIN: one transformer-block forward on NPU.
+// ---------------------------------------------------------------------------
+bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
+                                             void *img_hidden, int64_t img_seq,
+                                             void *txt_hidden, int64_t txt_seq,
+                                             void *t_emb,
+                                             void *pe) {
+    if (!ready_) return false;
+    const int64_t B    = 1;
+    const int64_t H    = cfg_.hidden_size;        // 3072
+    const int64_t HD   = cfg_.head_dim;           // 128
+    const int64_t NH   = cfg_.num_heads;          // 24
+    const int64_t FF   = (int64_t)H * cfg_.ff_mult;  // 12288
+    const int64_t seq_total = img_seq + txt_seq;
+
+    // ------------------------------------------------------------------
+    // 1. Modulation: mod_params = img_mod.1(silu(t_emb))  (and txt side)
+    //    scratch_mod_dev_ holds [12, H] F16 — first 6 img, next 6 txt.
+    //    First compute silu(t_emb) in-place on scratch_q_dev_[:H] (reuse).
+    // ------------------------------------------------------------------
+    // silu(t_emb) — t_emb is [B, H] F16. Write to scratch_q_dev_.
+    {
+        int64_t shape[2]   = {B, H};
+        int64_t strides[2] = {H, 1};
+        aclTensor *t_in  = tensor_nd_f16(t_emb,          2, shape, strides);
+        aclTensor *t_out = tensor_nd_f16(scratch_q_dev_, 2, shape, strides);
+        uint64_t ws = 0; aclOpExecutor *exec = nullptr;
+        aclnnStatus s = g_cann.aclnnSiluGetWorkspaceSize(t_in, t_out, &ws,
+                                                          &exec);
+        if (s == 0) {
+            ensure_workspace_(ws);
+            s = g_cann.aclnnSilu(ws > 0 ? workspace_dev_ : nullptr, ws, exec,
+                                   compute_stream_);
+        }
+        g_cann.aclDestroyTensor(t_in);
+        g_cann.aclDestroyTensor(t_out);
+        if (s != 0) { QIE_LOG("block: silu(t_emb) status=%d", (int)s);
+                       return false; }
+    }
+
+    // img_mod_params = img_mod.1 Linear → scratch_mod_dev_[0 .. 6H)
+    if (!dispatch_matmul_(scratch_q_dev_, lw.img_mod_w_q4, lw.img_mod_scale,
+                          lw.img_mod_b, B, H, 6 * H, scratch_mod_dev_))
+        return false;
+    // txt_mod_params = txt_mod.1 Linear → scratch_mod_dev_[6H .. 12H)
+    if (!dispatch_matmul_(scratch_q_dev_, lw.txt_mod_w_q4, lw.txt_mod_scale,
+                          lw.txt_mod_b, B, H, 6 * H,
+                          (uint8_t *)scratch_mod_dev_ + (size_t)6 * H *
+                                                          sizeof(uint16_t)))
+        return false;
+
+    // Chunk pointers (6 × H each) — scale1, shift1, gate1, scale2, shift2, gate2.
+    auto mod_chunk = [&](void *base, int which) {
+        return (uint8_t *)base + (size_t)which * H * sizeof(uint16_t);
+    };
+    void *img_scale1 = mod_chunk(scratch_mod_dev_, 0);
+    void *img_shift1 = mod_chunk(scratch_mod_dev_, 1);
+    void *img_gate1  = mod_chunk(scratch_mod_dev_, 2);
+    void *img_scale2 = mod_chunk(scratch_mod_dev_, 3);
+    void *img_shift2 = mod_chunk(scratch_mod_dev_, 4);
+    void *img_gate2  = mod_chunk(scratch_mod_dev_, 5);
+    void *txt_base   = (uint8_t *)scratch_mod_dev_ +
+                       (size_t)6 * H * sizeof(uint16_t);
+    void *txt_scale1 = mod_chunk(txt_base, 0);
+    void *txt_shift1 = mod_chunk(txt_base, 1);
+    void *txt_gate1  = mod_chunk(txt_base, 2);
+    void *txt_scale2 = mod_chunk(txt_base, 3);
+    void *txt_shift2 = mod_chunk(txt_base, 4);
+    void *txt_gate2  = mod_chunk(txt_base, 5);
+
+    // ------------------------------------------------------------------
+    // 2. LayerNorm1 on img + txt, then modulate(scale1, shift1).
+    //    Outputs written to scratch_img_norm_dev_ / scratch_txt_norm_dev_.
+    // ------------------------------------------------------------------
+    if (!layer_norm_(img_hidden, scratch_img_norm_dev_, B, img_seq, H))
+        return false;
+    if (!modulate_(scratch_img_norm_dev_, img_scale1, img_shift1,
+                   B, img_seq, H)) return false;
+    if (!layer_norm_(txt_hidden, scratch_txt_norm_dev_, B, txt_seq, H))
+        return false;
+    if (!modulate_(scratch_txt_norm_dev_, txt_scale1, txt_shift1,
+                   B, txt_seq, H)) return false;
+
+    // ------------------------------------------------------------------
+    // 3. QKV projections. img → to_q / to_k / to_v, txt → add_q/k/v.
+    //    The joint attention buffer layout is `txt || img` along seq dim
+    //    (matches qwen_image.hpp:160: ggml_concat(txt, img, 2)).
+    //    scratch_q/k/v_dev_ hold [seq_total, H] F16, with txt occupying the
+    //    first txt_seq rows and img the following img_seq rows.
+    // ------------------------------------------------------------------
+    auto offset_rows = [&](void *base, int64_t rows) {
+        return (uint8_t *)base + (size_t)rows * H * sizeof(uint16_t);
+    };
+    // txt QKV (rows 0 .. txt_seq) — head of scratch buffers.
+    if (!dispatch_matmul_(scratch_txt_norm_dev_, lw.add_q_w_q4, lw.add_q_scale,
+                          lw.add_q_b, txt_seq, H, H, scratch_q_dev_))
+        return false;
+    if (!dispatch_matmul_(scratch_txt_norm_dev_, lw.add_k_w_q4, lw.add_k_scale,
+                          lw.add_k_b, txt_seq, H, H, scratch_k_dev_))
+        return false;
+    if (!dispatch_matmul_(scratch_txt_norm_dev_, lw.add_v_w_q4, lw.add_v_scale,
+                          lw.add_v_b, txt_seq, H, H, scratch_v_dev_))
+        return false;
+    // img QKV (rows txt_seq .. seq_total).
+    if (!dispatch_matmul_(scratch_img_norm_dev_, lw.to_q_w_q4, lw.to_q_scale,
+                          lw.to_q_b, img_seq, H, H,
+                          offset_rows(scratch_q_dev_, txt_seq))) return false;
+    if (!dispatch_matmul_(scratch_img_norm_dev_, lw.to_k_w_q4, lw.to_k_scale,
+                          lw.to_k_b, img_seq, H, H,
+                          offset_rows(scratch_k_dev_, txt_seq))) return false;
+    if (!dispatch_matmul_(scratch_img_norm_dev_, lw.to_v_w_q4, lw.to_v_scale,
+                          lw.to_v_b, img_seq, H, H,
+                          offset_rows(scratch_v_dev_, txt_seq))) return false;
+
+    // ------------------------------------------------------------------
+    // 4. RMSNorm on Q / K (both streams). Since Q/K have shape
+    //    [seq, n_heads, head_dim] and RMSNorm is over head_dim, we view
+    //    each as [seq * n_heads, head_dim].
+    //    Reference: qwen_image.hpp:147-148, 157-158.
+    // ------------------------------------------------------------------
+    // img Q/K (rows = img_seq * n_heads).
+    {
+        void *img_q = offset_rows(scratch_q_dev_, txt_seq);
+        void *img_k = offset_rows(scratch_k_dev_, txt_seq);
+        if (!rms_norm_head_(img_q, img_q, lw.norm_q_w,
+                            img_seq * NH, HD)) return false;
+        if (!rms_norm_head_(img_k, img_k, lw.norm_k_w,
+                            img_seq * NH, HD)) return false;
+    }
+    // txt Q/K (rows = txt_seq * n_heads) — head of scratch buffers.
+    {
+        if (!rms_norm_head_(scratch_q_dev_, scratch_q_dev_,
+                            lw.norm_added_q_w, txt_seq * NH, HD)) return false;
+        if (!rms_norm_head_(scratch_k_dev_, scratch_k_dev_,
+                            lw.norm_added_k_w, txt_seq * NH, HD)) return false;
+    }
+
+    // ------------------------------------------------------------------
+    // 5. RoPE on Q, K. pe index layout (from compute_qwen_rope_pe_host):
+    //    rows [0 .. ctx_len) are txt, rows [ctx_len .. ctx_len + img_tokens)
+    //    are img. ctx_len = cfg_.max_txt_seq.
+    // ------------------------------------------------------------------
+    {
+        // txt stream: pe offset 0.
+        if (!apply_rope_(scratch_q_dev_, pe, 0, B, txt_seq, NH, HD))
+            return false;
+        if (!apply_rope_(scratch_k_dev_, pe, 0, B, txt_seq, NH, HD))
+            return false;
+        // img stream: pe offset = cfg_.max_txt_seq (the ctx_len used at
+        // pe build time). For the Phase 3 smoke we run with txt_seq ==
+        // max_txt_seq so the offset equals ctx_len exactly. Higher-phase
+        // work may need session rebuild (see compute_qwen_rope_pe_host
+        // NOTE-TO-AGENT).
+        const int64_t img_pe_off = cfg_.max_txt_seq;
+        if (!apply_rope_(offset_rows(scratch_q_dev_, txt_seq),
+                         pe, img_pe_off, B, img_seq, NH, HD)) return false;
+        if (!apply_rope_(offset_rows(scratch_k_dev_, txt_seq),
+                         pe, img_pe_off, B, img_seq, NH, HD)) return false;
+    }
+
+    // ------------------------------------------------------------------
+    // 6. Joint attention via aclnnFusedInferAttentionScoreV2.
+    //    Layout BSND = [B=1, seq_total, NH, HD]. Q/K/V scratch are already
+    //    laid out as txt || img along seq. V is [seq_total, H] = BSND.
+    // ------------------------------------------------------------------
+    {
+        int64_t qkv_shape[4]   = {B, seq_total, NH, HD};
+        int64_t qkv_strides[4];
+        make_contig_strides(4, qkv_shape, qkv_strides);
+        aclTensor *t_q = tensor_nd_f16(scratch_q_dev_,    4, qkv_shape, qkv_strides);
+        aclTensor *t_k = tensor_nd_f16(scratch_k_dev_,    4, qkv_shape, qkv_strides);
+        aclTensor *t_v = tensor_nd_f16(scratch_v_dev_,    4, qkv_shape, qkv_strides);
+        aclTensor *t_o = tensor_nd_f16(scratch_attn_dev_, 4, qkv_shape, qkv_strides);
+        aclTensorList *t_k_list = g_cann.aclCreateTensorList(&t_k, 1);
+        aclTensorList *t_v_list = g_cann.aclCreateTensorList(&t_v, 1);
+        char layout[5] = {'B','S','N','D',0};
+        double scale = 1.0 / std::sqrt((double)HD);
+        uint64_t ws = 0; aclOpExecutor *exec = nullptr;
+        aclnnStatus s = g_cann.aclnnFusedInferAttentionScoreV2GetWorkspaceSize(
+            t_q, t_k_list, t_v_list,
+            nullptr, nullptr, nullptr, nullptr,
+            nullptr, nullptr, nullptr, nullptr, nullptr,
+            nullptr, nullptr, nullptr, nullptr, nullptr,
+            nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+            (int64_t)NH, scale,
+            (int64_t)65535, (int64_t)65535,
+            layout, (int64_t)NH, (int64_t)0, (int64_t)0,
+            (int64_t)0, (int64_t)0, false,
+            (int64_t)0, (int64_t)0,
+            t_o, nullptr, &ws, &exec);
+        if (s == 0) {
+            ensure_workspace_(ws);
+            s = g_cann.aclnnFusedInferAttentionScoreV2(
+                ws > 0 ? workspace_dev_ : nullptr, ws, exec, compute_stream_);
+        }
+        g_cann.aclDestroyTensorList(t_k_list);
+        g_cann.aclDestroyTensorList(t_v_list);
+        g_cann.aclDestroyTensor(t_q);
+        g_cann.aclDestroyTensor(t_o);
+        if (s != 0) {
+            QIE_LOG("block: FIAv2 status=%d (seq_total=%lld NH=%lld HD=%lld)",
+                    (int)s, (long long)seq_total, (long long)NH, (long long)HD);
+            return false;
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 7. Output projections.
+    //    txt attn-out view: scratch_attn_dev_[0 .. txt_seq*H] → to_add_out
+    //    img attn-out view: scratch_attn_dev_[txt_seq*H .. end] → to_out.0
+    //    The output projections write to scratch_img_out_dev_ /
+    //    scratch_txt_out_dev_ so the subsequent gated residual is a pure
+    //    add on top of the original img_hidden / txt_hidden buffers.
+    // ------------------------------------------------------------------
+    if (!dispatch_matmul_(scratch_attn_dev_, lw.to_add_out_w_q4,
+                          lw.to_add_out_scale, lw.to_add_out_b,
+                          txt_seq, H, H, scratch_txt_out_dev_)) return false;
+    if (!dispatch_matmul_(offset_rows(scratch_attn_dev_, txt_seq),
+                          lw.to_out_0_w_q4, lw.to_out_0_scale, lw.to_out_0_b,
+                          img_seq, H, H, scratch_img_out_dev_)) return false;
+
+    // ------------------------------------------------------------------
+    // 8. Gated residual add: img += attn_out_img * gate1_img (and txt).
+    // ------------------------------------------------------------------
+    if (!gated_residual_add_(img_hidden, scratch_img_out_dev_,
+                             img_gate1, B, img_seq, H)) return false;
+    if (!gated_residual_add_(txt_hidden, scratch_txt_out_dev_,
+                             txt_gate1, B, txt_seq, H)) return false;
+
+    // ------------------------------------------------------------------
+    // 9. LayerNorm2 + modulate(scale2, shift2) — output to scratch_*_norm.
+    // ------------------------------------------------------------------
+    if (!layer_norm_(img_hidden, scratch_img_norm_dev_, B, img_seq, H))
+        return false;
+    if (!modulate_(scratch_img_norm_dev_, img_scale2, img_shift2,
+                   B, img_seq, H)) return false;
+    if (!layer_norm_(txt_hidden, scratch_txt_norm_dev_, B, txt_seq, H))
+        return false;
+    if (!modulate_(scratch_txt_norm_dev_, txt_scale2, txt_shift2,
+                   B, txt_seq, H)) return false;
+
+    // ------------------------------------------------------------------
+    // 10. FFN per stream: Linear(H→FF) → GELU-tanh → Linear(FF→H).
+    //     scratch_mlp_dev_ [SEQ, FF] holds the post-up-projection
+    //     activation (enough for either stream; streams run sequentially).
+    // ------------------------------------------------------------------
+    auto gelu_activate = [&](void *buf_dev, int64_t rows) -> bool {
+        int64_t shape[2]   = {rows, FF};
+        int64_t strides[2] = {FF, 1};
+        aclTensor *t_in  = tensor_nd_f16(buf_dev, 2, shape, strides);
+        aclTensor *t_out = tensor_nd_f16(buf_dev, 2, shape, strides);
+        uint64_t ws = 0; aclOpExecutor *exec = nullptr;
+        aclnnStatus s = 0;
+        // Prefer GELU V2 with approximate="tanh" (1) to match the ggml CPU
+        // reference (ggml_gelu uses tanh approx).
+        if (g_cann.has_gelu_v2()) {
+            s = g_cann.aclnnGeluV2GetWorkspaceSize(t_in, /*approximate=*/1,
+                                                     t_out, &ws, &exec);
+            if (s == 0) {
+                ensure_workspace_(ws);
+                s = g_cann.aclnnGeluV2(ws > 0 ? workspace_dev_ : nullptr,
+                                         ws, exec, compute_stream_);
+            }
+        } else if (g_cann.aclnnGelu &&
+                   g_cann.aclnnGeluGetWorkspaceSize) {
+            // Fallback: exact erf. Drifts vs CPU ref by ~1e-3 cos_sim.
+            s = g_cann.aclnnGeluGetWorkspaceSize(t_in, t_out, &ws, &exec);
+            if (s == 0) {
+                ensure_workspace_(ws);
+                s = g_cann.aclnnGelu(ws > 0 ? workspace_dev_ : nullptr,
+                                       ws, exec, compute_stream_);
+            }
+        } else {
+            QIE_LOG("block: no Gelu symbol resolved");
+            s = -1;
+        }
+        g_cann.aclDestroyTensor(t_in);
+        g_cann.aclDestroyTensor(t_out);
+        return s == 0;
+    };
+
+    // img FFN.
+    if (!dispatch_matmul_(scratch_img_norm_dev_, lw.img_ff_up_w_q4,
+                          lw.img_ff_up_scale, lw.img_ff_up_b,
+                          img_seq, H, FF, scratch_mlp_dev_)) return false;
+    if (!gelu_activate(scratch_mlp_dev_, img_seq)) return false;
+    if (!dispatch_matmul_(scratch_mlp_dev_, lw.img_ff_down_w_q4,
+                          lw.img_ff_down_scale, lw.img_ff_down_b,
+                          img_seq, FF, H, scratch_img_out_dev_)) return false;
+
+    // txt FFN.
+    if (!dispatch_matmul_(scratch_txt_norm_dev_, lw.txt_ff_up_w_q4,
+                          lw.txt_ff_up_scale, lw.txt_ff_up_b,
+                          txt_seq, H, FF, scratch_mlp_dev_)) return false;
+    if (!gelu_activate(scratch_mlp_dev_, txt_seq)) return false;
+    if (!dispatch_matmul_(scratch_mlp_dev_, lw.txt_ff_down_w_q4,
+                          lw.txt_ff_down_scale, lw.txt_ff_down_b,
+                          txt_seq, FF, H, scratch_txt_out_dev_)) return false;
+
+    // ------------------------------------------------------------------
+    // 11. Gated residual add #2.
+    // ------------------------------------------------------------------
+    if (!gated_residual_add_(img_hidden, scratch_img_out_dev_,
+                             img_gate2, B, img_seq, H)) return false;
+    if (!gated_residual_add_(txt_hidden, scratch_txt_out_dev_,
+                             txt_gate2, B, txt_seq, H)) return false;
+
+    return true;
 }
 
 void ImageDiffusionEngine::scheduler_step_(void * /*latent_dev*/,
@@ -1177,6 +2061,101 @@ void ImageDiffusionEngine::scheduler_step_(void * /*latent_dev*/,
     (void)step_idx;
     // Phase 4 body: Euler-flow step per
     // tools/ominix_diffusion/src/denoiser.hpp:831-865.
+}
+
+// ============================================================================
+// Q2.3 Phase 3 test-only hooks. NOT part of the steady-state engine API.
+// ============================================================================
+
+bool ImageDiffusionEngine::forward_block_test(int il,
+                                                void *img_hidden, int64_t img_seq,
+                                                void *txt_hidden, int64_t txt_seq,
+                                                void *t_emb, void *pe) {
+    if (!ready_) return false;
+    if (il < 0 || il >= (int)layer_w_.size()) return false;
+    return forward_block_(layer_w_[il], img_hidden, img_seq,
+                          txt_hidden, txt_seq, t_emb, pe);
+}
+
+DiTLayerWeights *ImageDiffusionEngine::mutable_layer_weights(int il) {
+    if (il < 0 || il >= (int)layer_w_.size()) return nullptr;
+    return &layer_w_[il];
+}
+
+bool ImageDiffusionEngine::init_for_smoke(const ImageDiffusionConfig &cfg,
+                                            int device) {
+    if (!cp_cann_load_symbols()) {
+        QIE_LOG("init_for_smoke: symbol load failed");
+        return false;
+    }
+    cfg_    = cfg;
+    device_ = device;
+    QIE_ACL_CHECK(g_cann.aclrtSetDevice(device_));
+    QIE_ACL_CHECK(g_cann.aclrtCreateStream(&primary_stream_));
+    compute_stream_ = primary_stream_;
+
+    layer_w_.clear();
+    layer_w_.resize(cfg_.num_layers);
+
+    // Pre-compute RoPE table (same as init_from_gguf).
+    const int64_t HEAD_D = cfg_.head_dim;
+    (void)HEAD_D;
+    if (cfg_.precompute_rope) {
+        std::vector<uint16_t> pe_host;
+        int64_t total_pos = 0;
+        compute_qwen_rope_pe_host(cfg_, pe_host, total_pos);
+        const size_t pe_bytes = pe_host.size() * sizeof(uint16_t);
+        QIE_ACL_CHECK(g_cann.aclrtMalloc(&global_w_.rope_pe_dev, pe_bytes,
+                                          ACL_MEM_MALLOC_HUGE_FIRST));
+        QIE_ACL_CHECK(g_cann.aclrtMemcpy(global_w_.rope_pe_dev, pe_bytes,
+                                          pe_host.data(), pe_bytes,
+                                          ACL_MEMCPY_HOST_TO_DEVICE));
+        stats_.rope_bytes = pe_bytes;
+    }
+
+    // Scratch allocations — same layout as init_from_gguf.
+    const int64_t H      = cfg_.hidden_size;
+    const int64_t FF_DIM = (int64_t)H * cfg_.ff_mult;
+    const int64_t SEQ    = (int64_t)cfg_.max_img_seq + cfg_.max_txt_seq;
+    const size_t F16     = sizeof(uint16_t);
+    auto try_alloc = [&](void **ptr, size_t bytes) -> bool {
+        aclError err = g_cann.aclrtMalloc(ptr, bytes,
+                                           ACL_MEM_MALLOC_HUGE_FIRST);
+        if (err != 0) { QIE_LOG("init_for_smoke: aclrtMalloc(%zu) err=%d",
+                                 bytes, (int)err); *ptr = nullptr;
+                          return false; }
+        stats_.scratch_bytes += bytes;
+        return true;
+    };
+    if (!try_alloc(&scratch_q_dev_,    (size_t)SEQ * H * F16))  return false;
+    if (!try_alloc(&scratch_k_dev_,    (size_t)SEQ * H * F16))  return false;
+    if (!try_alloc(&scratch_v_dev_,    (size_t)SEQ * H * F16))  return false;
+    if (!try_alloc(&scratch_attn_dev_, (size_t)SEQ * H * F16))  return false;
+    if (!try_alloc(&scratch_mlp_dev_,  (size_t)SEQ * FF_DIM * F16)) return false;
+    if (!try_alloc(&scratch_mod_dev_,  (size_t)12 * H * F16))      return false;
+    if (!try_alloc(&rstd_dev_,         (size_t)cfg_.num_heads
+                                         * SEQ * sizeof(float)))    return false;
+    if (!try_alloc(&scratch_img_norm_dev_,
+                   (size_t)cfg_.max_img_seq * H * F16)) return false;
+    if (!try_alloc(&scratch_txt_norm_dev_,
+                   (size_t)cfg_.max_txt_seq * H * F16)) return false;
+    if (!try_alloc(&scratch_img_out_dev_,
+                   (size_t)cfg_.max_img_seq * H * F16)) return false;
+    if (!try_alloc(&scratch_txt_out_dev_,
+                   (size_t)cfg_.max_txt_seq * H * F16)) return false;
+    if (!try_alloc(&mean_dev_,    (size_t)SEQ * sizeof(float))) return false;
+    if (!try_alloc(&ln_rstd_dev_, (size_t)SEQ * sizeof(float))) return false;
+    if (!try_alloc(&workspace_dev_, 4 * 1024 * 1024)) return false;
+    workspace_size_ = 4 * 1024 * 1024;
+
+    ready_ = true;
+    QIE_LOG("init_for_smoke: OK device=%d hidden=%lld heads=%lld head_dim=%lld "
+            "img_seq=%lld txt_seq=%lld (NO WEIGHTS LOADED — caller must "
+            "populate layer_w_ via mutable_layer_weights)",
+            device_, (long long)H, (long long)cfg_.num_heads,
+            (long long)cfg_.head_dim,
+            (long long)cfg_.max_img_seq, (long long)cfg_.max_txt_seq);
+    return true;
 }
 
 }  // namespace ominix_qie
