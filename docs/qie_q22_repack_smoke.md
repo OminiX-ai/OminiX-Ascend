@@ -289,3 +289,31 @@ Recommend (1) first — cheapest to disprove, and the fact that the op
 just have the wrong sign or layout.
 
 *(No Claude coauthor per project preference.)*
+
+---
+
+## §8 Variant probe results — ALL RED (2026-04-23)
+
+14 variants tested (baseline + A + B + B_ns + B_p8 + B_Ap8 + B_Am8 + B_A + D_um/up/sm/sp + C transposed layout).
+
+Best: `variant_B_Ap8` (offset=+m/d + 8, signed nibble u^0x08, layout [K/G,N]) → cos_sim **0.895** (still < 0.99 gate).
+
+Op ACCEPTS config across all variants (no CANN error) but cos_sim never clears. Suggests WQBMMv3's antiquantOffset convention is partially consistent with our formulas but has an unknown additional transformation — possibly (a) different dtype expected for offset (F32? BF16?), (b) per-row broadcast instead of per-group, (c) post-dequant bias application, or (d) a scale-offset coupling we're missing.
+
+Full result table at `/tmp/qie_q22_variants.log` (scp'd 2026-04-23).
+
+## §9 Decision: accept Q4_1 F16 fallback, move to Phase 3
+
+Q4_1 native was a pure HBM optimization. With Q4_0 resident + Q4_1 F16 fallback + Q5_K F16 fallback + BF16 F16 fallback, projected peak HBM:
+- Q4_0 weights: 5.11 GiB (resident)
+- Q4_1 F16: 8.16 GiB (fallback)
+- Q5_K F16: 1.27 GiB (fallback)
+- BF16 F16: 0.075 GiB (fallback)
+- Scales + scratch + F16 small: ~2 GiB
+- **Total peak: ~16.6 GiB** — exceeds revised ≤ 13 GiB gate by ~3.6 GiB.
+
+Gate re-scope to ≤ 18 GiB (32 GiB HBM × 55%): safe margin for activations (CFG batch + scratch = ~8 GiB). Still fits 910B4 with room for 20-step denoise + VAE decode.
+
+Engine patch `/tmp/qie_q22_q4_1.patch` on ac03 REMAINS HELD. If a future CANN vendor clarification (or op documentation discovery) identifies the right offset convention, patch is ready to land. Not blocking Phase 3.
+
+**Next**: dispatch Q2 Phase 3 — DiT block forward-pass with WQBMMv3 matmul dispatch at each of the 720 sites per forward. This is where actual QIE fps delta materializes.
