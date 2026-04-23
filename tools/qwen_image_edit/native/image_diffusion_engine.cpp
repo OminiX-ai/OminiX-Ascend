@@ -502,9 +502,16 @@ bool load_matmul_weight_upload(ggml_context *ggml_ctx, const char *name,
 // session-rebuild hook lands in Phase 3. Track this via a Q2.5-ref-rope
 // TODO — see final report.
 // ---------------------------------------------------------------------------
+// Phase 4.1 NOTE: this helper now additionally emits two flat F16 tables
+// (`cos_f16_out`, `sin_f16_out`) of shape [total_pos, head_dim/2]. These
+// feed the on-device interleaved-RoPE path directly (no strided-view gymnastics
+// over the packed pe [seq, hd/2, 2, 2] layout). If callers pass null for
+// the flat outputs we skip the separated emission.
 void compute_qwen_rope_pe_host(const ImageDiffusionConfig &cfg,
                                std::vector<uint16_t> &pe_f16_out,
-                               int64_t &total_pos_out) {
+                               int64_t &total_pos_out,
+                               std::vector<uint16_t> *cos_f16_out = nullptr,
+                               std::vector<uint16_t> *sin_f16_out = nullptr) {
     const int axes_t = cfg.rope_axes_temporal;  // 16
     const int axes_h = cfg.rope_axes_h;         // 56
     const int axes_w = cfg.rope_axes_w;         // 56
@@ -526,6 +533,8 @@ void compute_qwen_rope_pe_host(const ImageDiffusionConfig &cfg,
 
     total_pos_out = (int64_t)ctx_len + img_tokens;
     pe_f16_out.assign((size_t)total_pos_out * head_dim / 2 * 2 * 2, 0);
+    if (cos_f16_out) cos_f16_out->assign((size_t)total_pos_out * head_dim / 2, 0);
+    if (sin_f16_out) sin_f16_out->assign((size_t)total_pos_out * head_dim / 2, 0);
 
     auto pe_set = [&](int64_t pos, int64_t dpair,
                       float cos_v, float sin_v) {
@@ -535,6 +544,14 @@ void compute_qwen_rope_pe_host(const ImageDiffusionConfig &cfg,
         pe_f16_out[base + 1] = fp32_to_fp16(-sin_v);
         pe_f16_out[base + 2] = fp32_to_fp16(sin_v);
         pe_f16_out[base + 3] = fp32_to_fp16(cos_v);
+        if (cos_f16_out) {
+            const size_t flat = (size_t)pos * head_dim / 2 + (size_t)dpair;
+            (*cos_f16_out)[flat] = fp32_to_fp16(cos_v);
+        }
+        if (sin_f16_out) {
+            const size_t flat = (size_t)pos * head_dim / 2 + (size_t)dpair;
+            (*sin_f16_out)[flat] = fp32_to_fp16(sin_v);
+        }
     };
 
     // Per-axis 1/theta^(2d / axis_dim) scale via the `linspace(0, 2-2/axis_dim)`
@@ -661,10 +678,18 @@ ImageDiffusionEngine::~ImageDiffusionEngine() {
     free_dev(global_w_.proj_out_w_q4);        free_dev(global_w_.proj_out_scale);
     free_dev(global_w_.proj_out_b);
     free_dev(global_w_.rope_pe_dev);
+    free_dev(global_w_.rope_cos_dev);
+    free_dev(global_w_.rope_sin_dev);
 
     free_dev(scratch_q_dev_);    free_dev(scratch_k_dev_);
     free_dev(scratch_v_dev_);    free_dev(scratch_attn_dev_);
     free_dev(scratch_mlp_dev_);  free_dev(scratch_mod_dev_);
+    free_dev(scratch_rope_a_dev_); free_dev(scratch_rope_b_dev_);
+    free_dev(scratch_rope_c_dev_);
+    free_dev(scratch_rope_cos_bcast_dev_);
+    free_dev(scratch_rope_sin_bcast_dev_);
+    free_dev(scratch_rope_cos_full_dev_);
+    free_dev(scratch_rope_sin_full_dev_);
     free_dev(rstd_dev_);
     free_dev(scratch_img_norm_dev_);  free_dev(scratch_txt_norm_dev_);
     free_dev(scratch_img_out_dev_);   free_dev(scratch_txt_out_dev_);
@@ -960,24 +985,104 @@ bool ImageDiffusionEngine::init_from_gguf(const std::string &gguf_path,
     // Pre-compute 3D axial RoPE tables (Q0.5.3 MUST-HAVE).
     // ------------------------------------------------------------------
     if (cfg_.precompute_rope) {
-        std::vector<uint16_t> pe_host;
+        std::vector<uint16_t> pe_host, cos_host, sin_host;
         int64_t total_pos = 0;
         auto t_r0 = std::chrono::steady_clock::now();
-        compute_qwen_rope_pe_host(cfg_, pe_host, total_pos);
+        compute_qwen_rope_pe_host(cfg_, pe_host, total_pos,
+                                   &cos_host, &sin_host);
         auto t_r1 = std::chrono::steady_clock::now();
         stats_.dequant_wall_ms +=
             std::chrono::duration<double, std::milli>(t_r1 - t_r0).count();
 
-        const size_t pe_bytes = pe_host.size() * sizeof(uint16_t);
+        const size_t pe_bytes  = pe_host.size()  * sizeof(uint16_t);
+        const size_t cos_bytes = cos_host.size() * sizeof(uint16_t);
+        const size_t sin_bytes = sin_host.size() * sizeof(uint16_t);
         QIE_ACL_CHECK(g_cann.aclrtMalloc(&global_w_.rope_pe_dev, pe_bytes,
                                           ACL_MEM_MALLOC_HUGE_FIRST));
         QIE_ACL_CHECK(g_cann.aclrtMemcpy(global_w_.rope_pe_dev, pe_bytes,
                                           pe_host.data(), pe_bytes,
                                           ACL_MEMCPY_HOST_TO_DEVICE));
-        stats_.rope_bytes = pe_bytes;
+        // Phase 4.1 on-device RoPE tables (flat cos + sin).
+        QIE_ACL_CHECK(g_cann.aclrtMalloc(&global_w_.rope_cos_dev, cos_bytes,
+                                          ACL_MEM_MALLOC_HUGE_FIRST));
+        QIE_ACL_CHECK(g_cann.aclrtMemcpy(global_w_.rope_cos_dev, cos_bytes,
+                                          cos_host.data(), cos_bytes,
+                                          ACL_MEMCPY_HOST_TO_DEVICE));
+        QIE_ACL_CHECK(g_cann.aclrtMalloc(&global_w_.rope_sin_dev, sin_bytes,
+                                          ACL_MEM_MALLOC_HUGE_FIRST));
+        QIE_ACL_CHECK(g_cann.aclrtMemcpy(global_w_.rope_sin_dev, sin_bytes,
+                                          sin_host.data(), sin_bytes,
+                                          ACL_MEMCPY_HOST_TO_DEVICE));
+        global_w_.rope_total_pos = total_pos;
+        stats_.rope_bytes = pe_bytes + cos_bytes + sin_bytes;
         QIE_LOG("rope pe: pos=%lld head_dim/2=%lld bytes=%zu "
-                "(layout=[seq, hd/2, 2, 2] F16)",
-                (long long)total_pos, (long long)(HEAD_D / 2), pe_bytes);
+                "(layout=[seq, hd/2, 2, 2] F16) + cos/sin flat %zu+%zu B",
+                (long long)total_pos, (long long)(HEAD_D / 2), pe_bytes,
+                cos_bytes, sin_bytes);
+
+        // Pre-broadcast cos/sin over NH: explicit [total_pos, NH, half] tiles
+        // to avoid ACL stride-0 broadcast numerical bugs in aclnnMul.
+        {
+            const int64_t half = cfg_.head_dim / 2;
+            const int64_t NH = cfg_.num_heads;
+            std::vector<uint16_t> cos_bcast((size_t)total_pos * NH * half, 0);
+            std::vector<uint16_t> sin_bcast((size_t)total_pos * NH * half, 0);
+            for (int64_t p = 0; p < total_pos; ++p) {
+                for (int64_t h = 0; h < NH; ++h) {
+                    const size_t src_off = (size_t)p * half;
+                    const size_t dst_off =
+                        ((size_t)p * NH + (size_t)h) * half;
+                    std::memcpy(&cos_bcast[dst_off], &cos_host[src_off],
+                                 (size_t)half * sizeof(uint16_t));
+                    std::memcpy(&sin_bcast[dst_off], &sin_host[src_off],
+                                 (size_t)half * sizeof(uint16_t));
+                }
+            }
+            const size_t bc_bytes = cos_bcast.size() * sizeof(uint16_t);
+            QIE_ACL_CHECK(g_cann.aclrtMalloc(&scratch_rope_cos_bcast_dev_,
+                                              bc_bytes, ACL_MEM_MALLOC_HUGE_FIRST));
+            QIE_ACL_CHECK(g_cann.aclrtMemcpy(scratch_rope_cos_bcast_dev_, bc_bytes,
+                                              cos_bcast.data(), bc_bytes,
+                                              ACL_MEMCPY_HOST_TO_DEVICE));
+            QIE_ACL_CHECK(g_cann.aclrtMalloc(&scratch_rope_sin_bcast_dev_,
+                                              bc_bytes, ACL_MEM_MALLOC_HUGE_FIRST));
+            QIE_ACL_CHECK(g_cann.aclrtMemcpy(scratch_rope_sin_bcast_dev_, bc_bytes,
+                                              sin_bcast.data(), bc_bytes,
+                                              ACL_MEMCPY_HOST_TO_DEVICE));
+            stats_.rope_bytes += 2 * bc_bytes;
+        }
+
+        // Build "full" cos/sin tables for aclnnRotaryPositionEmbedding
+        // interleave-mode dispatch. Shape [total_pos, head_dim] with each
+        // pair's cos/sin duplicated across both elements of the pair.
+        {
+            const int64_t HD = cfg_.head_dim;
+            const int64_t half = HD / 2;
+            std::vector<uint16_t> cos_full((size_t)total_pos * HD, 0);
+            std::vector<uint16_t> sin_full((size_t)total_pos * HD, 0);
+            for (int64_t p = 0; p < total_pos; ++p) {
+                for (int64_t dp = 0; dp < half; ++dp) {
+                    uint16_t c = cos_host[(size_t)p * half + dp];
+                    uint16_t s = sin_host[(size_t)p * half + dp];
+                    cos_full[(size_t)p * HD + 2*dp + 0] = c;
+                    cos_full[(size_t)p * HD + 2*dp + 1] = c;
+                    sin_full[(size_t)p * HD + 2*dp + 0] = s;
+                    sin_full[(size_t)p * HD + 2*dp + 1] = s;
+                }
+            }
+            const size_t cf_bytes = cos_full.size() * sizeof(uint16_t);
+            QIE_ACL_CHECK(g_cann.aclrtMalloc(&scratch_rope_cos_full_dev_,
+                                              cf_bytes, ACL_MEM_MALLOC_HUGE_FIRST));
+            QIE_ACL_CHECK(g_cann.aclrtMemcpy(scratch_rope_cos_full_dev_, cf_bytes,
+                                              cos_full.data(), cf_bytes,
+                                              ACL_MEMCPY_HOST_TO_DEVICE));
+            QIE_ACL_CHECK(g_cann.aclrtMalloc(&scratch_rope_sin_full_dev_,
+                                              cf_bytes, ACL_MEM_MALLOC_HUGE_FIRST));
+            QIE_ACL_CHECK(g_cann.aclrtMemcpy(scratch_rope_sin_full_dev_, cf_bytes,
+                                              sin_full.data(), cf_bytes,
+                                              ACL_MEMCPY_HOST_TO_DEVICE));
+            stats_.rope_bytes += 2 * cf_bytes;
+        }
     }
 
     // ------------------------------------------------------------------
@@ -1035,6 +1140,18 @@ bool ImageDiffusionEngine::init_from_gguf(const std::string &gguf_path,
         // LayerNorm mean/rstd are F32 per row (rows = B*seq).
         if (!try_alloc(&mean_dev_,    (size_t)SEQ * sizeof(float))) goto fail;
         if (!try_alloc(&ln_rstd_dev_, (size_t)SEQ * sizeof(float))) goto fail;
+
+        // Phase 4.1 on-device RoPE scratch (three [seq, NH, head_dim/2] F16
+        // buffers for the interleaved-rotation dispatch).
+        {
+            const int64_t NH_ = cfg_.num_heads;
+            const int64_t HALF_HD = cfg_.head_dim / 2;
+            const size_t rope_half_bytes =
+                (size_t)SEQ * NH_ * HALF_HD * F16;
+            if (!try_alloc(&scratch_rope_a_dev_, rope_half_bytes)) goto fail;
+            if (!try_alloc(&scratch_rope_b_dev_, rope_half_bytes)) goto fail;
+            if (!try_alloc(&scratch_rope_c_dev_, rope_half_bytes)) goto fail;
+        }
 
         // Small workspace seed — ops grow it via ensure_workspace_.
         if (!try_alloc(&workspace_dev_, 4 * 1024 * 1024)) goto fail;
@@ -1639,8 +1756,7 @@ bool ImageDiffusionEngine::rms_norm_head_(void *x_f16_dev, void *out_f16_dev,
 }
 
 // ---------------------------------------------------------------------------
-// Q2.3: apply 3D-axial RoPE to a Q or K tensor using the pre-computed pe
-// table (`[seq_pe_max, head_dim/2, 2, 2]` F16 per Q0.5.3).
+// Q2.4.1 (Phase 4.1): apply 3D-axial RoPE to a Q or K tensor.
 //
 // The CPU reference (`Rope::apply_rope` in rope.hpp:603) implements the
 // rotation as a repeat-then-pair-mul-and-add over two pe slices:
@@ -1648,27 +1764,56 @@ bool ImageDiffusionEngine::rms_norm_head_(void *x_f16_dev, void *out_f16_dev,
 //   x_pair_0 = repeat(x[..., 0], 2)   // x0 x0
 //   x_pair_1 = repeat(x[..., 1], 2)   // x1 x1
 //   out = x_pair_0 * pe[0] + x_pair_1 * pe[1]
-// where `pe[0] = [cos, -sin]` and `pe[1] = [sin, cos]`.
+// where `pe[0] = [cos, -sin]` and `pe[1] = [sin, cos]`, producing:
+//   y_even = x_even * cos + x_odd  * sin        (output at offsets 2*dp)
+//   y_odd  = x_odd  * cos - x_even * sin        (output at offsets 2*dp+1)
 //
-// For the NPU path we do the same thing with a small kernel that
-// dispatches element-wise ops. Since we don't have a per-element
-// aclnn primitive for the interleaved (x0 x1) → (x0*c - x1*s, x0*s + x1*c)
-// pattern AND the aclnnRotaryPositionEmbedding op uses NEOX-half layout
-// (not our interleaved pair layout), we implement RoPE via an on-device
-// Ascend-C copy that does the rotation. FOR PHASE 3 SMOKE, we first
-// validate correctness via a host-side round-trip (D2H → rotate → H2D)
-// — this is slow but bit-accurate and isolates the rest of the block's
-// numerics from RoPE bugs. Phase 3.1 (follow-up) swaps this for a
-// custom kernel or a repacked pe + aclnnRotaryPositionEmbedding path.
+// Phase 3 used a host round-trip (D2H → rotate in F32 → H2D) — bit-accurate
+// but catastrophic on PCIe traffic (~96 GiB per image at seq=4352 × 60
+// blocks × 20 steps × 2 CFG). Phase 4.1 dispatches this on-device via
+// aclnnMul + aclnnAdd with strided views over separate cos/sin tables.
 //
-// `pe_row_offset` selects the starting row in pe: 0 for txt stream,
-// ctx_len for img stream per `compute_qwen_rope_pe_host`.
+// `pe_row_offset` selects the starting row in the cos/sin tables: 0 for the
+// txt stream, ctx_len for the img stream per `compute_qwen_rope_pe_host`.
+//
+// The `pe_f16_dev` argument is retained for signature-compat with the Phase 3
+// smoke harness; the on-device path indexes `global_w_.rope_cos_dev` and
+// `rope_sin_dev` (populated by the same compute_qwen_rope_pe_host call).
+//
+// Fallback to host-side round-trip is available via `QIE_ROPE_HOST=1` env
+// var — used only by parity probes.
 // ---------------------------------------------------------------------------
 bool ImageDiffusionEngine::apply_rope_(void *x_f16_dev,
                                          const void *pe_f16_dev,
                                          int64_t pe_row_offset,
                                          int64_t B, int64_t seq,
                                          int64_t n_heads, int64_t head_dim) {
+    // Phase 4.1 STATUS: on-device dispatch is in-flight but the CANN
+    // aclnnRotaryPositionEmbedding mode=2 (interleave) parity is still RED
+    // at the time of this landing (see docs/qie_q2_phase4_smoke.md §4.1).
+    // Default path remains the Phase 3 host round-trip so the block-forward
+    // smoke + upstream Phase 4.2 plumbing stay GREEN. Opt-in to the on-device
+    // experimental path via QIE_ROPE_DEVICE=1 — used by the Q2.4.1 probe
+    // during bring-up.
+    static const bool force_device = [] {
+        const char *v = std::getenv("QIE_ROPE_DEVICE");
+        return v && *v && v[0] != '0';
+    }();
+    if (force_device) {
+        (void)pe_f16_dev;
+        return apply_rope_on_device_(x_f16_dev, pe_row_offset,
+                                       B, seq, n_heads, head_dim);
+    }
+    return apply_rope_host_(x_f16_dev, pe_f16_dev, pe_row_offset,
+                              B, seq, n_heads, head_dim);
+}
+
+// Phase 3 reference — preserved for parity testing.
+bool ImageDiffusionEngine::apply_rope_host_(void *x_f16_dev,
+                                              const void *pe_f16_dev,
+                                              int64_t pe_row_offset,
+                                              int64_t B, int64_t seq,
+                                              int64_t n_heads, int64_t head_dim) {
     if (!x_f16_dev || !pe_f16_dev) return false;
     const int64_t half = head_dim / 2;
     const size_t  n_elt = (size_t)B * seq * n_heads * head_dim;
@@ -1742,6 +1887,314 @@ bool ImageDiffusionEngine::apply_rope_(void *x_f16_dev,
                               x_host.data(), x_host.size() * sizeof(uint16_t),
                               ACL_MEMCPY_HOST_TO_DEVICE);
     return err == 0;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4.1: on-device interleaved RoPE.
+//
+// x has layout [B, seq, NH, head_dim] F16 contiguous. Half head_dim = half.
+// Logically we need:
+//   y_even[b,s,h,dp] = x_even[b,s,h,dp] * cos[s,dp] + x_odd[b,s,h,dp] * sin[s,dp]
+//   y_odd [b,s,h,dp] = x_odd [b,s,h,dp] * cos[s,dp] - x_even[b,s,h,dp] * sin[s,dp]
+// where x_even = x[..., 2*dp]  and  x_odd = x[..., 2*dp+1], interleaved.
+//
+// Phase 3 used a D2H→F32→H2D round-trip (~ host ms per call) as a bit-exact
+// baseline. Phase 4.1 dispatches on-device via:
+//   (1) 4× aclnnMul with strided-input views + broadcast cos/sin
+//   (2) 2× aclnnAdd (alpha-weighted) into contiguous scratch
+//   (3) 2× aclnnInplaceCopy to scatter the contiguous scratch back into the
+//       strided even/odd views of x (cannot rely on aclnnAdd accepting a
+//       strided OUTPUT tensor — empirical result: it does not scatter).
+//
+// Scratch usage (`scratch_rope_{a,b,c}_dev_` each `[B, seq, NH, half]` F16):
+//   C ← x_even * cos
+//   A ← x_odd  * sin
+//   C ← C + A               (y_even; A and C free)
+//   A ← x_odd  * cos
+//   B ← x_even * sin        (must read x_even BEFORE it gets scatter-overwritten)
+//   A ← A + (-1)*B          (y_odd; B free)
+//   scatter-copy C → x_even_view  (in-place copy to stride-2 positions)
+//   scatter-copy A → x_odd_view
+//
+// Scatter order matters: copy y_even first (reads stride-0 positions of x
+// which are x_even that we no longer need), then copy y_odd. Since we
+// captured both x_even*sin and x_odd*cos before scattering, neither copy
+// depends on live x values anymore.
+//
+// 4 muls + 2 adds + 2 copies = 8 dispatches — all short, no host round-trip.
+// ---------------------------------------------------------------------------
+bool ImageDiffusionEngine::apply_rope_on_device_(void *x_f16_dev,
+                                                   int64_t pe_row_offset,
+                                                   int64_t B, int64_t seq,
+                                                   int64_t n_heads,
+                                                   int64_t head_dim) {
+    if (!x_f16_dev) return false;
+    if (!g_cann.aclnnRotaryPositionEmbedding ||
+        !g_cann.aclnnRotaryPositionEmbeddingGetWorkspaceSize) {
+        QIE_LOG("apply_rope_on_device_: aclnnRotaryPositionEmbedding missing");
+        return false;
+    }
+    // Default backend: "rope" (use aclnnRotaryPositionEmbedding). Fallback to
+    // "manual" (hand-rolled 4Mul+2Add+2Copy) via env var — used during the
+    // Q2.4.1 bring-up while the interleave-mode op is being debugged.
+    const char *backend = std::getenv("QIE_ROPE_BACKEND");
+    if (backend && std::strcmp(backend, "manual") == 0) {
+        return apply_rope_manual_(x_f16_dev, pe_row_offset, B, seq,
+                                     n_heads, head_dim);
+    }
+
+    const int64_t HD   = head_dim;
+    const int64_t half = HD / 2;
+
+    if (!scratch_rope_cos_full_dev_ || !scratch_rope_sin_full_dev_) {
+        QIE_LOG("apply_rope_on_device_: full cos/sin tables not allocated");
+        return false;
+    }
+    if (!global_w_.rope_cos_dev || !global_w_.rope_sin_dev) {
+        QIE_LOG("apply_rope_on_device_: half cos/sin tables not allocated");
+        return false;
+    }
+
+    // x view: [B, seq, NH, HD] contig. Output goes in-place (out = x).
+    const int64_t x_shape[4]   = {B, seq, n_heads, HD};
+    int64_t       x_strides[4];
+    make_contig_strides(4, x_shape, x_strides);
+    const int64_t x_storage[1] = {B * seq * n_heads * HD};
+    aclTensor *t_x  = g_cann.aclCreateTensor(x_shape, 4, ACL_FLOAT16,
+                                               x_strides, 0, ACL_FORMAT_ND,
+                                               x_storage, 1, x_f16_dev);
+    aclTensor *t_x_out = g_cann.aclCreateTensor(x_shape, 4, ACL_FLOAT16,
+                                                   x_strides, 0, ACL_FORMAT_ND,
+                                                   x_storage, 1, x_f16_dev);
+
+    // Mode + cos/sin layout selection via env. Defaults to mode=2 + full-HD
+    // cos/sin (duplicated per-pair). QIE_ROPE_COS_LAYOUT=half points at the
+    // half-sized cos/sin (one entry per pair) for ops that expect that shape.
+    int64_t mode = 2;
+    if (const char *m = std::getenv("QIE_ROPE_MODE")) mode = std::atoll(m);
+    const bool cos_half = [] {
+        const char *c = std::getenv("QIE_ROPE_COS_LAYOUT");
+        return c && std::strcmp(c, "half") == 0;
+    }();
+
+    const int64_t cs_last = cos_half ? half : HD;
+    void *cos_base = cos_half ? global_w_.rope_cos_dev
+                                : scratch_rope_cos_full_dev_;
+    void *sin_base = cos_half ? global_w_.rope_sin_dev
+                                : scratch_rope_sin_full_dev_;
+    const int64_t cs_shape[4]   = {1, seq, 1, cs_last};
+    const int64_t cs_strides[4] = {0, cs_last, 0, 1};
+    const int64_t cs_storage[1] = {seq * cs_last};
+    auto make_cs_view = [&](void *base) -> aclTensor * {
+        uint8_t *sliced = (uint8_t *)base +
+                           (size_t)pe_row_offset * cs_last *
+                           sizeof(uint16_t);
+        return g_cann.aclCreateTensor(cs_shape, 4, ACL_FLOAT16,
+                                         cs_strides, 0, ACL_FORMAT_ND,
+                                         cs_storage, 1, sliced);
+    };
+    aclTensor *t_cos = make_cs_view(cos_base);
+    aclTensor *t_sin = make_cs_view(sin_base);
+
+    uint64_t ws = 0; aclOpExecutor *exec = nullptr;
+    aclnnStatus s = g_cann.aclnnRotaryPositionEmbeddingGetWorkspaceSize(
+        t_x, t_cos, t_sin, mode, t_x_out, &ws, &exec);
+    if (s == 0) {
+        ensure_workspace_(ws);
+        s = g_cann.aclnnRotaryPositionEmbedding(
+            ws > 0 ? workspace_dev_ : nullptr, ws, exec, compute_stream_);
+    }
+    if (s != 0) {
+        QIE_LOG("apply_rope_on_device_: mode=%lld cs_half=%d status=%d",
+                (long long)mode, (int)cos_half, (int)s);
+    }
+
+    g_cann.aclDestroyTensor(t_x);
+    g_cann.aclDestroyTensor(t_x_out);
+    g_cann.aclDestroyTensor(t_cos);
+    g_cann.aclDestroyTensor(t_sin);
+    return s == 0;
+}
+
+// ---------------------------------------------------------------------------
+// Stashed Q2.4.1 hand-rolled 4Mul+2Add RoPE (kept as a fallback path in case
+// aclnnRotaryPositionEmbedding's interleave mode proves unusable on a given
+// CANN version). Selected via env QIE_ROPE_BACKEND=manual.
+// ---------------------------------------------------------------------------
+bool ImageDiffusionEngine::apply_rope_manual_(void *x_f16_dev,
+                                                 int64_t pe_row_offset,
+                                                 int64_t B, int64_t seq,
+                                                 int64_t n_heads,
+                                                 int64_t head_dim) {
+    if (!x_f16_dev) return false;
+    if (!global_w_.rope_cos_dev || !global_w_.rope_sin_dev) {
+        QIE_LOG("apply_rope_manual_: cos/sin tables not allocated");
+        return false;
+    }
+    if (!g_cann.aclnnMul || !g_cann.aclnnAdd || !g_cann.aclnnInplaceCopy) {
+        return false;
+    }
+    if (!scratch_rope_a_dev_ || !scratch_rope_b_dev_ || !scratch_rope_c_dev_) {
+        return false;
+    }
+
+    const int64_t half = head_dim / 2;
+    const int64_t HD   = head_dim;
+
+    const int64_t x_storage[1] = {B * seq * n_heads * HD};
+    const int64_t half_shape[4]   = {B, seq, n_heads, half};
+    const int64_t x_strides_stride2[4] = {
+        seq * n_heads * HD,
+        n_heads * HD,
+        HD,
+        2
+    };
+    auto make_x_view = [&](int64_t elem_off) -> aclTensor * {
+        uint8_t *sliced = (uint8_t *)x_f16_dev +
+                           (size_t)elem_off * sizeof(uint16_t);
+        return g_cann.aclCreateTensor(half_shape, 4, ACL_FLOAT16,
+                                         x_strides_stride2, 0, ACL_FORMAT_ND,
+                                         x_storage, 1, sliced);
+    };
+    aclTensor *t_x_even = make_x_view(0);
+    aclTensor *t_x_odd  = make_x_view(1);
+
+    // cos/sin views over the NH-pre-broadcast tiles. Shape matches A's
+    // contig shape [B=1, seq, NH, half] exactly — no broadcasting needed at
+    // aclnnMul dispatch. Slice each base pointer to pe_row_offset * NH * half
+    // elements via byte arithmetic so storage descriptor starts at row 0.
+    if (!scratch_rope_cos_bcast_dev_ || !scratch_rope_sin_bcast_dev_) {
+        QIE_LOG("apply_rope_on_device_: pre-broadcast cos/sin tiles missing "
+                "(cos=%p sin=%p)",
+                scratch_rope_cos_bcast_dev_, scratch_rope_sin_bcast_dev_);
+        return false;
+    }
+    const int64_t cs_shape[4]   = {1, seq, n_heads, half};
+    int64_t cs_strides[4];
+    make_contig_strides(4, cs_shape, cs_strides);
+    const int64_t cs_storage[1] = {seq * n_heads * half};
+    auto make_cs_view = [&](void *base) -> aclTensor * {
+        uint8_t *sliced = (uint8_t *)base +
+                           (size_t)pe_row_offset * n_heads * half *
+                           sizeof(uint16_t);
+        return g_cann.aclCreateTensor(cs_shape, 4, ACL_FLOAT16,
+                                         cs_strides, 0, ACL_FORMAT_ND,
+                                         cs_storage, 1, sliced);
+    };
+    aclTensor *t_cos = make_cs_view(scratch_rope_cos_bcast_dev_);
+    aclTensor *t_sin = make_cs_view(scratch_rope_sin_bcast_dev_);
+
+    // Scratch contiguous [B, seq, NH, half] F16.
+    const int64_t scratch_storage[1] = {B * seq * n_heads * half};
+    int64_t scratch_strides[4];
+    make_contig_strides(4, half_shape, scratch_strides);
+    auto make_scratch = [&](void *base) -> aclTensor * {
+        return g_cann.aclCreateTensor(half_shape, 4, ACL_FLOAT16,
+                                         scratch_strides, 0, ACL_FORMAT_ND,
+                                         scratch_storage, 1, base);
+    };
+    aclTensor *t_A = make_scratch(scratch_rope_a_dev_);
+    aclTensor *t_B = make_scratch(scratch_rope_b_dev_);
+    aclTensor *t_C = make_scratch(scratch_rope_c_dev_);
+    // 4th scratch buffer carved from scratch_mlp_dev_ (oversized 107 MiB at
+    // worst case; apply_rope_ runs outside modulate_/gated_residual_add_ so
+    // no simultaneous use). Pre-initialized here so it is in scope for every
+    // goto-done path below.
+    aclTensor *t_D = make_scratch(scratch_mlp_dev_);
+
+    aclnnStatus s = 0;
+    uint64_t ws = 0;
+    aclOpExecutor *exec = nullptr;
+
+    auto do_mul = [&](aclTensor *a, aclTensor *b, aclTensor *out) -> aclnnStatus {
+        ws = 0; exec = nullptr;
+        aclnnStatus st = g_cann.aclnnMulGetWorkspaceSize(a, b, out, &ws, &exec);
+        if (st != 0) return st;
+        ensure_workspace_(ws);
+        return g_cann.aclnnMul(ws > 0 ? workspace_dev_ : nullptr, ws, exec,
+                                 compute_stream_);
+    };
+    auto do_add = [&](aclTensor *x, aclTensor *y, float alpha,
+                      aclTensor *out) -> aclnnStatus {
+        ws = 0; exec = nullptr;
+        aclScalar *a = make_f16_scalar_local(alpha);
+        aclnnStatus st = g_cann.aclnnAddGetWorkspaceSize(x, y, a, out,
+                                                           &ws, &exec);
+        if (st != 0) { g_cann.aclDestroyScalar(a); return st; }
+        ensure_workspace_(ws);
+        st = g_cann.aclnnAdd(ws > 0 ? workspace_dev_ : nullptr, ws, exec,
+                                compute_stream_);
+        g_cann.aclDestroyScalar(a);
+        return st;
+    };
+    auto do_copy = [&](aclTensor *dst, const aclTensor *src) -> aclnnStatus {
+        ws = 0; exec = nullptr;
+        aclnnStatus st = g_cann.aclnnInplaceCopyGetWorkspaceSize(dst, src,
+                                                                    &ws, &exec);
+        if (st != 0) return st;
+        ensure_workspace_(ws);
+        return g_cann.aclnnInplaceCopy(ws > 0 ? workspace_dev_ : nullptr, ws,
+                                          exec, compute_stream_);
+    };
+
+    // Phase 4.1 approach: gather x_even / x_odd into contiguous scratches
+    // first, run 4 muls + 2 adds on contiguous tensors, then scatter
+    // y_even / y_odd back to x via InplaceCopy. Four scratch slots
+    // (A=x_even, B=x_odd, C=y_even, D=y_odd / intermediate) are used.
+    //
+    // 1. A = gather x_even  (contig = strided copy)
+    s = do_copy(t_A, t_x_even);
+    if (s != 0) { QIE_LOG("apply_rope_on_device_: Copy(gather x_even) status=%d",
+                           (int)s); goto done; }
+    // 2. B = gather x_odd
+    s = do_copy(t_B, t_x_odd);
+    if (s != 0) { QIE_LOG("apply_rope_on_device_: Copy(gather x_odd) status=%d",
+                           (int)s); goto done; }
+    // 3. C = A * cos                  (x_even * cos)
+    s = do_mul(t_A, t_cos, t_C);
+    if (s != 0) { QIE_LOG("apply_rope_on_device_: Mul(A*cos) status=%d",
+                           (int)s); goto done; }
+    // 4. D = B * sin                  (x_odd * sin)
+    s = do_mul(t_B, t_sin, t_D);
+    if (s != 0) { QIE_LOG("apply_rope_on_device_: Mul(B*sin) status=%d",
+                           (int)s); goto done; }
+    // 5. C = C + D                    (y_even = x_even*cos + x_odd*sin)
+    s = do_add(t_C, t_D, 1.0f, t_C);
+    if (s != 0) { QIE_LOG("apply_rope_on_device_: Add(y_even) status=%d",
+                           (int)s); goto done; }
+
+    // 6. D = B * cos                  (x_odd * cos)
+    s = do_mul(t_B, t_cos, t_D);
+    if (s != 0) { QIE_LOG("apply_rope_on_device_: Mul(B*cos) status=%d",
+                           (int)s); goto done; }
+    // 7. A = A * sin                  (x_even * sin; overwrite A — we already consumed it)
+    s = do_mul(t_A, t_sin, t_A);
+    if (s != 0) { QIE_LOG("apply_rope_on_device_: Mul(A*sin) status=%d",
+                           (int)s); goto done; }
+    // 8. D = D + (-1)*A               (y_odd = x_odd*cos - x_even*sin)
+    s = do_add(t_D, t_A, -1.0f, t_D);
+    if (s != 0) { QIE_LOG("apply_rope_on_device_: Add(y_odd) status=%d",
+                           (int)s); goto done; }
+
+    // 9. Scatter y_even back: x_even_view ← C
+    s = do_copy(t_x_even, t_C);
+    if (s != 0) { QIE_LOG("apply_rope_on_device_: Copy(scatter y_even) status=%d",
+                           (int)s); goto done; }
+    // 10. Scatter y_odd back: x_odd_view ← D
+    s = do_copy(t_x_odd, t_D);
+    if (s != 0) { QIE_LOG("apply_rope_on_device_: Copy(scatter y_odd) status=%d",
+                           (int)s); goto done; }
+
+done:
+    g_cann.aclDestroyTensor(t_x_even);
+    g_cann.aclDestroyTensor(t_x_odd);
+    g_cann.aclDestroyTensor(t_cos);
+    g_cann.aclDestroyTensor(t_sin);
+    g_cann.aclDestroyTensor(t_A);
+    g_cann.aclDestroyTensor(t_B);
+    g_cann.aclDestroyTensor(t_C);
+    g_cann.aclDestroyTensor(t_D);
+    return s == 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -2101,16 +2554,95 @@ bool ImageDiffusionEngine::init_for_smoke(const ImageDiffusionConfig &cfg,
     const int64_t HEAD_D = cfg_.head_dim;
     (void)HEAD_D;
     if (cfg_.precompute_rope) {
-        std::vector<uint16_t> pe_host;
+        std::vector<uint16_t> pe_host, cos_host, sin_host;
         int64_t total_pos = 0;
-        compute_qwen_rope_pe_host(cfg_, pe_host, total_pos);
-        const size_t pe_bytes = pe_host.size() * sizeof(uint16_t);
+        compute_qwen_rope_pe_host(cfg_, pe_host, total_pos,
+                                   &cos_host, &sin_host);
+        const size_t pe_bytes  = pe_host.size()  * sizeof(uint16_t);
+        const size_t cos_bytes = cos_host.size() * sizeof(uint16_t);
+        const size_t sin_bytes = sin_host.size() * sizeof(uint16_t);
         QIE_ACL_CHECK(g_cann.aclrtMalloc(&global_w_.rope_pe_dev, pe_bytes,
                                           ACL_MEM_MALLOC_HUGE_FIRST));
         QIE_ACL_CHECK(g_cann.aclrtMemcpy(global_w_.rope_pe_dev, pe_bytes,
                                           pe_host.data(), pe_bytes,
                                           ACL_MEMCPY_HOST_TO_DEVICE));
-        stats_.rope_bytes = pe_bytes;
+        QIE_ACL_CHECK(g_cann.aclrtMalloc(&global_w_.rope_cos_dev, cos_bytes,
+                                          ACL_MEM_MALLOC_HUGE_FIRST));
+        QIE_ACL_CHECK(g_cann.aclrtMemcpy(global_w_.rope_cos_dev, cos_bytes,
+                                          cos_host.data(), cos_bytes,
+                                          ACL_MEMCPY_HOST_TO_DEVICE));
+        QIE_ACL_CHECK(g_cann.aclrtMalloc(&global_w_.rope_sin_dev, sin_bytes,
+                                          ACL_MEM_MALLOC_HUGE_FIRST));
+        QIE_ACL_CHECK(g_cann.aclrtMemcpy(global_w_.rope_sin_dev, sin_bytes,
+                                          sin_host.data(), sin_bytes,
+                                          ACL_MEMCPY_HOST_TO_DEVICE));
+        global_w_.rope_total_pos = total_pos;
+        stats_.rope_bytes = pe_bytes + cos_bytes + sin_bytes;
+
+        // Pre-broadcast cos/sin over NH: explicit [1, total_pos, NH, half]
+        // tiles to avoid ACL stride-0 broadcast numerical bugs observed in
+        // Q2.4.1 RoPE smoke. Cost: total_pos * NH * half * F16 each.
+        {
+            const int64_t half = cfg_.head_dim / 2;
+            const int64_t NH = cfg_.num_heads;
+            std::vector<uint16_t> cos_bcast((size_t)total_pos * NH * half, 0);
+            std::vector<uint16_t> sin_bcast((size_t)total_pos * NH * half, 0);
+            for (int64_t p = 0; p < total_pos; ++p) {
+                for (int64_t h = 0; h < NH; ++h) {
+                    const size_t src_off = (size_t)p * half;
+                    const size_t dst_off =
+                        ((size_t)p * NH + (size_t)h) * half;
+                    std::memcpy(&cos_bcast[dst_off], &cos_host[src_off],
+                                 (size_t)half * sizeof(uint16_t));
+                    std::memcpy(&sin_bcast[dst_off], &sin_host[src_off],
+                                 (size_t)half * sizeof(uint16_t));
+                }
+            }
+            const size_t bc_bytes = cos_bcast.size() * sizeof(uint16_t);
+            QIE_ACL_CHECK(g_cann.aclrtMalloc(&scratch_rope_cos_bcast_dev_,
+                                              bc_bytes, ACL_MEM_MALLOC_HUGE_FIRST));
+            QIE_ACL_CHECK(g_cann.aclrtMemcpy(scratch_rope_cos_bcast_dev_, bc_bytes,
+                                              cos_bcast.data(), bc_bytes,
+                                              ACL_MEMCPY_HOST_TO_DEVICE));
+            QIE_ACL_CHECK(g_cann.aclrtMalloc(&scratch_rope_sin_bcast_dev_,
+                                              bc_bytes, ACL_MEM_MALLOC_HUGE_FIRST));
+            QIE_ACL_CHECK(g_cann.aclrtMemcpy(scratch_rope_sin_bcast_dev_, bc_bytes,
+                                              sin_bcast.data(), bc_bytes,
+                                              ACL_MEMCPY_HOST_TO_DEVICE));
+            stats_.rope_bytes += 2 * bc_bytes;
+        }
+
+        // Build "full" cos/sin tables for aclnnRotaryPositionEmbedding
+        // interleave-mode dispatch. Shape [total_pos, head_dim] with each
+        // pair's cos/sin duplicated across both elements of the pair.
+        {
+            const int64_t HD = cfg_.head_dim;
+            const int64_t half = HD / 2;
+            std::vector<uint16_t> cos_full((size_t)total_pos * HD, 0);
+            std::vector<uint16_t> sin_full((size_t)total_pos * HD, 0);
+            for (int64_t p = 0; p < total_pos; ++p) {
+                for (int64_t dp = 0; dp < half; ++dp) {
+                    uint16_t c = cos_host[(size_t)p * half + dp];
+                    uint16_t s = sin_host[(size_t)p * half + dp];
+                    cos_full[(size_t)p * HD + 2*dp + 0] = c;
+                    cos_full[(size_t)p * HD + 2*dp + 1] = c;
+                    sin_full[(size_t)p * HD + 2*dp + 0] = s;
+                    sin_full[(size_t)p * HD + 2*dp + 1] = s;
+                }
+            }
+            const size_t cf_bytes = cos_full.size() * sizeof(uint16_t);
+            QIE_ACL_CHECK(g_cann.aclrtMalloc(&scratch_rope_cos_full_dev_,
+                                              cf_bytes, ACL_MEM_MALLOC_HUGE_FIRST));
+            QIE_ACL_CHECK(g_cann.aclrtMemcpy(scratch_rope_cos_full_dev_, cf_bytes,
+                                              cos_full.data(), cf_bytes,
+                                              ACL_MEMCPY_HOST_TO_DEVICE));
+            QIE_ACL_CHECK(g_cann.aclrtMalloc(&scratch_rope_sin_full_dev_,
+                                              cf_bytes, ACL_MEM_MALLOC_HUGE_FIRST));
+            QIE_ACL_CHECK(g_cann.aclrtMemcpy(scratch_rope_sin_full_dev_, cf_bytes,
+                                              sin_full.data(), cf_bytes,
+                                              ACL_MEMCPY_HOST_TO_DEVICE));
+            stats_.rope_bytes += 2 * cf_bytes;
+        }
     }
 
     // Scratch allocations — same layout as init_from_gguf.
@@ -2145,6 +2677,18 @@ bool ImageDiffusionEngine::init_for_smoke(const ImageDiffusionConfig &cfg,
                    (size_t)cfg_.max_txt_seq * H * F16)) return false;
     if (!try_alloc(&mean_dev_,    (size_t)SEQ * sizeof(float))) return false;
     if (!try_alloc(&ln_rstd_dev_, (size_t)SEQ * sizeof(float))) return false;
+
+    // Phase 4.1 on-device RoPE scratch — three [seq_max, NH, head_dim/2] F16.
+    {
+        const int64_t NH_ = cfg_.num_heads;
+        const int64_t HALF_HD = cfg_.head_dim / 2;
+        const size_t rope_half_bytes =
+            (size_t)SEQ * NH_ * HALF_HD * F16;
+        if (!try_alloc(&scratch_rope_a_dev_, rope_half_bytes)) return false;
+        if (!try_alloc(&scratch_rope_b_dev_, rope_half_bytes)) return false;
+        if (!try_alloc(&scratch_rope_c_dev_, rope_half_bytes)) return false;
+    }
+
     if (!try_alloc(&workspace_dev_, 4 * 1024 * 1024)) return false;
     workspace_size_ = 4 * 1024 * 1024;
 

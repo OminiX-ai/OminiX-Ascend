@@ -263,6 +263,16 @@ struct CannSyms {
                                               aclOpExecutor **executor);
     aclnnStatus (*aclnnCast)(void *, uint64_t, aclOpExecutor *, aclrtStream);
 
+    // Strided tensor copy (supports non-contiguous tensors). Used by the
+    // Phase 4.1 on-device RoPE scatter-write to avoid relying on aclnnAdd
+    // accepting strided output views.
+    aclnnStatus (*aclnnInplaceCopyGetWorkspaceSize)(aclTensor *selfRef,
+                                                     const aclTensor *src,
+                                                     uint64_t *workspaceSize,
+                                                     aclOpExecutor **executor);
+    aclnnStatus (*aclnnInplaceCopy)(void *, uint64_t, aclOpExecutor *,
+                                     aclrtStream);
+
     // TensorList creation / destruction — used to wrap a single K/V tensor for
     // the FusedInferAttention op (which takes lists to support chunked KV).
     aclTensorList *(*aclCreateTensorList)(const aclTensor *const *value,

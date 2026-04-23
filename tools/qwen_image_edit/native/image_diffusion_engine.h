@@ -296,6 +296,17 @@ struct DiTGlobalWeights {
     // block gets zero-rotation (cos=1, sin=0) in the upstream reference;
     // populate the tables accordingly so no runtime branch is needed.
     void *rope_pe_dev = nullptr;  // F16 [seq · head_dim/2 · 2 · 2]
+
+    // Phase 4.1 on-device RoPE tables. Redundant with `rope_pe_dev` but in a
+    // layout the on-device RoPE kernel can consume without strided-view
+    // gymnastics on the 4-D packed pe tensor. Both are F16 [seq, head_dim/2]
+    // contiguous, with the same row indexing convention as `rope_pe_dev`
+    // (rows [0 .. ctx_len) are txt, rows [ctx_len .. ctx_len+img_tokens)
+    // are img). `apply_rope_on_device_` indexes these directly via
+    // `pe_row_offset`.
+    void *rope_cos_dev = nullptr;  // F16 [seq · head_dim/2]
+    void *rope_sin_dev = nullptr;  // F16 [seq · head_dim/2]
+    int64_t rope_total_pos = 0;    // number of rows in the tables above
 };
 
 // ---------------------------------------------------------------------------
@@ -388,6 +399,30 @@ public:
     // vector yet.
     DiTLayerWeights *mutable_layer_weights(int il);
 
+    // Phase 4.1 test-only hook: expose the on-device and host apply_rope
+    // variants for the Q2.4.1 RoPE smoke probe. Not for production use.
+    bool apply_rope_on_device_test(void *x_f16_dev, int64_t pe_row_offset,
+                                     int64_t B, int64_t seq,
+                                     int64_t n_heads, int64_t head_dim) {
+        return apply_rope_on_device_(x_f16_dev, pe_row_offset, B, seq,
+                                        n_heads, head_dim);
+    }
+    bool apply_rope_host_test(void *x_f16_dev, const void *pe_f16_dev,
+                                int64_t pe_row_offset, int64_t B, int64_t seq,
+                                int64_t n_heads, int64_t head_dim) {
+        return apply_rope_host_(x_f16_dev, pe_f16_dev, pe_row_offset, B, seq,
+                                   n_heads, head_dim);
+    }
+    // Pass-throughs for the probe to access the pe tables.
+    void *rope_pe_dev_for_test()  { return global_w_.rope_pe_dev; }
+    void *rope_cos_dev_for_test() { return global_w_.rope_cos_dev; }
+    void *rope_sin_dev_for_test() { return global_w_.rope_sin_dev; }
+    // Phase 4.1 pre-broadcast [total_pos, NH, half] tiles consumed by the
+    // on-device RoPE path. Probes that override cos/sin need to write into
+    // these too.
+    void *rope_cos_bcast_dev_for_test() { return scratch_rope_cos_bcast_dev_; }
+    void *rope_sin_bcast_dev_for_test() { return scratch_rope_sin_bcast_dev_; }
+
 private:
     // --- State ---
     bool  ready_                 = false;
@@ -427,6 +462,28 @@ private:
     void *scratch_txt_out_dev_  = nullptr;  // F16 [txt_seq, hidden]
     void *mean_dev_             = nullptr;  // F32 [max_seq]  (LayerNorm mean)
     void *ln_rstd_dev_          = nullptr;  // F32 [max_seq]  (LayerNorm rstd)
+
+    // Phase 4.1 on-device RoPE scratch. Three `[B, seq, NH, head_dim/2]` F16
+    // buffers for the four-Mul + two-Add interleaved rotation. Sized for
+    // max_seq × max_heads × head_dim/2 F16 each (worst case under joint-attn
+    // layout = max_img_seq + max_txt_seq). Ping-ponged per apply_rope_ call.
+    void *scratch_rope_a_dev_   = nullptr;  // F16 [seq_max · NH · head_dim/2]
+    void *scratch_rope_b_dev_   = nullptr;  // F16 [seq_max · NH · head_dim/2]
+    void *scratch_rope_c_dev_   = nullptr;  // F16 [seq_max · NH · head_dim/2]
+    // Pre-broadcast cos/sin tiles for on-device RoPE: ACL's implicit
+    // stride-0 broadcast inside aclnnMul produced wrong numerics empirically
+    // during Q2.4.1 (see docs/qie_q2_phase4_smoke.md §4.1-diagnostic). We
+    // materialize explicit `[1, seq, NH, head_dim/2]` contiguous tiles on
+    // device per `apply_rope_` call (or up-front if cheap). Sized for
+    // max_seq × max_heads × head_dim/2 F16.
+    void *scratch_rope_cos_bcast_dev_ = nullptr;
+    void *scratch_rope_sin_bcast_dev_ = nullptr;
+    // Phase 4.1 interleave-mode cos/sin tables for aclnnRotaryPositionEmbedding
+    // dispatch path. Shape [total_pos, head_dim] with each pair's cos/sin
+    // duplicated across the two elements of the pair (so cos[2dp] = cos[2dp+1]
+    // = cos_of_pair_dp).
+    void *scratch_rope_cos_full_dev_ = nullptr;
+    void *scratch_rope_sin_full_dev_ = nullptr;
     // Affine-off LayerNorm helpers: since aclnnLayerNorm takes optional
     // gamma/beta we can pass nullptr. Reserved for future probe fallbacks
     // that need explicit constant tensors.
@@ -523,9 +580,40 @@ private:
     // [seq_pe_max, head_dim/2, 2, 2]. `pe_row_offset` is the starting row
     // inside pe to apply (0 for txt stream, ctx_len for img stream).
     // Output is in-place on x.
+    //
+    // Phase 4.1: `apply_rope_` now dispatches on-device (4× aclnnMul +
+    // 2× aclnnAdd with strided cos/sin broadcasts). It consumes
+    // `global_w_.rope_cos_dev` / `rope_sin_dev` (separate flat F16 tables)
+    // rather than the packed `pe_f16_dev` — the argument is retained for
+    // backwards compat with the test harness but is unused on the hot path.
+    // The original host round-trip implementation is preserved as
+    // `apply_rope_host_` for parity testing (see `QIE_ROPE_HOST` env var).
     bool apply_rope_(void *x_f16_dev,
                      const void *pe_f16_dev, int64_t pe_row_offset,
                      int64_t B, int64_t seq, int64_t n_heads, int64_t head_dim);
+
+    // Phase 4.1: on-device interleaved RoPE using precomputed cos/sin flat
+    // tables. Pre-gate: `global_w_.rope_cos_dev` and `rope_sin_dev` must be
+    // allocated and populated by init_from_gguf/init_for_smoke.
+    bool apply_rope_on_device_(void *x_f16_dev,
+                                int64_t pe_row_offset,
+                                int64_t B, int64_t seq,
+                                int64_t n_heads, int64_t head_dim);
+
+    // Phase 4.1 fallback: manual 4-Mul + 2-Add + 2-Copy assembly of the
+    // interleaved rotation (kept as a backup if aclnnRotaryPositionEmbedding's
+    // interleave mode proves unreliable on a given CANN version).
+    bool apply_rope_manual_(void *x_f16_dev,
+                             int64_t pe_row_offset,
+                             int64_t B, int64_t seq,
+                             int64_t n_heads, int64_t head_dim);
+
+    // Phase 3 host round-trip reference — preserved for parity probes.
+    // Selected via `QIE_ROPE_HOST=1` env var.
+    bool apply_rope_host_(void *x_f16_dev,
+                           const void *pe_f16_dev, int64_t pe_row_offset,
+                           int64_t B, int64_t seq,
+                           int64_t n_heads, int64_t head_dim);
 
     // One Euler-flow scheduler step: given the DiT's predicted velocity
     // `model_out` (NPU buffer), the current latent, and the Euler-flow

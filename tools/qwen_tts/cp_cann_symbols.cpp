@@ -157,6 +157,12 @@ bool load_once() {
                   g_cann.aclnnCastGetWorkspaceSize);
     ok &= resolve(h_op,   "aclnnCast",                g_cann.aclnnCast);
 
+    // Phase 4.1 on-device RoPE scatter. aclnnInplaceCopy supports non-contig
+    // src/dst — used to scatter rotated halves back into interleaved x.
+    ok &= resolve(h_op,   "aclnnInplaceCopyGetWorkspaceSize",
+                  g_cann.aclnnInplaceCopyGetWorkspaceSize);
+    ok &= resolve(h_op,   "aclnnInplaceCopy",         g_cann.aclnnInplaceCopy);
+
     // TensorList lives in libnnopbase like the other aclCreateTensor helpers.
     ok &= resolve(h_base, "aclCreateTensorList",      g_cann.aclCreateTensorList);
     ok &= resolve(h_base, "aclDestroyTensorList",     g_cann.aclDestroyTensorList);
