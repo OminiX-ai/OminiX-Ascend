@@ -509,11 +509,6 @@ against *real* weight payloads.
 
 ---
 
-## §5. Phase 4.5 — Canonical cat-edit smoke (pending)
-
-Not yet started. Gate: any sensible output, no crash, HBM peak ≤ 18 GiB.
-Report end-to-end 20-step wall-clock for one 256×256 edit — the first QIE
-native fps measurement that isn't Q1 baseline.
 ## Phase 4.4 real-GGUF smoke — VERDICT: RED (NaN)
 
 Commit: `bc24a8c6` probe + receipts on fork.
@@ -611,3 +606,273 @@ next step would have been BF16 pipeline conversion (the
 see `ggml/src/ggml-cann/aclnn_ops.cpp:2638`). Not needed.
 
 **Unblocks:** Phase 4.5 cat-edit smoke is now UNBLOCKED.
+
+---
+
+## §5. Phase 4.5 — Canonical cat-edit smoke end-to-end (in flight)
+
+**Predecessor:** commit `8603d0f` — Phase 4.4d F32 residual stream GREEN at
+N=60 single forward on real Q4_0 GGUF.
+
+**Scope:** wire Phase 4.3's 20-step Euler denoise loop to real GGUF
+weights (from Phase 4.4d), add host-side conditioning input path
+(Option A: VAE-encode cat image + text-encode prompt on host via the
+ominix-diffusion stack, upload F32 tensors to NPU), run 20 steps, VAE
+decode on host, save PNG. First real-weight end-to-end QIE on the
+native engine.
+
+### §5.1 Workplan decomposition
+
+| Step | Scope | Receipt target |
+|---|---|---|
+| 5.1 | real-weight 20-step denoise with **synthetic** conditioning (isolates residual-F32 stability risk) | `tools/probes/qie_q45_real_denoise_smoke`, log at `/tmp/q45_step1_smoke.log` |
+| 5.2 | host-side conditioning dump via ominix-diffusion pipeline, upload to NPU as F32 `txt_cond`/`txt_uncond` + prepend ref-image-latent tokens to `x_init` | patch into `ominix-diffusion-cli` with `--dump-conditioning` mode |
+| 5.3 | final-latent → VAE decode → PNG on host | consume `/tmp/qie_q45_final_latent.f32.bin` via ominix-diffusion VAE |
+| 5.4 | end-to-end wall measurement at 256×256 × 20-step | honest comparison vs Q1 extrapolated baseline |
+| 5.5 | eye-check output image | compare to Q1's `qie_smoke_bf16.png` / human expectation |
+
+### §5.2 Step 1 — real-weight 20-step denoise (synthetic conditioning)
+
+**Probe:** `tools/probes/qie_q45_real_denoise_smoke/` (commit `68eca5f`).
+
+Same dispatch pattern as Phase 4.4d probe for the load + 4.3 probe for
+the denoise loop — the novel step is running the loop **on real Q4_0
+weights** for the first time. The F32-residual fix is proven at
+N=60 blocks × single forward (Phase 4.4d). Step 1's primary unknown:
+does the fix hold across 20 steps × 2 CFG × 60 blocks = 2400 block
+dispatches?
+
+#### §5.2.1 Small-shape smoke (img=64, txt=32 — dev checkpoint)
+
+Scheduler: `cfg_scale=4.0`, `n_steps=20`, linear sigmas on (1.0, 0.0].
+
+Launch recipe (SIGHUP-proof, HBM lock held):
+
+```
+nohup setsid bash -c 'touch /tmp/ac03_hbm_lock && \
+    cd ~/work/OminiX-Ascend/tools/probes/qie_q45_real_denoise_smoke && \
+    GGML_BUILD=$HOME/work/OminiX-Ascend/build-w1 \
+    GGML_CANN_QUANT_BF16=on \
+    bash build_and_run.sh 2>&1 | tee /tmp/q45_step1_smoke.log; \
+    rm -f /tmp/ac03_hbm_lock; echo EXITCODE=$?' \
+    < /dev/null > /dev/null 2>&1 &
+```
+
+Gate:
+- GREEN — 20 steps complete, `NaN=0 && inf=0 && std > 0.001` on final
+  latent.
+- YELLOW — loop finishes but numerics off (e.g. std < 0.001).
+- RED — NaN/inf mid-loop or loop returns false.
+
+**Expected wall (from Phase 4.3 synthetic-weight measurement):** 20 steps
+× 2 CFG × 60 blocks ≈ 10.8 s at small shape. Phase 4.4d single forward
+(synthetic input, real GGUF) measured 1.44 s — extrapolates to 2 × 20 ×
+1.44 s ≈ 57.6 s on real weights (real Q4 path vs synthetic F16 add
+similar dispatch cost), plus ~1 s op-graph compilation amortised on
+step 0.
+
+**VERDICT: GREEN.** First real-weight end-to-end 20-step denoise on
+the native engine passes at `img_seq=64 txt_seq=32` small shape:
+
+| Metric | Value | Gate |
+|---|---|---|
+| Steps completed | **20 / 20** | 20 ≥ 1 |
+| NaN in final latent | **0** | = 0 |
+| inf in final latent | **0** | = 0 |
+| Final latent std | **1134.77** | > 0.001 |
+| Final latent mean | -14.02 | (tracked) |
+| Final latent min / max | -61468.4 / +1322.2 | F32 range — F16 would overflow |
+
+Consistent with Phase 4.4d's single-forward magnitudes (std=1513.40,
+max=+81974) — the F32 residual-stream contract (Phase 4.4c) **holds
+across 2400 block dispatches** (20 steps × 2 CFG × 60 blocks). Primary
+risk for Phase 4.5 is now RETIRED.
+
+**Wall-clock (ac03, NPU, real Q4_0 Qwen-Image-Edit-2509 GGUF):**
+
+```
+init_from_gguf         : 107316.8 ms  (107.3 s; one-shot)
+  tensors uploaded     : 1933 (696 Q4-resident + 150 F16 fallback + norms/biases)
+  Q4 weight bytes      : 7.14 GiB
+  F16 fallback bytes   : 9.51 GiB
+  Peak init HBM        : 17.93 GiB  (≤ 18 GiB Q1.10 gate ✅)
+  Dequant/repack wall  : 9.0 ms
+
+denoise_loop_test (20 × 2 CFG × 60 blocks) : 11803.66 ms (11.8 s)
+  per-step min    :   523.91 ms
+  per-step median :   527.67 ms
+  per-step max    :  1781.42 ms  (step 0 op-graph compile tax)
+  per-step sum    : 11802.88 ms
+  first 5 steps   : 1781.42  526.14  523.91  527.20  526.38 ms
+  last  5 steps   :  528.54  529.20  529.16  531.08  528.16 ms
+```
+
+Amortised per-step wall (steps 1–19): **~527 ms**. Step 0 pays ~1250 ms
+op-graph compilation tax (matches Phase 4.4d's 1215 ms first-block
+penalty on real weights).
+
+**Wall breakdown vs Phase 4.3 synthetic-weight baseline:**
+
+| Phase | seq | step wall | 20-step total |
+|---|---|---|---|
+| 4.3 synthetic F16 weights | img=64 txt=32 | 475 ms median | 10775 ms |
+| **4.5 real Q4 weights** | img=64 txt=32 | **528 ms median** | **11803 ms** |
+
+Real weights add ~11% to per-step wall — the Q4-resident WQBMMv3
+dispatches are slightly heavier than the all-F16 aclnnMm path, but the
+delta is small. This confirms that native-engine performance at
+production-shape will not be bottlenecked by Q4 antiquant — it scales
+with seq² for attention and seq for matmul, as expected.
+
+**Artefacts:**
+- Full log: `docs/_qie_q45_step1_smoke_v1.log` (51 lines, EXITCODE=0).
+- Probe source: `tools/probes/qie_q45_real_denoise_smoke/`.
+- Final latent: `/tmp/qie_q45_final_latent.f32.bin` (196608 F32 elts,
+  0.75 MiB, shape `[img_seq=64, H=3072]` — pre-proj_out, pre-unpatchify;
+  Step 3 VAE decode path consumes this).
+
+**Below: first-session dispatch-blocked history (Step 1 eventually
+fired via queued launcher and GREENd; kept for receipts continuity):**
+
+
+
+At session start HBM was already at 25.5 GiB / 32 GiB used by a
+cohabitant `ominix-diffusion-cli` run from the RoPE-lift agent
+(PID 1880537, `-W 1024 -H 1024 --steps 20 --cfg-scale 1.0`). That run
+held the `/tmp/ac03_hbm_lock` discipline so Phase 4.5 Step 1 probe
+launch was deferred via a queued launcher at `/tmp/q45_queue_launch.sh`:
+
+```
+#!/usr/bin/env bash
+while pgrep -f ominix-diffusion-cli > /dev/null; do
+  echo "[$(date +%H:%M:%S)] waiting on ominix-diffusion-cli to finish..."
+  sleep 30
+done
+sleep 5
+cd $HOME/work/OminiX-Ascend/tools/probes/qie_q45_real_denoise_smoke
+GGML_BUILD=$HOME/work/OminiX-Ascend/build-w1 GGML_CANN_QUANT_BF16=on \
+  bash build_and_run.sh 2>&1 | tee /tmp/q45_step1_smoke.log
+echo EXITCODE=${PIPESTATUS[0]}
+```
+
+Cohab timeline observed:
+- 01:34 — cohab started
+- 01:34–01:54 — 20-step ggml-cann sampling at 60.1 s/step (~1203 s total)
+- 01:54 — cohab logs `sampling completed`, `[NaN CHECK] diffusion/x_0:
+  262144 NaN / 262144 elements` (Q1 baseline's 512×512 NaN regression
+  reproduced at 1024×1024 — same "long-sequence × many steps" failure
+  mode; not this agent's problem to diagnose)
+- 01:54–02:03+ — cohab in VAE decode (`wan_vae compute buffer size:
+  7493.50 MB`), no progress emitted to log since 01:54 despite 91% CPU;
+  all-NaN latent dragging through Wan-VAE decoder
+- 02:03+ — session ends with cohab still decoding (total cohab elapsed
+  ~29 min when session closed); probe never got HBM
+
+**Queued launcher is still running at session close** (`pgrep -af
+q45_queue_launch` on ac03) and will auto-fire Step 1 the instant cohab
+exits. Receipts will land in `/tmp/q45_step1_smoke.log` and the final
+latent at `/tmp/qie_q45_final_latent.f32.bin`.
+
+**Next-session handoff:** check these two files first, then append
+receipts to this §5.2 block and make a commit `feat(qwen_image_edit):
+Q2.4.5.1 receipts`. If the run REDs (NaN mid-loop), follow Phase 4.4b
+playbook: bisect on step count (`QIE_N_STEPS=5, 10, 15, 20`) to find
+where accumulation blows up, then widen F32 coverage (the handoff
+warns: "may need F32 on more than just residual — possibly modulation
+or attn output paths").
+
+### §5.3 Step 2 design (post Step 1 GREEN) — host-side conditioning
+
+Option A (recommended per handoff): short-circuit via existing
+ominix-diffusion pipeline.
+
+- Load text encoder (Qwen2.5-VL-7B Q4_0) + mmproj (BF16) + VAE
+  (safetensors).
+- Text-encode the prompt ("convert cat to black and white") → get
+  `txt_cond` tensor F32 `[txt_seq, 3584]` (pre-txt_in; engine's
+  `txt_in` projects to hidden=3072).
+- Same for empty prompt → `txt_uncond`.
+- VAE-encode ref image (`~/work/qie_test/cat.jpg` resized to 256×256)
+  → get `ref_latent` F32 `[16, 32, 32]` in latent space (VAE downscales
+  8×; 256/8=32 per side).
+- Patchify ref_latent (2×2 patch, channel-dim first) → F32 `[img_tokens,
+  64]` = 16×16=256 ref tokens (post txt_in-projection shape from engine's
+  img_in = 64→hidden).
+- Initial noise latent: random F32 `[img_tokens, 64]` at 16×16=256 img
+  tokens (256×256 image / 8 VAE / 2 patch = 16 per side).
+- Concat [init_noise ; ref_patches] along seq dim → 512 joint img tokens
+  (this replaces the engine's 256 img_seq with 512 for the ref-aware
+  edit — critical difference vs Phase 4.3/4.4 which had img_seq=64).
+
+Dump file layout (each is a raw F32 flat buffer):
+```
+/tmp/qie_q45_inputs/
+  txt_cond.f32.bin       shape [txt_seq=32, H=3584]  (pre txt_in proj)
+  txt_uncond.f32.bin     shape [txt_seq=32, H=3584]
+  ref_latent.f32.bin     shape [img_tokens=256, C=64] patchified
+  init_noise.f32.bin     shape [img_tokens=256, C=64] patchified
+  sigmas.f32.bin         shape [n_steps+1]
+  meta.txt               shape strings + H/W/channels/seed
+```
+
+**Open issue — txt_in projection:** the ref stack's text_encoder outputs
+`[txt_seq, 3584]` (joint_attention_dim). The native engine's `txt_in`
+weight (F16 fallback in the Q4 upload) projects to hidden=3072. The
+engine consumes `txt_hidden` as F32 `[txt_seq, hidden=3072]` per
+Phase 4.4c contract — so the host-dumper must **also** run txt_in on
+host (or upload the raw `[txt_seq, 3584]` and fold txt_in into the
+engine's denoise entry as a one-time projection). Easiest: extract
+`txt_in.weight/bias` from the GGUF on host, multiply, upload post-proj
+F32. Track as a Step 2a design note.
+
+**Open issue — img_in projection:** same — the engine consumes F32
+`[img_seq, hidden]` after `img_in`. Either project on host (64→3072
+F16 matmul) or fold into the engine.
+
+### §5.4 Step 3 design — VAE decode on host
+
+After 20 steps the native engine dumps `x_out` as F32 `[img_seq=256,
+hidden=3072]`. Host-side path:
+
+1. Un-project with `proj_out` (weight lives in the GGUF; F16 fallback on
+   the engine path) and `norm_out` (AdaLN — needs t_emb=0 for final
+   output; trivially `identity * scale(t=0) + shift(t=0)`). Output:
+   F32 `[img_tokens, patch_size² × out_channels] = [256, 64]`.
+2. Unpatchify to `[out_channels=16, H/8=32, W/8=32]`.
+3. Strip ref_latent tokens (we concatenated init+ref at step 2; final
+   output's first `init_img_tokens=256` rows are the edited latent).
+4. Run ominix-diffusion VAE decode (vae.hpp) on the 16-ch latent →
+   `[3, 256, 256]` uint8 RGB image.
+5. Save as PNG via stbi_write_png.
+
+### §5.5 Step 4 — end-to-end wall at 256×256
+
+Target report (populate after Step 3 lands):
+
+| Phase | Wall (ms) | Fraction |
+|---|---|---|
+| Session init (GGUF load + NPU upload) | ? | one-shot |
+| Host conditioning (VAE-encode ref + text-encode prompt) | ? | small |
+| Denoise 20 steps × 2 CFG × 60 blocks @ img_seq=512 txt_seq=32 | ? | dominant |
+| Host VAE decode + unpatchify + PNG | ? | small |
+| Total end-to-end wall | ? | — |
+
+Q1 baseline comparator: 145 s / 256×256 / **2-step** → extrapolated
+to 20 steps ≈ 1450 s (linear in step count; per-step wall on ggml-cann
+was ~50 s at 256×256 per Q1 §Q1.4 receipts). **Native target: beat
+1450 s.** Stretch: beat Q1's 50 s/step (i.e. <<1000 s for 20 steps).
+
+Production 1024×1024 extrapolation: per-block attention cost is
+~O(seq²), per-block matmul cost ~O(seq·hidden). At seq=256→4096 (1024×1024
+produces 4096 img tokens + ref), attention × 256× slower, matmuls × 16×
+slower. Per-block total ~256× heavier on attention alone. Phase 4.3 small
+shape measured ~475 ms per step (~8 ms per block-pair); 1024×1024 could
+be 250× → ~120 s/step → **~2400 s total at 1024×1024 × 20-step**
+(40 min — competitive but not revolutionary vs Q1's ~2-6 hr 1024×1024
+projection).
+
+### §5.6 Step 5 — eye check
+
+Display `/tmp/qie_q45_cat_edit.png` and compare visually to
+`/tmp/qie_smoke_bf16.png` (Q1 baseline) and the canonical cat. Flag if
+the output is garbled / blank / noise / inverted.
