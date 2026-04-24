@@ -2018,6 +2018,80 @@ bool ImageDiffusionEngine::layer_norm_f32_to_f16_(const void *x_f32_dev,
 }
 
 // ---------------------------------------------------------------------------
+// Phase 4.5 Step 4: RMSNorm over last dim `inner`, F32 in → F16 out. Used
+// for the global `txt_norm` (RMSNorm over joint_attention_dim=3584) on the
+// raw text-encoder conditioning before `txt_in` matmul. F32-in is required
+// because the host-dumped txt conditioning arrives F32 and we keep the
+// numerically sensitive normalization in F32 (joint_dim=3584 is large
+// enough that F16 accumulator overflow is plausible). The bounded ~1σ
+// output casts cleanly to F16 for the subsequent Q4_0 dispatch_matmul_.
+// ---------------------------------------------------------------------------
+bool ImageDiffusionEngine::rms_norm_row_f32_to_f16_(const void *x_f32_dev,
+                                                      void *out_f16_dev,
+                                                      const void *gamma_f32_dev,
+                                                      int64_t rows,
+                                                      int64_t inner) {
+    if (!g_cann.aclnnRmsNorm || !g_cann.aclnnRmsNormGetWorkspaceSize) {
+        QIE_LOG("rms_norm_row_f32_to_f16_: aclnnRmsNorm symbol missing");
+        return false;
+    }
+    if (!g_cann.aclnnCast || !g_cann.aclnnCastGetWorkspaceSize) {
+        QIE_LOG("rms_norm_row_f32_to_f16_: aclnnCast symbol missing");
+        return false;
+    }
+    if (!scratch_residual_tmp_f32_dev_) {
+        QIE_LOG("rms_norm_row_f32_to_f16_: scratch_residual_tmp_f32_dev_ null");
+        return false;
+    }
+    if (!gamma_f32_dev) {
+        QIE_LOG("rms_norm_row_f32_to_f16_: null gamma");
+        return false;
+    }
+
+    // Input / output F32 shape [rows, inner].
+    int64_t x_shape[2]   = {rows, inner};
+    int64_t x_strides[2] = {inner, 1};
+    aclTensor *t_in  = tensor_nd_f32(const_cast<void *>(x_f32_dev),
+                                       2, x_shape, x_strides);
+    aclTensor *t_out = tensor_nd_f32(scratch_residual_tmp_f32_dev_,
+                                       2, x_shape, x_strides);
+
+    int64_t g_shape[1]   = {inner};
+    int64_t g_strides[1] = {1};
+    aclTensor *t_g = tensor_nd_f32(const_cast<void *>(gamma_f32_dev),
+                                     1, g_shape, g_strides);
+
+    // rstd [rows, 1] F32 — rstd_dev_ is sized for num_heads*SEQ so it's
+    // plenty for `rows = txt_seq` in the worst case.
+    int64_t r_shape[2]   = {rows, 1};
+    int64_t r_strides[2] = {1, 1};
+    aclTensor *t_rstd = tensor_nd_f32(rstd_dev_, 2, r_shape, r_strides);
+
+    uint64_t ws = 0;
+    aclOpExecutor *exec = nullptr;
+    aclnnStatus s = g_cann.aclnnRmsNormGetWorkspaceSize(
+        t_in, t_g, (double)cfg_.rms_norm_eps,
+        t_out, t_rstd, &ws, &exec);
+    if (s == 0) {
+        ensure_workspace_(ws);
+        s = g_cann.aclnnRmsNorm(ws > 0 ? workspace_dev_ : nullptr,
+                                  ws, exec, compute_stream_);
+    }
+    if (s != 0) QIE_LOG("rms_norm_row_f32_to_f16_: RmsNorm(F32) status=%d",
+                          (int)s);
+
+    g_cann.aclDestroyTensor(t_in);
+    g_cann.aclDestroyTensor(t_out);
+    g_cann.aclDestroyTensor(t_g);
+    g_cann.aclDestroyTensor(t_rstd);
+
+    if (s != 0) return false;
+
+    return cast_f32_to_f16_(scratch_residual_tmp_f32_dev_, out_f16_dev,
+                              rows * inner);
+}
+
+// ---------------------------------------------------------------------------
 // Q2.3: RMSNorm across the head_dim axis. Input is [rows, head_dim] F16;
 // gamma is F32 [head_dim]. rstd_dev_ reused (F32 [rows]).
 // ---------------------------------------------------------------------------
@@ -3392,6 +3466,995 @@ bool ImageDiffusionEngine::init_for_smoke(const ImageDiffusionConfig &cfg,
             device_, (long long)H, (long long)cfg_.num_heads,
             (long long)cfg_.head_dim,
             (long long)cfg_.max_img_seq, (long long)cfg_.max_txt_seq);
+    return true;
+}
+
+// ============================================================================
+// Phase 4.5 Step 4: denoise_full — first real end-to-end cat-edit PNG via
+// the native engine.
+//
+// Wraps the 60-block loop (forward_block_) with the five previously missing
+// projection / embedding paths: time_linear{1,2}, img_in, txt_in + txt_norm,
+// and norm_out + proj_out (AdaLayerNormContinuous head). Per the §5.5 shape
+// plan at 256×256:
+//
+//   init_latent        [32, 32, 16, 1]         F32   (Qwen-Image VAE layout)
+//   ref_latent_0       [32, 32, 16, 1]         F32   (optional)
+//   cond_c_crossattn   [3584, 214, 1, 1]       F32
+//   uncond_c_crossattn [3584, 214, 1, 1]       F32   (optional)
+//
+// Semantics — faithful to the CPU Euler sampler (denoiser.hpp L831-866):
+//   For each step s = 0 .. n_steps-1:
+//     sigma    = sigmas[s]
+//     denoised = DiT_full_forward(x, sigma)        # shape matches x
+//     d        = (x - denoised) / sigma
+//     x       += d * (sigmas[s+1] - sigmas[s])
+// The "full DiT forward" includes norm_out + proj_out — so these must run
+// every step, not once at the end. We match that: host-side x[W_lat,H_lat,
+// C_lat,B] is re-patchified per step, pushed through img_in → blocks →
+// norm_out + proj_out → unpatchified back to x's shape, and the Euler step
+// runs on host over the full unpatched volume.
+//
+// Host-side preprocessing (once per request):
+//   * pad_and_patchify(latent, patch=2): reshape `[W_lat, H_lat, C, B]` →
+//     `[B, H_lat/2 * W_lat/2, 2*2*C]` — 16 × patch² = 64-dim per token.
+//     At 32×32 latent this produces 256 tokens. Concat init|ref along seq
+//     yields `img_seq = 512` tokens. Ref is patchified once; init is
+//     re-patchified each step from evolving x_host.
+//   * Text conditioning: uploaded F32 on-device once, RMSNorm+txt_in run
+//     once (before the loop) to produce per-stream F32 residual that is
+//     D2D-copied into the per-step txt working buffer (forward destroys
+//     it in-place).
+//
+// Per-step NPU pipeline:
+//   1. t = sigma_s * 1000 → sinusoidal [256] on host (matching
+//      ggml_compute_forward_timestep_embedding_f32: cos[0..half),
+//      sin[half..dim)). Upload F32 [1, 256], cast F32→F16 into scratch,
+//      Q4 Linear time_linear1 [256 → 3072], SiLU in-place, Q4 Linear
+//      time_linear2 [3072 → 3072]. Output is F16 [1, 3072] t_emb_s.
+//   2. Patchify x_host → concat with ref → F16 upload → img_in Q4 Linear
+//      [IN_CH=64 → H=3072] → F32 via Cast. Sets img_res_c_f32 (and
+//      img_res_u_f32 if CFG — same projection, differs only in txt cond).
+//   3. D2D txt_res_c → txt_work_c. forward_all_blocks_test on (img_res_c,
+//      txt_work_c, t_emb_s). At exit, img_res_c_f32 holds the 60-block
+//      output hidden stream for cond.
+//   4. Compute AdaLN (scale, shift) with this step's t_emb_s:
+//         silu = SiLU(t_emb_s)
+//         emb  = Linear(silu) → split → scale [1,H], shift [1,H]
+//      LayerNorm(img_res_c_f32) → modulate → proj_out Q4 Linear [H → 64]
+//      → F16 [img_seq, 64] cond noise prediction.
+//   5. (run_uncond) Same steps 3-4 with uncond txt stream. CFG compose:
+//         eps = eps_uncond + cfg*(eps_cond - eps_uncond)
+//      (F16 InplaceAdd).
+//   6. D2H the first init_img_tokens × PATCH_OUT elements (drop ref
+//      tokens — they're carried during forward for attention mixing but
+//      not used in the Euler update). Host F16→F32, unpatchify to
+//      denoised_host [W_lat, H_lat, out_channels=16, B].
+//   7. Host Euler: x_host[j] += (x_host[j] - denoised_host[j]) / sigma *
+//                                 (sigmas[s+1] - sigma).
+//
+// Scratch footprint per request (at 256×256 production shape):
+//   ~30 MiB on top of the ~8 GiB resident weights. Comfortably fits in
+//   the 32 GiB HBM budget.
+// ============================================================================
+
+// Host-side helpers for denoise_full.
+namespace {
+
+// Host patchify: input `latent` is laid out Qwen-Image VAE convention
+// `[ne0=W_lat, ne1=H_lat, ne2=C_lat, ne3=B]` row-major in ne0. Equivalent
+// of DiT::pad_and_patchify(patch_size=2) with no padding required when
+// W_lat and H_lat are already multiples of patch.
+// Output buffer `out` is written as F32 `[B, seq, patch²*C_lat]` row-major:
+//   seq = (H_lat/patch) * (W_lat/patch), out layout per-token is
+//   `[ch, py, px]` flattened (C-contiguous over patch² × C).
+// Matches the CPU reference logic from common_dit.hpp::pad_and_patchify
+// (convert to tokens in row-major patch sweep).
+static void host_patchify_latent(const float *latent,
+                                  int64_t W_lat, int64_t H_lat,
+                                  int64_t C_lat, int64_t B,
+                                  int patch,
+                                  std::vector<float> &out,
+                                  int64_t &seq_out,
+                                  int64_t &token_dim_out) {
+    const int64_t H_tok = H_lat / patch;
+    const int64_t W_tok = W_lat / patch;
+    seq_out = H_tok * W_tok;
+    token_dim_out = (int64_t)patch * patch * C_lat;
+    out.assign((size_t)B * seq_out * token_dim_out, 0.0f);
+
+    // `latent[w, h, c, b]` index in row-major with ne0=W_lat fastest:
+    //   lat_idx = ((b * C_lat + c) * H_lat + h) * W_lat + w
+    // Token (ty, tx) covers the patch block w in [tx*patch .. tx*patch+patch),
+    // h in [ty*patch .. ty*patch+patch). The per-token layout matches
+    // diffusers' convention: channel-major then py, px.
+    for (int64_t b = 0; b < B; ++b) {
+        for (int64_t ty = 0; ty < H_tok; ++ty) {
+            for (int64_t tx = 0; tx < W_tok; ++tx) {
+                const int64_t tok = ty * W_tok + tx;
+                float *dst = &out[((size_t)b * seq_out + tok) * token_dim_out];
+                int64_t k = 0;
+                for (int64_t c = 0; c < C_lat; ++c) {
+                    for (int64_t py = 0; py < patch; ++py) {
+                        for (int64_t px = 0; px < patch; ++px) {
+                            const int64_t h = ty * patch + py;
+                            const int64_t w = tx * patch + px;
+                            const size_t lat_idx =
+                                (((size_t)b * C_lat + c) * H_lat + h) *
+                                    W_lat + w;
+                            dst[k++] = latent[lat_idx];
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Inverse of host_patchify_latent: given flat F32 `[B, seq, patch²*C_lat]`
+// in the same layout produced above, scatter back to `[W_lat, H_lat, C_lat, B]`.
+static void host_unpatchify_latent(const float *tokens,
+                                    int64_t W_lat, int64_t H_lat,
+                                    int64_t C_lat, int64_t B,
+                                    int patch,
+                                    float *out_latent) {
+    const int64_t H_tok = H_lat / patch;
+    const int64_t W_tok = W_lat / patch;
+    const int64_t seq   = H_tok * W_tok;
+    const int64_t token_dim = (int64_t)patch * patch * C_lat;
+    std::memset(out_latent, 0,
+                 (size_t)B * C_lat * H_lat * W_lat * sizeof(float));
+    for (int64_t b = 0; b < B; ++b) {
+        for (int64_t ty = 0; ty < H_tok; ++ty) {
+            for (int64_t tx = 0; tx < W_tok; ++tx) {
+                const int64_t tok = ty * W_tok + tx;
+                const float *src = &tokens[((size_t)b * seq + tok) * token_dim];
+                int64_t k = 0;
+                for (int64_t c = 0; c < C_lat; ++c) {
+                    for (int64_t py = 0; py < patch; ++py) {
+                        for (int64_t px = 0; px < patch; ++px) {
+                            const int64_t h = ty * patch + py;
+                            const int64_t w = tx * patch + px;
+                            const size_t lat_idx =
+                                (((size_t)b * C_lat + c) * H_lat + h) *
+                                    W_lat + w;
+                            out_latent[lat_idx] = src[k++];
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Host sinusoidal timestep embedding — matches the ggml CPU reference
+// `ggml_compute_forward_timestep_embedding_f32` layout: dim=256 total,
+// `[cos(arg_0), cos(arg_1), ..., cos(arg_half-1), sin(arg_0), ...,
+//   sin(arg_half-1)]` for `arg_j = timestep * exp(-log(max_period)*j/half)`.
+// This is IMPORTANT — the engine's earlier `build_time_emb_` used the
+// interleaved convention which doesn't match the trained time_linear1
+// weight layout.
+static void host_timestep_embedding_f32(float timestep, int dim,
+                                          int max_period,
+                                          std::vector<float> &out) {
+    out.assign((size_t)dim, 0.0f);
+    const int half = dim / 2;
+    for (int j = 0; j < half; ++j) {
+        float freq = std::exp(-std::log((float)max_period) * (float)j /
+                               (float)half);
+        float arg = timestep * freq;
+        out[(size_t)j] = std::cos(arg);
+        out[(size_t)j + half] = std::sin(arg);
+    }
+    if (dim % 2 != 0) {
+        out[(size_t)2 * half] = 0.0f;
+    }
+}
+
+// Read whole file into a vector. Returns file size; -1 on error.
+static long slurp_file(const std::string &path, std::vector<uint8_t> &out) {
+    FILE *f = std::fopen(path.c_str(), "rb");
+    if (!f) return -1;
+    std::fseek(f, 0, SEEK_END);
+    long fsize = std::ftell(f);
+    std::fseek(f, 0, SEEK_SET);
+    if (fsize <= 0) { std::fclose(f); return -1; }
+    out.assign((size_t)fsize, 0);
+    size_t nread = std::fread(out.data(), 1, (size_t)fsize, f);
+    std::fclose(f);
+    if (nread != (size_t)fsize) return -1;
+    return fsize;
+}
+
+}  // namespace
+
+bool ImageDiffusionEngine::init_from_dump(const std::string &dump_dir,
+                                            int64_t W_lat, int64_t H_lat,
+                                            int64_t C_lat, int64_t B,
+                                            int64_t joint_dim,
+                                            std::vector<float> &initial_latent_out,
+                                            std::vector<float> &ref_latent_out,
+                                            std::vector<float> &txt_cond_out,
+                                            std::vector<float> &txt_uncond_out,
+                                            int64_t &txt_seq_out,
+                                            bool &has_ref_out,
+                                            bool &has_uncond_out) {
+    initial_latent_out.clear();
+    ref_latent_out.clear();
+    txt_cond_out.clear();
+    txt_uncond_out.clear();
+    has_ref_out = false;
+    has_uncond_out = false;
+    txt_seq_out = 0;
+
+    const size_t latent_elems = (size_t)W_lat * H_lat * C_lat * B;
+    const size_t latent_bytes = latent_elems * sizeof(float);
+
+    // Required: init_latent.f32.bin
+    {
+        std::vector<uint8_t> raw;
+        long fsize = slurp_file(dump_dir + "/init_latent.f32.bin", raw);
+        if (fsize < 0) {
+            QIE_LOG("init_from_dump: missing %s/init_latent.f32.bin",
+                    dump_dir.c_str());
+            return false;
+        }
+        if ((size_t)fsize != latent_bytes) {
+            QIE_LOG("init_from_dump: init_latent size %ld != expected %zu "
+                    "(W=%lld H=%lld C=%lld B=%lld)",
+                    fsize, latent_bytes, (long long)W_lat, (long long)H_lat,
+                    (long long)C_lat, (long long)B);
+            return false;
+        }
+        initial_latent_out.assign(latent_elems, 0.0f);
+        std::memcpy(initial_latent_out.data(), raw.data(), latent_bytes);
+    }
+
+    // Optional: ref_latent_0.f32.bin
+    {
+        std::vector<uint8_t> raw;
+        long fsize = slurp_file(dump_dir + "/ref_latent_0.f32.bin", raw);
+        if (fsize >= 0) {
+            if ((size_t)fsize != latent_bytes) {
+                QIE_LOG("init_from_dump: ref_latent_0 size %ld != expected %zu",
+                        fsize, latent_bytes);
+                return false;
+            }
+            ref_latent_out.assign(latent_elems, 0.0f);
+            std::memcpy(ref_latent_out.data(), raw.data(), latent_bytes);
+            has_ref_out = true;
+        }
+    }
+
+    // Required: cond_c_crossattn.f32.bin. Size = joint_dim * txt_seq * 4 B.
+    {
+        std::vector<uint8_t> raw;
+        long fsize = slurp_file(dump_dir + "/cond_c_crossattn.f32.bin", raw);
+        if (fsize < 0) {
+            QIE_LOG("init_from_dump: missing %s/cond_c_crossattn.f32.bin",
+                    dump_dir.c_str());
+            return false;
+        }
+        if ((size_t)fsize % (joint_dim * sizeof(float)) != 0) {
+            QIE_LOG("init_from_dump: cond_c_crossattn size %ld not multiple "
+                    "of joint_dim*4 (joint_dim=%lld)",
+                    fsize, (long long)joint_dim);
+            return false;
+        }
+        const size_t elems = (size_t)fsize / sizeof(float);
+        txt_seq_out = (int64_t)(elems / (size_t)joint_dim);
+        txt_cond_out.assign(elems, 0.0f);
+        std::memcpy(txt_cond_out.data(), raw.data(), (size_t)fsize);
+    }
+
+    // Optional: uncond_c_crossattn.f32.bin
+    {
+        std::vector<uint8_t> raw;
+        long fsize = slurp_file(dump_dir + "/uncond_c_crossattn.f32.bin", raw);
+        if (fsize >= 0) {
+            if ((size_t)fsize != txt_cond_out.size() * sizeof(float)) {
+                QIE_LOG("init_from_dump: uncond_c_crossattn size %ld != cond "
+                        "size %zu — skipping uncond (will force cfg=1.0)",
+                        fsize, txt_cond_out.size() * sizeof(float));
+            } else {
+                txt_uncond_out.assign(txt_cond_out.size(), 0.0f);
+                std::memcpy(txt_uncond_out.data(), raw.data(), (size_t)fsize);
+                has_uncond_out = true;
+            }
+        }
+    }
+
+    QIE_LOG("init_from_dump OK: dir=%s lat=[%lld,%lld,%lld,%lld] "
+            "txt=[%lld x %lld] has_ref=%d has_uncond=%d",
+            dump_dir.c_str(),
+            (long long)W_lat, (long long)H_lat, (long long)C_lat, (long long)B,
+            (long long)joint_dim, (long long)txt_seq_out,
+            (int)has_ref_out, (int)has_uncond_out);
+    return true;
+}
+
+bool ImageDiffusionEngine::denoise_full(const float *initial_latent,
+                                          const float *ref_latent,
+                                          int64_t W_lat, int64_t H_lat,
+                                          int64_t C_lat, int64_t B,
+                                          const float *txt_cond,
+                                          const float *txt_uncond,
+                                          int64_t txt_seq, int64_t joint_dim,
+                                          const float *sigmas, int n_steps,
+                                          float cfg_scale,
+                                          float *out_latent,
+                                          double *per_step_ms) {
+    if (!ready_) {
+        QIE_LOG("denoise_full: engine not ready");
+        return false;
+    }
+    if (!initial_latent || !txt_cond || !sigmas || !out_latent ||
+        n_steps < 1 || B != 1) {
+        QIE_LOG("denoise_full: bad args (B must be 1 for Step 4)");
+        return false;
+    }
+    const int PATCH = cfg_.patch_size;
+    if (W_lat % PATCH != 0 || H_lat % PATCH != 0) {
+        QIE_LOG("denoise_full: W_lat/H_lat must be multiples of patch=%d "
+                "(got %lld x %lld)",
+                PATCH, (long long)W_lat, (long long)H_lat);
+        return false;
+    }
+    if (joint_dim != cfg_.joint_attention_dim) {
+        QIE_LOG("denoise_full: joint_dim mismatch got=%lld cfg=%d",
+                (long long)joint_dim, cfg_.joint_attention_dim);
+        return false;
+    }
+    if (C_lat * PATCH * PATCH != cfg_.in_channels) {
+        QIE_LOG("denoise_full: C_lat*patch² != in_channels (got %lld != %d)",
+                (long long)C_lat * PATCH * PATCH, cfg_.in_channels);
+        return false;
+    }
+
+    const int64_t H = cfg_.hidden_size;
+    const int64_t IN_CH = cfg_.in_channels;            // patch² * C_lat = 64
+    const int64_t PATCH_OUT = (int64_t)PATCH * PATCH * cfg_.out_channels;  // 64
+    const int64_t init_img_tokens = (H_lat / PATCH) * (W_lat / PATCH);
+    const int64_t ref_img_tokens  = ref_latent ? init_img_tokens : 0;
+    const int64_t img_seq         = init_img_tokens + ref_img_tokens;
+
+    if (img_seq > cfg_.max_img_seq) {
+        QIE_LOG("denoise_full: img_seq=%lld > max_img_seq=%d",
+                (long long)img_seq, cfg_.max_img_seq);
+        return false;
+    }
+    if (txt_seq > cfg_.max_txt_seq) {
+        QIE_LOG("denoise_full: txt_seq=%lld > max_txt_seq=%d — "
+                "continuing but RoPE table was built for max_txt_seq; "
+                "numerics may drift (§5.5 pe-rebuild TODO)",
+                (long long)txt_seq, cfg_.max_txt_seq);
+    }
+
+    const bool run_uncond = (cfg_scale != 1.0f) && txt_uncond != nullptr;
+
+    QIE_LOG("denoise_full: W_lat=%lld H_lat=%lld C_lat=%lld B=%lld "
+            "img_tokens=%lld+%lld=%lld txt_seq=%lld joint_dim=%lld "
+            "n_steps=%d cfg=%.2f run_uncond=%d",
+            (long long)W_lat, (long long)H_lat, (long long)C_lat, (long long)B,
+            (long long)init_img_tokens, (long long)ref_img_tokens,
+            (long long)img_seq, (long long)txt_seq, (long long)joint_dim,
+            n_steps, cfg_scale, (int)run_uncond);
+
+    // ------------------------------------------------------------------
+    // Host-side patchify of the REF latent: ref is static across steps
+    // (it's the VAE-encoded conditioning image). We patchify it once on
+    // host, then upload once and re-use every step. The INIT latent is
+    // re-patchified each step since `x` evolves with Euler updates.
+    // ------------------------------------------------------------------
+    std::vector<float> ref_tokens_f32;  // [B, init_img_tokens, IN_CH] or empty
+    if (ref_latent) {
+        int64_t rs = 0, rtd = 0;
+        host_patchify_latent(ref_latent, W_lat, H_lat, C_lat, B, PATCH,
+                              ref_tokens_f32, rs, rtd);
+        if (rs != init_img_tokens || rtd != IN_CH) {
+            QIE_LOG("denoise_full: ref patchify shape mismatch");
+            return false;
+        }
+    }
+
+    // `x_host` is the evolving latent `[W_lat, H_lat, C_lat, B]` F32. We
+    // operate Euler on host (per-step update volume is tiny, ~64 KiB at
+    // 256×256) to match the CPU reference's sample_euler exactly:
+    //   for each step:
+    //     denoised = DiT_full_forward(x, sigma_s)        // [W_lat,H_lat,C_lat,B]
+    //     d = (x - denoised) / sigma_s
+    //     x += d * (sigmas[s+1] - sigmas[s])
+    // This matches tools/ominix_diffusion/src/denoiser.hpp EULER_SAMPLE_METHOD.
+    std::vector<float> x_host((size_t)W_lat * H_lat * C_lat * B, 0.0f);
+    std::memcpy(x_host.data(), initial_latent, x_host.size() * sizeof(float));
+
+    // ------------------------------------------------------------------
+    // Device allocation for denoise_full. All buffers freed in a single
+    // cleanup lambda at the end.
+    // ------------------------------------------------------------------
+    struct DevBuf { void *p = nullptr; };
+    std::vector<DevBuf> owned;
+    auto alloc_bytes = [&](size_t bytes) -> void * {
+        void *p = nullptr;
+        aclError e = g_cann.aclrtMalloc(&p, bytes, ACL_MEM_MALLOC_HUGE_FIRST);
+        if (e != 0) { QIE_LOG("denoise_full: aclrtMalloc(%zu) err=%d",
+                                bytes, (int)e); return nullptr; }
+        owned.push_back({p});
+        return p;
+    };
+    auto free_owned = [&]() {
+        for (auto &b : owned) if (b.p) g_cann.aclrtFree(b.p);
+        owned.clear();
+    };
+
+    const size_t F32 = sizeof(float);
+    const size_t F16 = sizeof(uint16_t);
+
+    // --- activations ---
+    // img_in input: F16 [img_seq, IN_CH] — patchified concat(x, ref) per step.
+    void *img_in_in_f16  = alloc_bytes((size_t)img_seq * IN_CH * F16);
+    // img residual (F32) — RE-SEEDED per step from the F32 img_in projection.
+    // Two copies for cond/uncond working buffers.
+    void *img_res_c_f32  = alloc_bytes((size_t)img_seq * H * F32);
+    void *img_res_u_f32  = run_uncond
+        ? alloc_bytes((size_t)img_seq * H * F32) : nullptr;
+    // txt activations: cond/uncond F16 staging (after txt_norm+txt_in) +
+    // F32 residual (input to forward) + working copies (destroyed in-place).
+    void *txt_in_out_c_f16 = alloc_bytes((size_t)txt_seq * H * F16);
+    void *txt_res_c_f32    = alloc_bytes((size_t)txt_seq * H * F32);
+    void *txt_work_c_f32   = alloc_bytes((size_t)txt_seq * H * F32);
+    void *txt_in_out_u_f16 = run_uncond
+        ? alloc_bytes((size_t)txt_seq * H * F16) : nullptr;
+    void *txt_res_u_f32    = run_uncond
+        ? alloc_bytes((size_t)txt_seq * H * F32) : nullptr;
+    void *txt_work_u_f32   = run_uncond
+        ? alloc_bytes((size_t)txt_seq * H * F32) : nullptr;
+
+    // Text conditioning F32 on device (cond + uncond).
+    void *txt_cond_f32_dev   = alloc_bytes((size_t)txt_seq * joint_dim * F32);
+    void *txt_uncond_f32_dev = run_uncond
+        ? alloc_bytes((size_t)txt_seq * joint_dim * F32) : nullptr;
+
+    // t_emb staging.
+    void *t_emb_in_f32    = alloc_bytes(256 * F32);  // sinusoidal input host→dev
+    void *t_emb_in_f16    = alloc_bytes(256 * F16);
+    void *t_emb_mid_f16   = alloc_bytes((size_t)H * F16);  // time_linear1 out
+    void *t_emb_out_f16   = alloc_bytes((size_t)H * F16);  // time_linear2 out
+
+    // norm_out + proj_out scratch.
+    void *adaln_silu_f16  = alloc_bytes((size_t)H * F16);
+    void *adaln_emb_f16   = alloc_bytes((size_t)2 * H * F16);
+    void *proj_out_in_f16  = alloc_bytes((size_t)img_seq * H * F16);
+    void *proj_out_out_f16 = alloc_bytes((size_t)img_seq * PATCH_OUT * F16);
+
+    // Per-stream txt_norm F16 landing zone (joint_dim > H, so we can't
+    // reuse scratch_txt_norm_dev_ which is sized for hidden).
+    void *txt_norm_out_c_f16 =
+        alloc_bytes((size_t)txt_seq * joint_dim * F16);
+    void *txt_norm_out_u_f16 = run_uncond
+        ? alloc_bytes((size_t)txt_seq * joint_dim * F16) : nullptr;
+
+    if (!img_in_in_f16 || !img_res_c_f32 ||
+        (run_uncond && !img_res_u_f32) ||
+        !txt_in_out_c_f16 || !txt_res_c_f32 || !txt_work_c_f32 ||
+        (run_uncond && (!txt_in_out_u_f16 || !txt_res_u_f32 ||
+                         !txt_work_u_f32 || !txt_uncond_f32_dev ||
+                         !txt_norm_out_u_f16)) ||
+        !txt_cond_f32_dev || !txt_norm_out_c_f16 ||
+        !t_emb_in_f32 || !t_emb_in_f16 || !t_emb_mid_f16 || !t_emb_out_f16 ||
+        !adaln_silu_f16 || !adaln_emb_f16 ||
+        !proj_out_in_f16 || !proj_out_out_f16) {
+        free_owned();
+        return false;
+    }
+
+    auto sync_ok = [&](const char *where) -> bool {
+        aclError e = g_cann.aclrtSynchronizeStream(compute_stream_);
+        if (e != 0) {
+            QIE_LOG("denoise_full: sync after %s err=%d", where, (int)e);
+            return false;
+        }
+        return true;
+    };
+
+    auto h2d_f32 = [&](void *dst, const float *src, size_t n) -> bool {
+        aclError e = g_cann.aclrtMemcpy(dst, n * F32, src, n * F32,
+                                          ACL_MEMCPY_HOST_TO_DEVICE);
+        if (e != 0) { QIE_LOG("denoise_full: H2D(F32, %zu) err=%d",
+                                n, (int)e); return false; }
+        return true;
+    };
+    auto h2d_f16 = [&](void *dst, const uint16_t *src, size_t n) -> bool {
+        aclError e = g_cann.aclrtMemcpy(dst, n * F16, src, n * F16,
+                                          ACL_MEMCPY_HOST_TO_DEVICE);
+        if (e != 0) { QIE_LOG("denoise_full: H2D(F16, %zu) err=%d",
+                                n, (int)e); return false; }
+        return true;
+    };
+
+    // Inline F16→F32 cast on a flat [rows, cols] F16 buffer → F32 buffer.
+    auto cast_f16_to_f32 = [&](void *in_f16, void *out_f32,
+                                 int64_t rows, int64_t cols) -> bool {
+        int64_t sh[2] = {rows, cols};
+        int64_t st[2] = {cols, 1};
+        aclTensor *t_in  = tensor_nd_f16(in_f16,  2, sh, st);
+        aclTensor *t_out = tensor_nd_f32(out_f32, 2, sh, st);
+        uint64_t ws = 0; aclOpExecutor *exec = nullptr;
+        aclnnStatus s = g_cann.aclnnCastGetWorkspaceSize(
+            t_in, ACL_FLOAT, t_out, &ws, &exec);
+        if (s == 0) {
+            ensure_workspace_(ws);
+            s = g_cann.aclnnCast(ws > 0 ? workspace_dev_ : nullptr,
+                                   ws, exec, compute_stream_);
+        }
+        g_cann.aclDestroyTensor(t_in);
+        g_cann.aclDestroyTensor(t_out);
+        return s == 0;
+    };
+
+    // ------------------------------------------------------------------
+    // Upload text conditioning + run one-shot txt_norm + txt_in for cond
+    // and uncond. These don't change across steps — results park in
+    // txt_res_{c,u}_f32 and are D2D-copied into txt_work_{c,u}_f32 per
+    // step (forward destroys in-place).
+    // ------------------------------------------------------------------
+    if (!h2d_f32(txt_cond_f32_dev, txt_cond,
+                  (size_t)txt_seq * joint_dim)) {
+        free_owned(); return false;
+    }
+    if (run_uncond) {
+        if (!h2d_f32(txt_uncond_f32_dev, txt_uncond,
+                      (size_t)txt_seq * joint_dim)) {
+            free_owned(); return false;
+        }
+    }
+
+    // txt_norm (RMSNorm) + txt_in (cond).
+    if (!rms_norm_row_f32_to_f16_(txt_cond_f32_dev, txt_norm_out_c_f16,
+                                    global_w_.txt_norm_w,
+                                    txt_seq, joint_dim)) {
+        QIE_LOG("denoise_full: txt_norm(cond) failed");
+        free_owned(); return false;
+    }
+    if (!dispatch_matmul_(txt_norm_out_c_f16, global_w_.txt_in_w_q4,
+                           global_w_.txt_in_scale, global_w_.txt_in_b,
+                           txt_seq, joint_dim, H, txt_in_out_c_f16)) {
+        QIE_LOG("denoise_full: txt_in matmul(cond) failed");
+        free_owned(); return false;
+    }
+    if (!cast_f16_to_f32(txt_in_out_c_f16, txt_res_c_f32, txt_seq, H)) {
+        QIE_LOG("denoise_full: txt(cond) F16→F32 err");
+        free_owned(); return false;
+    }
+
+    if (run_uncond) {
+        if (!rms_norm_row_f32_to_f16_(txt_uncond_f32_dev, txt_norm_out_u_f16,
+                                        global_w_.txt_norm_w,
+                                        txt_seq, joint_dim)) {
+            QIE_LOG("denoise_full: txt_norm(uncond) failed");
+            free_owned(); return false;
+        }
+        if (!dispatch_matmul_(txt_norm_out_u_f16, global_w_.txt_in_w_q4,
+                               global_w_.txt_in_scale, global_w_.txt_in_b,
+                               txt_seq, joint_dim, H, txt_in_out_u_f16)) {
+            QIE_LOG("denoise_full: txt_in matmul(uncond) failed");
+            free_owned(); return false;
+        }
+        if (!cast_f16_to_f32(txt_in_out_u_f16, txt_res_u_f32, txt_seq, H)) {
+            QIE_LOG("denoise_full: txt(uncond) F16→F32 err");
+            free_owned(); return false;
+        }
+    }
+
+    if (!sync_ok("txt conditioning setup")) { free_owned(); return false; }
+
+    // ------------------------------------------------------------------
+    // Per-step denoising loop — FULL per-step forward (re-patchify x →
+    // img_in → blocks → norm_out + proj_out → unpatchify → Euler on host).
+    //
+    // Reference: tools/ominix_diffusion/src/denoiser.hpp line 831-866
+    // (EULER_SAMPLE_METHOD) — for each step the sampler calls the model
+    // wrapper `model(x, sigma, i+1)` which returns `denoised` at the same
+    // shape as `x`, then does:
+    //     d = (x - denoised) / sigma
+    //     x += d * (sigmas[s+1] - sigmas[s])
+    //
+    // Our per-step body mirrors exactly this, with the full DiT forward
+    // on-device.
+    // ------------------------------------------------------------------
+    void *pe_dev = global_w_.rope_pe_dev;
+
+    // Per-step host buffers. Reused across steps via resize-only-if-grow.
+    std::vector<float>    concat_tokens_f32((size_t)img_seq * IN_CH, 0.0f);
+    std::vector<uint16_t> img_in_f16((size_t)img_seq * IN_CH, 0);
+    std::vector<uint16_t> out_tokens_f16((size_t)init_img_tokens * PATCH_OUT,
+                                          0);
+    std::vector<float>    out_tokens_f32(out_tokens_f16.size(), 0.0f);
+    std::vector<float>    denoised_host((size_t)W_lat * H_lat *
+                                         cfg_.out_channels * B, 0.0f);
+
+    for (int step = 0; step < n_steps; ++step) {
+        auto t_step_0 = std::chrono::steady_clock::now();
+
+        const float sigma = sigmas[step];
+
+        // --- (1) Timestep embedding for this step. ---
+        // Qwen-Image sigma_to_t = sigma * 1000.0.
+        const float t_val = sigma * 1000.0f;
+        std::vector<float> t_sinu_f32;
+        host_timestep_embedding_f32(t_val, 256, 10000, t_sinu_f32);
+        if (!h2d_f32(t_emb_in_f32, t_sinu_f32.data(), t_sinu_f32.size())) {
+            free_owned(); return false;
+        }
+        // F32 → F16 Cast.
+        {
+            int64_t sh[2] = {1, 256};
+            int64_t st[2] = {256, 1};
+            aclTensor *t_in  = tensor_nd_f32(t_emb_in_f32, 2, sh, st);
+            aclTensor *t_out = tensor_nd_f16(t_emb_in_f16, 2, sh, st);
+            uint64_t ws = 0; aclOpExecutor *exec = nullptr;
+            aclnnStatus s = g_cann.aclnnCastGetWorkspaceSize(
+                t_in, ACL_FLOAT16, t_out, &ws, &exec);
+            if (s == 0) {
+                ensure_workspace_(ws);
+                s = g_cann.aclnnCast(ws > 0 ? workspace_dev_ : nullptr,
+                                       ws, exec, compute_stream_);
+            }
+            g_cann.aclDestroyTensor(t_in);
+            g_cann.aclDestroyTensor(t_out);
+            if (s != 0) { QIE_LOG("denoise_full: t_emb F32→F16 err=%d",
+                                    (int)s); free_owned(); return false; }
+        }
+        // time_linear1 + SiLU + time_linear2.
+        if (!dispatch_matmul_(t_emb_in_f16,
+                               global_w_.time_linear1_w_q4,
+                               global_w_.time_linear1_scale,
+                               global_w_.time_linear1_b,
+                               1, 256, H, t_emb_mid_f16)) {
+            QIE_LOG("denoise_full: time_linear1 failed step=%d", step);
+            free_owned(); return false;
+        }
+        {
+            int64_t sh[2] = {1, H};
+            int64_t st[2] = {H, 1};
+            aclTensor *t_in  = tensor_nd_f16(t_emb_mid_f16, 2, sh, st);
+            aclTensor *t_out = tensor_nd_f16(t_emb_mid_f16, 2, sh, st);
+            uint64_t ws = 0; aclOpExecutor *exec = nullptr;
+            aclnnStatus s = g_cann.aclnnSiluGetWorkspaceSize(
+                t_in, t_out, &ws, &exec);
+            if (s == 0) {
+                ensure_workspace_(ws);
+                s = g_cann.aclnnSilu(ws > 0 ? workspace_dev_ : nullptr,
+                                       ws, exec, compute_stream_);
+            }
+            g_cann.aclDestroyTensor(t_in);
+            g_cann.aclDestroyTensor(t_out);
+            if (s != 0) { QIE_LOG("denoise_full: SiLU(t_emb) err=%d",
+                                    (int)s); free_owned(); return false; }
+        }
+        if (!dispatch_matmul_(t_emb_mid_f16,
+                               global_w_.time_linear2_w_q4,
+                               global_w_.time_linear2_scale,
+                               global_w_.time_linear2_b,
+                               1, H, H, t_emb_out_f16)) {
+            QIE_LOG("denoise_full: time_linear2 failed step=%d", step);
+            free_owned(); return false;
+        }
+
+        // --- (2) Host patchify(x) → concat with ref → upload as F16. ---
+        {
+            std::vector<float> init_tokens;
+            int64_t rs = 0, rtd = 0;
+            host_patchify_latent(x_host.data(), W_lat, H_lat, C_lat, B,
+                                   PATCH, init_tokens, rs, rtd);
+            if (rs != init_img_tokens || rtd != IN_CH) {
+                QIE_LOG("denoise_full: patchify(x) shape mismatch");
+                free_owned(); return false;
+            }
+            std::memcpy(concat_tokens_f32.data(), init_tokens.data(),
+                         init_tokens.size() * sizeof(float));
+            if (ref_latent) {
+                std::memcpy(concat_tokens_f32.data() +
+                                (size_t)init_img_tokens * IN_CH,
+                             ref_tokens_f32.data(),
+                             ref_tokens_f32.size() * sizeof(float));
+            }
+            for (size_t i = 0; i < img_in_f16.size(); ++i) {
+                img_in_f16[i] = fp32_to_fp16(concat_tokens_f32[i]);
+            }
+            if (!h2d_f16(img_in_in_f16, img_in_f16.data(),
+                          img_in_f16.size())) {
+                free_owned(); return false;
+            }
+        }
+
+        // --- (3) img_in → F16 [img_seq, H] → Cast F32 into img_res_c_f32. ---
+        if (!dispatch_matmul_(img_in_in_f16,
+                               global_w_.img_in_w_q4, global_w_.img_in_scale,
+                               global_w_.img_in_b,
+                               img_seq, IN_CH, H, scratch_img_norm_dev_)) {
+            QIE_LOG("denoise_full: img_in matmul failed step=%d", step);
+            free_owned(); return false;
+        }
+        if (!cast_f16_to_f32(scratch_img_norm_dev_, img_res_c_f32,
+                               img_seq, H)) {
+            QIE_LOG("denoise_full: img_in F16→F32 err step=%d", step);
+            free_owned(); return false;
+        }
+        // If CFG on, also copy img_res_c → img_res_u for the uncond pass
+        // (both passes consume the same patch-projected latent — only the
+        // text conditioning differs).
+        if (run_uncond) {
+            aclError me = g_cann.aclrtMemcpy(img_res_u_f32,
+                                               (size_t)img_seq * H * F32,
+                                               img_res_c_f32,
+                                               (size_t)img_seq * H * F32,
+                                               ACL_MEMCPY_DEVICE_TO_DEVICE);
+            if (me != 0) { QIE_LOG("denoise_full: D2D img_res cond→uncond "
+                                     "err=%d step=%d", (int)me, step);
+                             free_owned(); return false; }
+        }
+
+        // --- (4) cond pass: txt_res_c → txt_work_c, run 60 blocks. ---
+        aclError me = g_cann.aclrtMemcpy(txt_work_c_f32,
+                                           (size_t)txt_seq * H * F32,
+                                           txt_res_c_f32,
+                                           (size_t)txt_seq * H * F32,
+                                           ACL_MEMCPY_DEVICE_TO_DEVICE);
+        if (me != 0) { QIE_LOG("denoise_full: D2D txt_res_c→work err=%d",
+                                 (int)me); free_owned(); return false; }
+
+        if (!forward_all_blocks_test(img_res_c_f32, img_seq,
+                                       txt_work_c_f32, txt_seq,
+                                       t_emb_out_f16, pe_dev,
+                                       nullptr, 0)) {
+            QIE_LOG("denoise_full: cond forward failed step=%d", step);
+            free_owned(); return false;
+        }
+
+        // --- (5) norm_out + proj_out on the cond img residual. ---
+        //
+        // Compute AdaLN (scale, shift) ONCE per step using this step's
+        // t_emb. Apply the normalize+modulate pipeline on whichever img
+        // residual we're about to project (cond first; uncond after if
+        // running CFG).
+        //
+        // SiLU(t_emb_out) → adaln_silu.
+        {
+            int64_t sh[2] = {1, H};
+            int64_t st[2] = {H, 1};
+            aclTensor *t_in  = tensor_nd_f16(t_emb_out_f16, 2, sh, st);
+            aclTensor *t_out = tensor_nd_f16(adaln_silu_f16, 2, sh, st);
+            uint64_t ws = 0; aclOpExecutor *exec = nullptr;
+            aclnnStatus s = g_cann.aclnnSiluGetWorkspaceSize(t_in, t_out,
+                                                               &ws, &exec);
+            if (s == 0) {
+                ensure_workspace_(ws);
+                s = g_cann.aclnnSilu(ws > 0 ? workspace_dev_ : nullptr,
+                                       ws, exec, compute_stream_);
+            }
+            g_cann.aclDestroyTensor(t_in);
+            g_cann.aclDestroyTensor(t_out);
+            if (s != 0) { QIE_LOG("denoise_full: SiLU(norm_out t_emb) err=%d "
+                                    "step=%d", (int)s, step);
+                            free_owned(); return false; }
+        }
+        // norm_out.linear: [1, H] × [H, 2H] → [1, 2H] F16.
+        if (!dispatch_matmul_(adaln_silu_f16,
+                               global_w_.norm_out_linear_w_q4,
+                               global_w_.norm_out_linear_scale,
+                               global_w_.norm_out_linear_b,
+                               1, H, 2 * H, adaln_emb_f16)) {
+            QIE_LOG("denoise_full: norm_out Linear failed step=%d", step);
+            free_owned(); return false;
+        }
+        void *adaln_scale = adaln_emb_f16;
+        void *adaln_shift = (uint8_t *)adaln_emb_f16 + (size_t)H * F16;
+
+        // cond: LayerNorm(img_res_c_f32) → modulate → proj_out → F16 out.
+        if (!layer_norm_f32_to_f16_(img_res_c_f32, proj_out_in_f16,
+                                      /*B*/1, img_seq, H)) {
+            QIE_LOG("denoise_full: norm_out LN(cond) failed step=%d", step);
+            free_owned(); return false;
+        }
+        if (!modulate_(proj_out_in_f16, adaln_scale, adaln_shift,
+                        /*B*/1, img_seq, H)) {
+            QIE_LOG("denoise_full: norm_out modulate(cond) failed step=%d",
+                    step);
+            free_owned(); return false;
+        }
+        if (!dispatch_matmul_(proj_out_in_f16,
+                               global_w_.proj_out_w_q4,
+                               global_w_.proj_out_scale,
+                               global_w_.proj_out_b,
+                               img_seq, H, PATCH_OUT, proj_out_out_f16)) {
+            QIE_LOG("denoise_full: proj_out(cond) failed step=%d", step);
+            free_owned(); return false;
+        }
+
+        // --- (6) Optional uncond pass. ---
+        // Output of cond proj_out is F16 [img_seq, PATCH_OUT] in
+        // proj_out_out_f16. For CFG we need to compose cond + uncond
+        // predictions — but the composition happens in the SAME F16
+        // [img_seq, PATCH_OUT] output space (not the hidden residual).
+        // Strategy: after the uncond forward+proj_out, materialise its
+        // output in-place over proj_out_out_f16 with a temporary scratch.
+        void *eps_out_f16 = proj_out_out_f16;  // default for non-CFG
+        void *cond_proj_out_f16_saved = nullptr;
+
+        if (run_uncond) {
+            // Save cond proj_out before running uncond (uncond reuses the
+            // same proj_out_in/out buffers).
+            cond_proj_out_f16_saved =
+                alloc_bytes((size_t)img_seq * PATCH_OUT * F16);
+            if (!cond_proj_out_f16_saved) { free_owned(); return false; }
+            aclError m2 = g_cann.aclrtMemcpy(
+                cond_proj_out_f16_saved,
+                (size_t)img_seq * PATCH_OUT * F16,
+                proj_out_out_f16,
+                (size_t)img_seq * PATCH_OUT * F16,
+                ACL_MEMCPY_DEVICE_TO_DEVICE);
+            if (m2 != 0) {
+                QIE_LOG("denoise_full: D2D cond_proj_out save err=%d step=%d",
+                        (int)m2, step);
+                free_owned(); return false;
+            }
+
+            // uncond 60-block forward on img_res_u + txt_res_u.
+            me = g_cann.aclrtMemcpy(txt_work_u_f32,
+                                     (size_t)txt_seq * H * F32,
+                                     txt_res_u_f32,
+                                     (size_t)txt_seq * H * F32,
+                                     ACL_MEMCPY_DEVICE_TO_DEVICE);
+            if (me != 0) { QIE_LOG("denoise_full: D2D txt_res_u→work err=%d",
+                                     (int)me); free_owned(); return false; }
+            if (!forward_all_blocks_test(img_res_u_f32, img_seq,
+                                           txt_work_u_f32, txt_seq,
+                                           t_emb_out_f16, pe_dev,
+                                           nullptr, 0)) {
+                QIE_LOG("denoise_full: uncond forward failed step=%d", step);
+                free_owned(); return false;
+            }
+            // uncond norm_out + proj_out (re-uses same AdaLN scale/shift).
+            if (!layer_norm_f32_to_f16_(img_res_u_f32, proj_out_in_f16,
+                                          /*B*/1, img_seq, H)) {
+                QIE_LOG("denoise_full: norm_out LN(uncond) failed step=%d",
+                        step);
+                free_owned(); return false;
+            }
+            if (!modulate_(proj_out_in_f16, adaln_scale, adaln_shift,
+                            /*B*/1, img_seq, H)) {
+                QIE_LOG("denoise_full: norm_out modulate(uncond) failed "
+                        "step=%d", step);
+                free_owned(); return false;
+            }
+            if (!dispatch_matmul_(proj_out_in_f16,
+                                   global_w_.proj_out_w_q4,
+                                   global_w_.proj_out_scale,
+                                   global_w_.proj_out_b,
+                                   img_seq, H, PATCH_OUT,
+                                   proj_out_out_f16)) {
+                QIE_LOG("denoise_full: proj_out(uncond) failed step=%d", step);
+                free_owned(); return false;
+            }
+            // At this point: proj_out_out_f16 = eps_uncond,
+            //                cond_proj_out_f16_saved = eps_cond.
+            // Compose eps = eps_uncond + cfg*(eps_cond - eps_uncond), all F16.
+            int64_t nE = img_seq * PATCH_OUT;
+            int64_t shape1[1]   = { nE };
+            int64_t strides1[1] = { 1 };
+            int64_t storage1    = nE;
+            aclTensor *t_u = g_cann.aclCreateTensor(
+                shape1, 1, ACL_FLOAT16, strides1, 0, ACL_FORMAT_ND,
+                &storage1, 1, proj_out_out_f16);
+            aclTensor *t_c = g_cann.aclCreateTensor(
+                shape1, 1, ACL_FLOAT16, strides1, 0, ACL_FORMAT_ND,
+                &storage1, 1, cond_proj_out_f16_saved);
+
+            // cond -= uncond (alpha=-1 F16 scalar).
+            uint16_t neg_one_f16 = fp32_to_fp16(-1.0f);
+            aclScalar *alpha_neg1 = g_cann.aclCreateScalar(&neg_one_f16,
+                                                             ACL_FLOAT16);
+            uint64_t ws1 = 0; aclOpExecutor *ex1 = nullptr;
+            aclnnStatus st = g_cann.aclnnInplaceAddGetWorkspaceSize(
+                t_c, t_u, alpha_neg1, &ws1, &ex1);
+            if (st == 0) {
+                ensure_workspace_(ws1);
+                st = g_cann.aclnnInplaceAdd(ws1 > 0 ? workspace_dev_ : nullptr,
+                                               ws1, ex1, compute_stream_);
+            }
+            g_cann.aclDestroyScalar(alpha_neg1);
+            if (st != 0) { QIE_LOG("denoise_full: CFG sub err=%d step=%d",
+                                     (int)st, step);
+                             g_cann.aclDestroyTensor(t_u);
+                             g_cann.aclDestroyTensor(t_c);
+                             free_owned(); return false; }
+
+            // uncond += cfg * (cond - uncond)
+            uint16_t cfg_f16 = fp32_to_fp16(cfg_scale);
+            aclScalar *sc_cfg = g_cann.aclCreateScalar(&cfg_f16, ACL_FLOAT16);
+            uint64_t ws2 = 0; aclOpExecutor *ex2 = nullptr;
+            st = g_cann.aclnnInplaceAddGetWorkspaceSize(t_u, t_c, sc_cfg,
+                                                          &ws2, &ex2);
+            if (st == 0) {
+                ensure_workspace_(ws2);
+                st = g_cann.aclnnInplaceAdd(ws2 > 0 ? workspace_dev_ : nullptr,
+                                               ws2, ex2, compute_stream_);
+            }
+            g_cann.aclDestroyScalar(sc_cfg);
+            g_cann.aclDestroyTensor(t_u);
+            g_cann.aclDestroyTensor(t_c);
+            if (st != 0) { QIE_LOG("denoise_full: CFG add err=%d step=%d",
+                                     (int)st, step);
+                             free_owned(); return false; }
+
+            // Free the per-step saved cond proj_out buffer.
+            g_cann.aclrtFree(cond_proj_out_f16_saved);
+            // Remove from owned list so free_owned doesn't double-free.
+            for (auto it = owned.begin(); it != owned.end(); ++it) {
+                if (it->p == cond_proj_out_f16_saved) {
+                    owned.erase(it); break;
+                }
+            }
+            cond_proj_out_f16_saved = nullptr;
+
+            eps_out_f16 = proj_out_out_f16;  // holds composed CFG eps
+        }
+
+        if (!sync_ok("step compute")) { free_owned(); return false; }
+
+        // --- (7) D2H the FIRST init_img_tokens * PATCH_OUT elements. ---
+        aclError m3 = g_cann.aclrtMemcpy(out_tokens_f16.data(),
+                                           out_tokens_f16.size() * F16,
+                                           eps_out_f16,
+                                           out_tokens_f16.size() * F16,
+                                           ACL_MEMCPY_DEVICE_TO_HOST);
+        if (m3 != 0) {
+            QIE_LOG("denoise_full: D2H proj_out step=%d err=%d",
+                    step, (int)m3);
+            free_owned(); return false;
+        }
+        for (size_t i = 0; i < out_tokens_f16.size(); ++i) {
+            __fp16 hh;
+            std::memcpy(&hh, &out_tokens_f16[i], sizeof(hh));
+            out_tokens_f32[i] = (float)hh;
+        }
+        // Unpatchify to `denoised_host` [W_lat, H_lat, C_out=16, B].
+        host_unpatchify_latent(out_tokens_f32.data(),
+                                W_lat, H_lat, cfg_.out_channels, B,
+                                PATCH, denoised_host.data());
+
+        // --- (8) Euler step on host. ---
+        // Qwen-Image (flow-matching) Euler reference:
+        //     d[j] = (x[j] - denoised[j]) / sigma
+        //     x[j] += d[j] * (sigmas[s+1] - sigmas[s])
+        // Handle sigma==0 defensively (shouldn't happen during loop since
+        // sigmas[0..n_steps-1] are all > 0; sigmas[n_steps] is the terminal
+        // zero boundary that's only read as `dt`).
+        float dt = sigmas[step + 1] - sigma;
+        if (sigma > 0.0f) {
+            const size_t nelt = x_host.size();
+            for (size_t j = 0; j < nelt; ++j) {
+                float d = (x_host[j] - denoised_host[j]) / sigma;
+                x_host[j] += d * dt;
+            }
+        } else {
+            // Degenerate: sigma=0, treat as no-op.
+        }
+
+        if (per_step_ms) {
+            auto t_step_1 = std::chrono::steady_clock::now();
+            per_step_ms[step] =
+                std::chrono::duration<double, std::milli>(t_step_1 - t_step_0)
+                    .count();
+        }
+    }
+
+    // Final latent = x_host. Copy into caller's out buffer.
+    std::memcpy(out_latent, x_host.data(),
+                 x_host.size() * sizeof(float));
+
+    free_owned();
     return true;
 }
 

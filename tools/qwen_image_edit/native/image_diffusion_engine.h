@@ -457,6 +457,90 @@ public:
                             float cfg_scale,
                             double *per_step_ms = nullptr);
 
+    // Phase 4.5 Step 4: real end-to-end denoise for the canonical cat-edit
+    // smoke. This is the production entry point that wraps the 60-block
+    // loop with the five missing projection / embedding paths:
+    //
+    //   1. sinusoidal timestep_embedding(sigma * 1000) → F32[256] on host,
+    //      uploaded as F32 [B, 256], projected via time_linear1 (Q4_0) →
+    //      SiLU → time_linear2 (Q4_0) → t_emb F16 [B, hidden].
+    //   2. img_in: project concat(init_latent_patches, ref_latent_patches)
+    //      F32 [B, img_seq, in_channels] through Q4_0 Linear [in→hidden]
+    //      to produce img_hidden F32 [B, img_seq, hidden].
+    //   3. txt_in + txt_norm: RMSNorm over joint_attention_dim (txt_norm.w
+    //      F32 gamma) on the raw text embedding F32 [B, txt_seq, joint_dim],
+    //      then Q4_0 Linear [joint_dim → hidden] → txt_hidden F32
+    //      [B, txt_seq, hidden].
+    //   4. 60-block forward (forward_block_, F32 residual) for cond and
+    //      uncond, with CFG composition: eps = eps_u + cfg*(eps_c - eps_u).
+    //   5. norm_out (AdaLayerNormContinuous, affine-off) + proj_out Q4_0
+    //      Linear [hidden → patch_size² × out_channels], writing the final
+    //      noise prediction shape F32 [B, img_seq, patch² × out_ch].
+    //   6. Euler-flow scheduler on host (matching CPU Euler reference):
+    //        d = (x - denoised) / sigma ;  x += d * (sigmas[s+1] - sigmas[s]).
+    //
+    // Note on per-step structure: the FULL DiT forward (items 2-5 above)
+    // runs every step, NOT once — the CPU sample_euler reference calls
+    // `model(x, sigma, ...)` on a reprojected `x` each step (denoiser.hpp
+    // L839). The engine mirrors that: per step, re-patchify `x` on host
+    // → img_in → blocks → norm_out + proj_out → D2H & unpatchify →
+    // Euler update on host F32 latent. Only txt_in + txt_norm run once.
+    //
+    // Inputs (all host F32 pointers owned by caller, copied in):
+    //   initial_latent  [W_lat × H_lat × C_lat × B]  Qwen-Image VAE layout
+    //                   (ne[0]=W_lat, ne[1]=H_lat, ne[2]=C_lat=16, ne[3]=B=1).
+    //                   Pre-patchified view is produced on host.
+    //   ref_latent      same shape & layout as initial_latent (nullable —
+    //                   when null the call runs with no ref concatenation).
+    //   txt_cond        [joint_dim, txt_seq, 1, 1]   F32, ne[0]=joint_dim,
+    //                   ne[1]=txt_seq.
+    //   txt_uncond      same shape as txt_cond. Nullable — if null, runs
+    //                   single-forward per step (cfg_scale is ignored).
+    //   sigmas          host float array length `n_steps + 1`, inclusive
+    //                   of terminal 0.0.
+    //   out_latent      caller-owned host F32 buffer sized W_lat*H_lat*C_lat*B.
+    //                   Final latent is unpatchified into this layout.
+    //
+    // Width/height context: W_lat and H_lat must be multiples of
+    // cfg_.patch_size (otherwise pad_and_patchify on host is up to the
+    // caller — current impl requires exact multiples and asserts).
+    //
+    // Phase 4.5 Step 4 gate: NaN=0 over 20 steps, std>0.001 on the final
+    // latent, output PNG visually plausible after VAE decode.
+    bool denoise_full(const float *initial_latent,
+                       const float *ref_latent,
+                       int64_t W_lat, int64_t H_lat,
+                       int64_t C_lat, int64_t B,
+                       const float *txt_cond,
+                       const float *txt_uncond,
+                       int64_t txt_seq, int64_t joint_dim,
+                       const float *sigmas, int n_steps,
+                       float cfg_scale,
+                       float *out_latent,
+                       double *per_step_ms = nullptr);
+
+    // Phase 4.5 Step 4b: convenience loader that pre-stages inputs from a
+    // Step-2 dump directory. Reads these files in dir:
+    //     init_latent.f32.bin         F32 [W_lat*H_lat*C_lat*B]
+    //     ref_latent_0.f32.bin        F32 [W_lat*H_lat*C_lat*B] (optional)
+    //     cond_c_crossattn.f32.bin    F32 [joint_dim*txt_seq]
+    //     uncond_c_crossattn.f32.bin  F32 [joint_dim*txt_seq] (optional —
+    //                                 populated by a cfg>1 run of Step 2)
+    // plus writes their inferred shapes into the supplied out-params. The
+    // shapes are inferred from file size + known {W_lat,H_lat,C_lat,joint_dim};
+    // caller passes the image-side shape so the loader can disambiguate.
+    // Returns false on any missing required file or size mismatch.
+    bool init_from_dump(const std::string &dump_dir,
+                         int64_t W_lat, int64_t H_lat, int64_t C_lat,
+                         int64_t B, int64_t joint_dim,
+                         std::vector<float> &initial_latent_out,
+                         std::vector<float> &ref_latent_out,
+                         std::vector<float> &txt_cond_out,
+                         std::vector<float> &txt_uncond_out,
+                         int64_t &txt_seq_out,
+                         bool &has_ref_out,
+                         bool &has_uncond_out);
+
     // Test-only hook: mutable access to DiTLayerWeights[il] so a probe can
     // populate synthetic weights without a real GGUF. Returns nullptr if
     // `il` is out of range or the engine has not allocated its layer
@@ -678,6 +762,17 @@ private:
     // we reshape to `[B * seq * n_heads, head_dim]` as required by the op.
     bool rms_norm_head_(void *x_f16_dev, void *out_f16_dev, void *gamma_f32_dev,
                         int64_t rows, int64_t head_dim);
+
+    // Phase 4.5 Step 4: RMSNorm over last dim `inner` with F32 in → F16 out.
+    // Used for the global `txt_norm` (RMSNorm over joint_attention_dim) on
+    // the raw text-encoder conditioning. Input `x_f32` is [rows, inner] F32,
+    // `gamma_f32` is F32 [inner], output `out_f16` is F16 [rows, inner].
+    // Implementation path: aclnnRmsNorm(F32 in, F32 tmp out via
+    // scratch_residual_tmp_f32_dev_) + aclnnCast(F32→F16). eps is
+    // cfg_.rms_norm_eps.
+    bool rms_norm_row_f32_to_f16_(const void *x_f32_dev, void *out_f16_dev,
+                                     const void *gamma_f32_dev,
+                                     int64_t rows, int64_t inner);
 
     // Apply 3D-axial RoPE to a Q or K tensor using the pre-computed pe
     // table. `x_f16_dev` has layout [B, seq, n_heads, head_dim] F16.

@@ -1036,3 +1036,197 @@ pillow backdrop, sharp eyes — a recognisable "studio portrait of a
 kitten" output at the expected resolution. The Step 3 decode-only
 round-trip of the same latent produces a pixel-indistinguishable image,
 confirming the VAE decode path is byte-faithful.
+
+### §5.5.1 Step 4 landing — `denoise_full` + `init_from_dump`
+
+**Status:** native-engine entry point `ImageDiffusionEngine::denoise_full`
+lands with this commit. Wraps the 60-block loop (proven GREEN on real
+Q4_0 @ 20 steps by §5.2) with the five previously missing paths:
+`img_in` + `txt_in + txt_norm` + `time_linear{1,2}` + `norm_out
+(AdaLayerNormContinuous, affine=false)` + `proj_out`. Host-side
+`pad_and_patchify` / `unpatchify` carry the latent stream between
+the host F32 latent buffer and the on-device DiT. `init_from_dump`
+loads Step 2 artefacts from `/tmp/qie_q45_inputs/` into host
+`std::vector<float>` ready for `denoise_full`.
+
+**Semantics — faithful to the CPU Euler sampler** (reference
+`tools/ominix_diffusion/src/denoiser.hpp` lines 831-866
+EULER_SAMPLE_METHOD):
+
+```
+for step s = 0 .. n_steps - 1:
+    sigma    = sigmas[s]
+    denoised = DiT_full_forward(x, sigma)      # same shape as x
+    d        = (x - denoised) / sigma
+    x       += d * (sigmas[s+1] - sigmas[s])
+```
+
+Key consequence: `DiT_full_forward` INCLUDES `norm_out + proj_out` —
+they must run EVERY step, not once at the end. An earlier draft of the
+patch mistakenly applied `norm_out/proj_out` only once after the loop;
+this was corrected. The final CPU reference shapes `denoised` at the
+same volume as `x` (unpatched latent [W_lat,H_lat,C_lat,B]).
+
+**Dispatch tree (per step s, `denoise_full` main loop):**
+
+```
+  # (1) Per-step timestep embedding
+  t = sigmas[s] * 1000.0                              [host]
+  t_sinu[256] = sinusoidal(t, max_period=10000)       [host F32]
+  t_emb_in_f32 = H2D(t_sinu)                          [aclrtMemcpy]
+  t_emb_in_f16 = aclnnCast(t_emb_in_f32, F16)
+  t_mid        = time_linear1(t_emb_in_f16)           [WQBMMv3 256 → 3072]
+  t_mid        = aclnnSilu(t_mid)                     [in-place]
+  t_emb_s      = time_linear2(t_mid)                  [WQBMMv3 3072 → 3072]
+
+  # (2) Patchify x → upload → img_in
+  concat_tokens = host_patchify(x) || ref_tokens      [host F32 [img_seq, 64]]
+  img_in_in     = H2D(F32 → F16)
+  img_f16_out   = img_in(img_in_in_f16)               [WQBMMv3 64 → 3072]
+  img_res_c_f32 = aclnnCast(img_f16_out, F32)         [F16 → F32]
+  (if run_uncond) D2D copy img_res_c → img_res_u
+
+  # (3) cond forward
+  D2D txt_res_c → txt_work_c
+  forward_all_blocks_test(img_res_c, txt_work_c, t_emb_s, pe)
+
+  # (4) cond norm_out + proj_out
+  adaln_silu = aclnnSilu(t_emb_s)
+  adaln_emb  = norm_out.linear(adaln_silu)            [WQBMMv3 H → 2H]
+  scale, shift = split(adaln_emb, axis=1)
+  x_f16 = layer_norm_f32_to_f16_(img_res_c)           [affine-off F32-LN]
+  x_f16 = modulate_(x_f16, scale, shift)              [x*(1+scale)+shift]
+  eps_cond = proj_out(x_f16)                          [WQBMMv3 H → 64]
+
+  # (5) Optional uncond + CFG compose (F16 InplaceAdd)
+  if run_uncond:
+    save eps_cond into side buffer
+    D2D txt_res_u → txt_work_u
+    forward_all_blocks_test(img_res_u, txt_work_u, t_emb_s, pe)
+    x_f16 = layer_norm_f32_to_f16_(img_res_u)
+    x_f16 = modulate_(x_f16, scale, shift)
+    eps_uncond = proj_out(x_f16)                      [writes to proj_out_out]
+    eps_uncond += -1 * eps_cond_saved                 [→ Δ, aliased to cond_saved]
+    eps_uncond += cfg_scale * cond_saved              [= eps_u + cfg*(eps_c-eps_u)]
+
+  # (6) D2H unpatchify
+  out_f16 = D2H(proj_out_out[0:init_img_tokens*64])   # drop ref tokens
+  denoised_host = host_unpatchify(F16→F32)            # [W_lat,H_lat,C_out,B]
+
+  # (7) Euler on host
+  for j in range(W*H*C*B):
+      d = (x_host[j] - denoised_host[j]) / sigma
+      x_host[j] += d * (sigmas[s+1] - sigma)
+```
+
+Final `x_host` after the loop is the denoised latent. Copied byte-for-byte
+into `out_latent` (same shape, Qwen-Image VAE layout) for the subsequent
+Step 3 decode-only probe to consume.
+
+**Input contract (`init_from_dump` + `denoise_full`):**
+
+| File                          | ggml-layout shape            | interpretation      |
+|---|---|---|
+| init_latent.f32.bin           | [W_lat, H_lat, C_lat, B]     | F32 noisy init      |
+| ref_latent_0.f32.bin          | [W_lat, H_lat, C_lat, B]     | F32 VAE-encoded ref (optional) |
+| cond_c_crossattn.f32.bin      | [joint_dim, txt_seq, 1, 1]   | F32 text cond       |
+| uncond_c_crossattn.f32.bin    | [joint_dim, txt_seq, 1, 1]   | F32 text uncond (optional — enables CFG)     |
+
+At the canonical 256×256 cat-edit run this gives
+`W_lat=H_lat=32, C_lat=16, joint_dim=3584, txt_seq=214, init_img_tokens=256,
+img_seq=512` matching the §5.5 shape plan.
+
+**Scratch footprint** (allocated inside `denoise_full`, freed at return):
+- img side: `img_in_in_f16` + 3× `[img_seq, H] F32` (res + 2× work) + 2×
+  `[img_seq, H] F16` (proj_out in/out) + `[img_seq, PATCH_OUT] F16`
+  → ~12 MiB at production.
+- txt side: `[txt_seq, joint_dim] F32` cond+uncond (6.1 MiB) +
+  `[txt_seq, joint_dim] F16` cond+uncond norm-out staging (1.5 MiB)
+  + 3× `[txt_seq, H]` mix F16/F32 (~3 MiB each) → ~16 MiB at production.
+- Misc: `t_emb_*` (all tiny), `adaln_*` (tiny) → <100 KB.
+- Total: ~30 MiB per-request, comfortably within the 32 GiB HBM budget
+  on top of the ~8 GiB resident weights.
+
+**Known gaps carried forward into §5.5.2 (not blockers for the Step 4
+eye-check, but must be addressed for full Q1 parity):**
+
+1. **RoPE pe session-rebuild gap.** The pe table is computed in
+   `init_from_gguf` for a worst-case `h=w=64` image grid and
+   `ctx_len=max_txt_seq=256`. At the production 32×32 latent /
+   `patch_size=2` grid, the image side is 16×16 tokens — the pe rows
+   indexed by `forward_block_`'s `img_pe_off=ctx_len + row_index` point
+   into the LINEAR-SWEEP positions `(t=0, h=row/64, w=row%64)` of the
+   64×64 grid, not the `(h=row/16, w=row%16)` we actually want.
+   Similarly, txt positions read as offset `txt_start=64` inside the pe
+   (the max-grid `max(h_len,w_len)` at 64) rather than the production
+   `txt_start=16`. Expected effect: numerical drift vs CPU reference
+   (same DiT weights + different RoPE → different attention
+   outputs) — the model is expected to still produce plausible-looking
+   output because it was trained to tolerate diverse position shifts,
+   but Q1 cos_sim vs CPU will not be 1.0.
+   Fix: adopt Phase 3 pre-existing TODO — add
+   `ImageDiffusionEngine::rebuild_rope(h_tokens, w_tokens, ref_count, ctx_len)`
+   that re-runs `compute_qwen_rope_pe_host` with the request-specific
+   shape and re-uploads the tables. ~150 LoC.
+
+2. **Ref-latent RoPE temporal-axis gap.** `compute_qwen_rope_pe_host`
+   assigns `t=0` for every img token; the CPU reference's
+   `gen_refs_ids` assigns `t=1,2,...` for each ref-latent block. With
+   a single ref (cat-edit case), tokens 256..511 should have `t=1`,
+   not `t=0`. Again numerical drift rather than structural failure.
+
+3. **Per-step t_emb semantic correctness.** `denoise_full` DOES
+   rebuild t_emb per step from `sigmas[s]*1000` — resolving the gap
+   §5.5 called out for `denoise_loop_test`. The final step's t_emb is
+   re-used for the `norm_out` AdaLN head, matching the CPU reference
+   (`QwenImageModel::forward_orig` line 540).
+
+4. **CFG batching.** `denoise_full` runs cond+uncond sequentially per
+   step (2× forward_all_blocks). Q4 CFG batching (Steps 1 and 2 of
+   commit `036047de`) would halve denoise wall — follow-up work when
+   the non-CFG-batched path is GREEN end-to-end.
+
+5. **RoPE row layout + max_txt_seq=256.** The pe table's txt block
+   occupies rows [0, max_txt_seq). Our production `txt_seq=214 < 256`,
+   so we read rows [0, 214) and ignore rows [214, 256) — correct.
+   If a future request has `txt_seq > max_txt_seq` we must bump the
+   config before init_from_gguf and re-upload.
+
+**Test harness:** `tools/probes/qie_q45_step4_full_denoise/` —
+exercises init_from_gguf → init_from_dump → denoise_full → save final
+latent. Receipts (fill in post-run on ac03):
+
+| Measurement | Gate | Step 4 actual |
+|---|---|---|
+| NaN in final latent | =0 | (run on ac03) |
+| inf in final latent | =0 | (run on ac03) |
+| std(final latent) | > 0.001 | (run on ac03) |
+| min(final latent) | > -20 | (run on ac03) |
+| max(final latent) | < +20 | (run on ac03) |
+| denoise_full wall (20 steps, cfg=1 or 4) | < 1450 s target | (run on ac03) |
+| Output PNG eye-check | recognizable cat | Step 4d |
+
+**Smoke command (ac03, SIGHUP-proof):**
+
+```
+cd /home/ma-user/work/OminiX-Ascend
+LOG=/tmp/qie_q45_step4_full_denoise.log
+nohup setsid bash -c '
+  cd tools/probes/qie_q45_step4_full_denoise && bash build_and_run.sh
+' < /dev/null > "$LOG" 2>&1 &
+echo "pid=$! log=$LOG"
+```
+
+Then Step 4d runs the decode-only short-circuit:
+
+```
+OMINIX_QIE_DECODE_ONLY_LATENT=/tmp/qie_q45_step4_latent.f32.bin \
+  ./bin/ominix-diffusion-cli \
+    --diffusion-model <path>/Qwen-Image-Edit-2509-Q4_0.gguf \
+    --vae <path>/qwen_image_vae.safetensors \
+    --prompt "convert to black and white" \
+    --ref-image /tmp/cat.jpg \
+    --width 256 --height 256 --steps 2 --cfg-scale 1.0 \
+    --sample-method euler --seed 42 \
+    --output /tmp/qie_q45_step4_native_cat.png
+```
