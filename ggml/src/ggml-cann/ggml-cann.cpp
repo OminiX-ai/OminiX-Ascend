@@ -2278,15 +2278,53 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, 
     bool use_cann_graph = true;
 
     static bool prefill_use_graph = parse_bool(get_env_as_lowercase("GGML_CANN_PREFILL_USE_GRAPH").value_or(""));
-    if (!prefill_use_graph) {
-        // Do not use acl_graph for prefill.
-        for (int i = 0; i < cgraph->n_nodes; i++) {
-            ggml_tensor * node = cgraph->nodes[i];
-            // TODO: Optimize here. Currently, we can only
-            // get seq_len by FA's input.
-            if (node->op == GGML_OP_FLASH_ATTN_EXT) {
-                // Q -> src[0], shape: [B, S, N, D]
-                use_cann_graph = (node->src[0]->ne[1] == 1);
+    // Scan the graph once for two independent capture-disqualifying conditions:
+    //   (a) prefill — detected by an FA node with seq_len != 1 (unless overridden by env)
+    //   (b) CPU-fallback ops whose D2H/H2D round-trip cannot legally execute inside an
+    //       aclGraph capture scope. Blocking aclrtMemcpy returns EH9999 107030 ("current
+    //       capture mode does not support this operation") and any host stream sync
+    //       returns EE9999 107027. Graphs containing such ops must run in eager mode.
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        ggml_tensor * node = cgraph->nodes[i];
+        if (!prefill_use_graph && node->op == GGML_OP_FLASH_ATTN_EXT) {
+            // Q -> src[0], shape: [B, S, N, D]
+            if (node->src[0]->ne[1] != 1) {
+                use_cann_graph = false;
+            }
+            // Break only on FA — subsequent nodes still need the CPU-fallback scan.
+            continue;
+        }
+        // im2col_3d has an unconditional CPU fallback (see aclnn_ops.cpp around the
+        // "Perform im2col_3d on CPU" comment) that does sync D2H + CPU compute + sync
+        // H2D — incompatible with capture.
+        if (node->op == GGML_OP_IM2COL_3D) {
+            use_cann_graph = false;
+            break;
+        }
+        // GET_ROWS for Q4_0/Q4_1 and MUL_MAT for Q4_1 / Q5_{0,1} / K-quants both take
+        // the CPU-dequant fallback inside aclnn_ops.cpp for lack of native INT4/K-quant
+        // cast support in CANN. Same sync-D2H / sync-H2D pattern → capture-incompatible.
+        if (node->op == GGML_OP_GET_ROWS && node->src[0] &&
+            (node->src[0]->type == GGML_TYPE_Q4_0 || node->src[0]->type == GGML_TYPE_Q4_1)) {
+            use_cann_graph = false;
+            break;
+        }
+        if (node->op == GGML_OP_MUL_MAT && node->src[0]) {
+            switch (node->src[0]->type) {
+                case GGML_TYPE_Q4_1:
+                case GGML_TYPE_Q5_0:
+                case GGML_TYPE_Q5_1:
+                case GGML_TYPE_Q2_K:
+                case GGML_TYPE_Q3_K:
+                case GGML_TYPE_Q4_K:
+                case GGML_TYPE_Q5_K:
+                case GGML_TYPE_Q6_K:
+                    use_cann_graph = false;
+                    break;
+                default:
+                    break;
+            }
+            if (!use_cann_graph) {
                 break;
             }
         }

@@ -1515,7 +1515,9 @@ void ggml_cann_im2col_3d(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     void * dst_host  = malloc(dst_size);
     GGML_ASSERT(src1_host && dst_host);
 
-    ACL_CHECK(aclrtSynchronizeStream(ctx.stream()));
+    // Under aclGraph capture, host stream sync is forbidden (EE9999 107027); the helper
+    // skips the sync in that case and relies on capture-mode ordering instead.
+    ggml_cann_sync_stream_unless_capturing(ctx.stream());
     ACL_CHECK(aclrtMemcpy(src1_host, src1_size, src1->data, src1_size, ACL_MEMCPY_DEVICE_TO_HOST));
 
     // Perform im2col_3d on CPU
@@ -2298,7 +2300,9 @@ void ggml_cann_get_rows(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
 
                 // 1) D2H: pull the on-device quantised buffer into host memory. Sync the
                 //    backend stream first so any pending writes complete before the sync copy.
-                ACL_CHECK(aclrtSynchronizeStream(ctx.stream()));
+                //    Under aclGraph capture we skip the host sync (EE9999 107027) and trust
+                //    capture-mode ordering to serialise against prior ops on the same stream.
+                ggml_cann_sync_stream_unless_capturing(ctx.stream());
                 std::vector<uint8_t> device_buffer(device_size);
                 ACL_CHECK(aclrtMemcpy(device_buffer.data(), device_size, src0->data, device_size,
                                       ACL_MEMCPY_DEVICE_TO_HOST));
@@ -2362,9 +2366,10 @@ void ggml_cann_get_rows(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
                 // 4) H2D: park the dequantised buffer in a pool alloc and gather-index.
                 //    Sync the stream first — the pool can recycle an address whose previous
                 //    consumer is still running on ctx.stream(), and the sync memcpy below does
-                //    not itself serialize with the op queue.
+                //    not itself serialize with the op queue. Capture-active streams skip the
+                //    host sync and rely on recorded ordering.
                 ggml_cann_pool_alloc dequant_buffer_allocator(ctx.pool(), dst_size);
-                ACL_CHECK(aclrtSynchronizeStream(ctx.stream()));
+                ggml_cann_sync_stream_unless_capturing(ctx.stream());
                 ACL_CHECK(aclrtMemcpy(dequant_buffer_allocator.get(), dst_size, dst_host.data(), dst_size,
                                       ACL_MEMCPY_HOST_TO_DEVICE));
 
@@ -2378,8 +2383,10 @@ void ggml_cann_get_rows(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
                                       dst->data, dst->ne, dst->nb, src1, dst->type);
                 // Sync before dequant_buffer_allocator goes out of scope so the async
                 // aclnn_index_select_4d finishes reading the pool buffer before it's
-                // recycled by a later allocator.
-                ACL_CHECK(aclrtSynchronizeStream(ctx.stream()));
+                // recycled by a later allocator. Skipped under aclGraph capture — the
+                // recorded graph already orders the index_select against the following
+                // pool consumer via the same stream.
+                ggml_cann_sync_stream_unless_capturing(ctx.stream());
                 break;
             }
         default:
@@ -2796,8 +2803,10 @@ static void ggml_cann_mul_mat_quant_cpu_dequant(ggml_backend_cann_context & ctx,
     // Q4_1 / Q5_* / K-quants are NOT routed through ggml_backend_cann_transform_q4_0 at
     // buffer-copy time, so the on-device layout matches block_<type> exactly. Pull the
     // bytes back to host verbatim. The D2H read must wait for any pending writes on the
-    // backend stream (e.g., a previous op still scheduled) before the sync copy.
-    ACL_CHECK(aclrtSynchronizeStream(ctx.stream()));
+    // backend stream (e.g., a previous op still scheduled) before the sync copy. Under
+    // aclGraph capture the host sync is forbidden and the helper is a no-op; capture-mode
+    // recording preserves op order on the stream.
+    ggml_cann_sync_stream_unless_capturing(ctx.stream());
     std::vector<uint8_t> host_quant(device_q_bytes);
     ACL_CHECK(aclrtMemcpy(host_quant.data(), device_q_bytes, src0->data, device_q_bytes,
                           ACL_MEMCPY_DEVICE_TO_HOST));
@@ -2818,7 +2827,9 @@ static void ggml_cann_mul_mat_quant_cpu_dequant(ggml_backend_cann_context & ctx,
     ggml_cann_pool_alloc weight_fp16_alloc(ctx.pool(), fp16_bytes);
     // Sync the backend stream before the H2D upload so we don't race a prior matmul that
     // still has the pool buffer live (the pool can recycle the same address across calls).
-    ACL_CHECK(aclrtSynchronizeStream(ctx.stream()));
+    // Under capture the helper skips the sync; replay ordering via the captured stream is
+    // sufficient to keep the H2D ordered against prior pool consumers.
+    ggml_cann_sync_stream_unless_capturing(ctx.stream());
     ACL_CHECK(aclrtMemcpy(weight_fp16_alloc.get(), fp16_bytes, fp16_buf.data(), fp16_bytes,
                           ACL_MEMCPY_HOST_TO_DEVICE));
 
@@ -2850,8 +2861,9 @@ static void ggml_cann_mul_mat_quant_cpu_dequant(ggml_backend_cann_context & ctx,
     // The pool buffer for the dequantised FP16 weight is owned by weight_fp16_alloc and will
     // be returned to the pool at the end of this scope. Sync the backend stream before then
     // to guarantee the async aclnnMm has finished reading from it — otherwise a later pool
-    // consumer can overwrite in-flight data.
-    ACL_CHECK(aclrtSynchronizeStream(ctx.stream()));
+    // consumer can overwrite in-flight data. Under aclGraph capture we skip the host sync
+    // and rely on the recorded op order on the stream.
+    ggml_cann_sync_stream_unless_capturing(ctx.stream());
 }
 
 void ggml_cann_mul_mat(ggml_backend_cann_context & ctx, ggml_tensor * dst) {

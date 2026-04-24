@@ -76,6 +76,34 @@
 #define ACL_CHECK(stmt) ACL_CHECK_GEN(stmt, 0, aclGetRecentErrMsg)
 
 /**
+ * @brief Synchronise the given stream, unless it is currently being captured
+ *        into an aclGraph / model runtime instance.
+ *
+ * Under aclmdlRI capture, CANN forbids host-side stream synchronisation
+ * (EE9999 "Not allow to synchronize captured-stream", runtime result 107027).
+ * Capture-mode recording only needs relative ordering between ops on the same
+ * stream, which aclGraph replay enforces natively — so a caller that issues
+ * sync-memcpy / CPU-fallback D2H+H2D patterns can safely skip the host sync
+ * while capture is active. Outside of capture we preserve the original
+ * aclrtSynchronizeStream behaviour so non-capture correctness (pool-buffer
+ * aliasing, prior-write visibility) is unchanged.
+ *
+ * @param stream The ACL runtime stream to synchronise.
+ */
+static inline void ggml_cann_sync_stream_unless_capturing(aclrtStream stream) {
+#ifdef USE_ACL_GRAPH
+    aclmdlRICaptureStatus status  = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
+    aclmdlRI              modelRI = nullptr;
+    if (aclmdlRICaptureGetInfo(stream, &status, &modelRI) == ACL_SUCCESS &&
+        status != ACL_MODEL_RI_CAPTURE_STATUS_NONE) {
+        // Stream is in ACTIVE or INVALIDATED capture — skip the host sync.
+        return;
+    }
+#endif
+    ACL_CHECK(aclrtSynchronizeStream(stream));
+}
+
+/**
  * @brief Contains information about CANN devices.
  */
 struct ggml_cann_device_info {
