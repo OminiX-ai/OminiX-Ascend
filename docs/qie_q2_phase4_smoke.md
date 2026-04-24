@@ -514,3 +514,33 @@ against *real* weight payloads.
 Not yet started. Gate: any sensible output, no crash, HBM peak ≤ 18 GiB.
 Report end-to-end 20-step wall-clock for one 256×256 edit — the first QIE
 native fps measurement that isn't Q1 baseline.
+## Phase 4.4 real-GGUF smoke — VERDICT: RED (NaN)
+
+Commit: `bc24a8c6` probe + receipts on fork.
+
+### Load (GREEN)
+- Peak HBM: **17.86 GiB** (gate ≤18 GiB) ✅
+- Tensors uploaded: 1933 (696 Q4-resident + 150 F16 fallback + norms/biases)
+- Q4 weights: 7.14 GiB + scales 0.89 GiB
+- F16 fallback: 9.51 GiB (Q4_1 FFN-down + Q5_K layers 0/59 + BF16 globals)
+- Init wall: 102.6s (GGUF parse + upload + repack)
+
+### Forward (RED)
+- 60-block forward: 1486 ms (similar to synthetic 1432 ms — dispatch works)
+- Per-block: 4.13-4.54 ms amortized (block 0 = 1215 ms op-graph compile)
+- **Output: NaN=196608, inf=0, std=0** — all-NaN on all 196608 output elements
+- Same shape/code that passed cos_sim 0.9999 on synthetic F16 weights (Phase 4.2)
+
+### Root cause hypothesis
+F16 accumulator overflow on real-magnitude weights. Mirrors Q1 baseline's
+NaN regression (`GGML_CANN_QUANT_BF16=on` workaround for ggml-cann quant
+matmul accumulator). Native engine dispatches aclnn directly — env var
+doesn't propagate to our matmul helpers.
+
+### Phase 4.4b scope (next dispatch)
+Diagnose NaN origin:
+1. Binary-bisect on layer count: run with N={1, 5, 10, 30, 60} layers. Where does NaN first appear?
+2. Instrument `dispatch_matmul_` to log output std per call — find which matmul overflows first
+3. Try BF16 accumulator path for WQBMMv3 (if op supports it) and aclnnMm variants (MatmulV2 has dtype options)
+
+Phase 4.5 cat-edit BLOCKED on Phase 4.4b.
