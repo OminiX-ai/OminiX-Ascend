@@ -2530,6 +2530,58 @@ bool ImageDiffusionEngine::forward_block_test(int il,
                           txt_hidden, txt_seq, t_emb, pe);
 }
 
+// ---------------------------------------------------------------------------
+// Phase 4.2: chain all populated DiT blocks in sequence. The `forward()`
+// production entry point already does this (see line ~1215); this test hook
+// exists so smoke probes can (a) scope the run to the first `n_blocks`
+// layers when diagnosing layer-by-layer divergence and (b) capture per-block
+// wall-clock without having to thread timing knobs through the production
+// signature. Each sample synchronises the compute stream so the reported ms
+// reflects the actual NPU work for that block (plus the stream sync — at
+// seq=96 that sync is the dominant contributor; keep that caveat in mind
+// when reading the receipt).
+// ---------------------------------------------------------------------------
+bool ImageDiffusionEngine::forward_all_blocks_test(void *img_hidden,
+                                                     int64_t img_seq,
+                                                     void *txt_hidden,
+                                                     int64_t txt_seq,
+                                                     void *t_emb,
+                                                     void *pe,
+                                                     double *per_block_ms,
+                                                     int n_blocks) {
+    if (!ready_) {
+        QIE_LOG("forward_all_blocks_test: engine not ready");
+        return false;
+    }
+    const int L = (n_blocks <= 0) ? (int)layer_w_.size()
+                                    : std::min(n_blocks, (int)layer_w_.size());
+    for (int il = 0; il < L; ++il) {
+        auto t0 = std::chrono::steady_clock::now();
+        if (!forward_block_(layer_w_[il],
+                            img_hidden, img_seq,
+                            txt_hidden, txt_seq,
+                            t_emb, pe)) {
+            QIE_LOG("forward_all_blocks_test: block %d returned error", il);
+            return false;
+        }
+        if (per_block_ms) {
+            // Only sync when the caller asked for per-block timing: the
+            // stream sync is expensive relative to the queued aclnn ops and
+            // we don't want to penalise the no-timing path.
+            aclError err = g_cann.aclrtSynchronizeStream(compute_stream_);
+            if (err != 0) {
+                QIE_LOG("forward_all_blocks_test: sync after block %d err=%d",
+                        il, (int)err);
+                return false;
+            }
+            auto t1 = std::chrono::steady_clock::now();
+            per_block_ms[il] =
+                std::chrono::duration<double, std::milli>(t1 - t0).count();
+        }
+    }
+    return true;
+}
+
 DiTLayerWeights *ImageDiffusionEngine::mutable_layer_weights(int il) {
     if (il < 0 || il >= (int)layer_w_.size()) return nullptr;
     return &layer_w_[il];

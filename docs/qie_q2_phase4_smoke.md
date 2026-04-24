@@ -146,13 +146,123 @@ host-path default.
 
 ---
 
-## §2. Phase 4.2 — 60-block DiT forward loop (pending)
+## §2. Phase 4.2 — 60-block DiT forward loop (status **GREEN**)
 
-Not yet started. Scope: wire `forward_block_` across `cfg_.num_layers` in
+### §2.1 Gate recap
+
+Scope: wire `forward_block_` across `cfg_.num_layers` in
 `ImageDiffusionEngine::forward()`. Per Phase 3 §7 item 5, this is pure
 plumbing — each block takes the previous layer's output as input to the
-next. Gate: cos_sim > 0.95 at layer 60 output vs CPU reference on dummy
-input.
+next. Gate: `cos_sim > 0.95` at layer 60 output vs CPU reference on dummy
+input, NaN=0 both streams. Bar lowered from Phase 3's 0.99 to accept F16
+accumulation drift over 60 layers.
+
+### §2.2 Result
+
+**VERDICT: GREEN** (cos_sim 0.999962 / 0.999963 — exceeds even the Phase 3
+0.99 bar).
+
+| Metric | img stream | txt stream |
+|---|---|---|
+| cos_sim vs CPU ref @ layer 60 | **0.999962** | **0.999963** |
+| MAE                           | 3.30e-4     | 3.30e-4     |
+| min / max (NPU)               | -0.3447 / 0.2825 | -0.3140 / 0.2615 |
+| NaN / inf                     | 0           | 0           |
+
+### §2.3 Wall-clock (NPU)
+
+```
+config: H=3072 heads=24 head_dim=128 ff_dim=12288 layers=60
+seq:    img=64  txt=32  joint=96
+total:  1432.29 ms
+per-block: min=4.08 ms  median=4.11 ms  max=1189.67 ms  sum=1432.28 ms
+first 5 blocks:  1189.67  4.19  4.15  4.11  4.12 ms
+last  5 blocks:  4.14     4.11  4.10  4.11  4.09 ms
+```
+
+Block 0 pays the one-time aclnn op-graph compilation tax (~1.19 s —
+matches the Phase 3 first-block burn). Blocks 1–59 run in 4.08–4.19 ms
+each (median 4.11 ms). Amortised per-block wall once the graph is cached
+is **~4.1 ms at joint seq=96**; blocks 1–59 sum to ~243 ms total after
+first-block warmup.
+
+### §2.4 Harness notes
+
+- Synthetic F16 weights (`seed=0xC0DE42`) uploaded **once** and shared
+  across all 60 `layer_w_` slots via pointer aliasing. This keeps HBM at
+  a single-block footprint regardless of `cfg_.num_layers`, and makes
+  the CPU reference apples-to-apples (same numerical sequence 60 times).
+- Modulation weight amplitude is `1e-3` (vs Phase 3's `1e-2`) so
+  `(1+scale)^60 ≈ 1.06×` stays inside F16 range. Without this tightening,
+  60 identical blocks blow up under F16 accumulation.
+- CPU reference re-quantises `img_h_ref / txt_h_ref` through F16 at every
+  inter-block boundary to mirror the NPU's implicit F16 round-trip between
+  blocks. Without this step the CPU path keeps F32 precision across the
+  full chain and over-reports NPU drift.
+- RoPE path: host-default (Phase 4.1 on-device path remains RED — see §1).
+  This means each smoke run pays the ~96 GiB PCIe tax only at the
+  production shape; at the smoke's seq=96 the tax is negligible.
+
+### §2.5 Wall-time harvest (end-to-end)
+
+The full probe (build + NPU forward + 60-block CPU reference) took
+**~37 min wall** on ac03. NPU forward is 1.43 s; the rest is the CPU
+reference (~30.6 min, ~30.6 s/block in F32). The 4.2 gate does not need
+CPU reference in production — it is only used here as the parity oracle.
+
+### §2.6 Infrastructure landed for §2
+
+Engine-side:
+
+- `ImageDiffusionEngine::forward_all_blocks_test(img_hidden, img_seq,
+  txt_hidden, txt_seq, t_emb, pe, per_block_ms=nullptr, n_blocks=0)` —
+  test-only hook that chains `forward_block_` across all populated
+  layers. Per-block stream sync + wall sample is optional (opt-in when
+  `per_block_ms` is non-null) so the no-timing path does not pay the sync
+  cost. `n_blocks<=0` runs every layer; passing a smaller value is useful
+  for layer-by-layer divergence bisection.
+
+Probe-side:
+
+- `tools/probes/qie_q42_60block_smoke/` — stand-alone 60-block smoke
+  probe. Synthesises one shared F16 weight set, wires it into every
+  layer, dispatches `forward_all_blocks_test(60)` on NPU, mirrors the
+  dispatch in F32 on host, and reports cos_sim / MAE / NaN / per-block
+  wall. Env knobs: `QIE_N_BLOCKS=<k>` to scope to first k layers;
+  `QIE_SMOKE_SMALL=0` to switch to production seq (img=256, txt=64) for
+  a bigger perf sample.
+- SSH-disconnect-proof launch recipe (`nohup setsid bash -c … > … 2>&1 &`)
+  landed in the probe runbook — a naive `bash -c` over ssh inherits the
+  controlling terminal and SIGHUPs when the connection drops mid-CPU-ref.
+  First 60-block attempt died at block 20/60 this way; this run completed
+  despite three ssh drops during the 37-min wall window.
+
+### §2.7 Production enablement
+
+`ImageDiffusionEngine::forward()` already loops `forward_block_` across
+all `layer_w_` entries (engine.cpp:~1215); the Phase 4.2 work here just
+proves that loop is numerically sound across the full 60-block depth.
+No production code change is required for Phase 4.3 to proceed — the
+forward entry point is unblocked on correctness.
+
+### §2.8 Known caveats carried into Phase 4.3
+
+- Per-block wall (4.1 ms at seq=96) scales with O(seq²) for attention and
+  O(seq) for matmuls. At production seq=4352 (256 img + 64 txt, with
+  img=256 after 16×16 patchify), attention alone will dominate. Budget
+  for Phase 4.3 / 4.5 should use Phase 3's production-shape per-block
+  wall sample as the predictor, not this smoke's seq=96 number.
+- Host RoPE round-trip (Phase 4.1 RED) contributes ~18 s / image at
+  production shape. Phase 4.3 will include this tax until §1.7 is picked
+  up.
+
+### §2.9 Receipts
+
+- Full smoke log: `docs/_qie_q42_smoke_v2.log` (37 lines, EXITCODE=0).
+- Probe source: `tools/probes/qie_q42_60block_smoke/test_qie_q42_60block_smoke.cpp`.
+- Build recipe: `tools/probes/qie_q42_60block_smoke/build_and_run.sh`.
+- Engine hook: `image_diffusion_engine.{h,cpp}` — see
+  `forward_all_blocks_test` (cpp:~2533, 52 LOC).
 
 ---
 

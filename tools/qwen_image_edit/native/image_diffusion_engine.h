@@ -393,6 +393,21 @@ public:
                              void *t_emb,
                              void *pe);
 
+    // Phase 4.2 test-only hook: dispatch all populated DiT blocks 0..n-1 in
+    // sequence (output of block k → input of block k+1). Same dispatch path
+    // as `forward()` — the hook just adds optional per-block wall-clock
+    // sampling and a tighter log line. `n_blocks` can be ≤ cfg_.num_layers;
+    // pass 0 to run every layer. If `per_block_ms` is non-null, it must
+    // point at an array of length `n_blocks` (or cfg_.num_layers when
+    // n_blocks==0); each entry is filled with the wall time for that
+    // block including its trailing stream sync.
+    bool forward_all_blocks_test(void *img_hidden, int64_t img_seq,
+                                  void *txt_hidden, int64_t txt_seq,
+                                  void *t_emb,
+                                  void *pe,
+                                  double *per_block_ms = nullptr,
+                                  int n_blocks = 0);
+
     // Test-only hook: mutable access to DiTLayerWeights[il] so a probe can
     // populate synthetic weights without a real GGUF. Returns nullptr if
     // `il` is out of range or the engine has not allocated its layer
