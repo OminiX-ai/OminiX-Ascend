@@ -1,0 +1,27 @@
+[smoke43] config: layers=60 heads=24 head_dim=128 hidden=3072 ff=12288
+[smoke43] seq:    img=64 txt=32 joint=96
+[smoke43] sched:  n_steps=20 cfg_scale=4.00
+[qie_native] init_for_smoke: OK device=0 hidden=3072 heads=24 head_dim=128 img_seq=64 txt_seq=32 (NO WEIGHTS LOADED — caller must populate layer_w_ via mutable_layer_weights)
+[smoke43] engine scratch-alloc ok; generating synthetic weights...
+[smoke43] host weights generated; uploading to NPU...
+[smoke43] weights uploaded; wiring 60 layer_w_ slots...
+[smoke43] sigma schedule (first 5): 1.0000 0.9500 0.9000 0.8500 0.8000 ... (last): 0.0000
+[smoke43] x_init: mean=0.0000 std=0.0577 min=-0.1000 max=0.1000 nan=0 inf=0
+[smoke43] dispatching denoise_loop_test (n_steps=20, cfg=4.00)...
+[smoke43] denoise_loop_test OK (10775.85 ms total)
+
+========== Q2.4.3 Phase 4.3 Euler denoise smoke report ==========
+config: H=3072 heads=24 head_dim=128 ff_dim=12288 layers=60
+seq:    img=64  txt=32  joint=96
+sched:  n_steps=20 cfg_scale=4.00 sigma_max=1.0000 sigma_min=0.0000
+wall:   total=10775.85 ms   per-step min=474.04 ms  median=475.79 ms  max=1694.09 ms  sum=10775.77 ms
+per-step ms (first 5 / last 5):  1694.09 482.45 475.79 478.82 474.68 ... 475.06 485.57 475.00 478.79 478.96 
+
+-- final latent x vs input --
+  x_init : mean=0.0000 std=0.0577 min/max=-0.1000/0.1000
+  x_final: mean=-0.0001 std=0.0271 min/max=-0.2179/0.1730
+  NaN=0  inf=0
+
+---------------------------------------------------
+VERDICT: GREEN (gate: NaN=0, inf=0, std > 0.0010 over final latent)
+EXITCODE=0

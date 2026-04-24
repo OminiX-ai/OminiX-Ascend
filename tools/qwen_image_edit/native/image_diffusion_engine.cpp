@@ -1293,10 +1293,32 @@ void ImageDiffusionEngine::build_rope_tables_() {
 }
 
 void ImageDiffusionEngine::build_time_emb_(float timestep, void *out_dev) {
-    (void)timestep; (void)out_dev;
-    // Phase 4 body: sinusoidal timestep encoding into 256 dims, uploaded
-    // as F16 to `out_dev`. Caller then runs time_linear{1,2} to project
-    // to `hidden`.
+    // Sinusoidal timestep embedding — host-side F32 compute, upload as F16
+    // [256]. Standard diffusion formula (matches
+    // ominix_diffusion's `timestep_embedding`):
+    //   for i in [0, half):
+    //       freqs[i] = exp(-log(max_period) * i / half)
+    //   emb[2i]     = cos(timestep * freqs[i])
+    //   emb[2i + 1] = sin(timestep * freqs[i])   (pair interleaved)
+    // We emit 256 dims matching time_text_embed.timestep_embedder's input
+    // width (see qwen_image.hpp). Caller is expected to chain `time_linear{1,2}`
+    // to project to `hidden`. For the Phase 4.3 smoke the caller pre-computes
+    // a single-step synthetic t_emb on host and skips the linear projection,
+    // so this function is exposed for future Phase-4-production consumers.
+    if (!out_dev) return;
+    const int DIM = 256;
+    const int half = DIM / 2;
+    const float max_period = 10000.0f;
+    std::vector<uint16_t> emb((size_t)DIM, 0);
+    for (int i = 0; i < half; ++i) {
+        float freq = std::exp(-std::log(max_period) * (float)i / (float)half);
+        float arg  = timestep * freq;
+        emb[(size_t)(2 * i)    ] = fp32_to_fp16(std::cos(arg));
+        emb[(size_t)(2 * i + 1)] = fp32_to_fp16(std::sin(arg));
+    }
+    g_cann.aclrtMemcpy(out_dev, (size_t)DIM * sizeof(uint16_t),
+                         emb.data(), (size_t)DIM * sizeof(uint16_t),
+                         ACL_MEMCPY_HOST_TO_DEVICE);
 }
 
 // ============================================================================
@@ -2512,8 +2534,309 @@ void ImageDiffusionEngine::scheduler_step_(void * /*latent_dev*/,
                                              const void * /*model_out_dev*/,
                                              int step_idx) {
     (void)step_idx;
-    // Phase 4 body: Euler-flow step per
-    // tools/ominix_diffusion/src/denoiser.hpp:831-865.
+    // Phase 4.3 note: the in-place axpy `x += dt * eps` is provided via the
+    // `scheduler_step_test()` public test hook below (it takes explicit dt
+    // and element count, which matches the smoke probe's needs without
+    // needing to thread the full sigma schedule / C-H-W layout through this
+    // helper). A production `denoise()` body would call that same axpy
+    // sequence. See tools/ominix_diffusion/src/denoiser.hpp:831-865 for the
+    // Euler-flow reference formula:
+    //     d  = (x - denoised) / sigma          (for denoised-prediction model)
+    //     dt = sigmas[i+1] - sigmas[i]
+    //     x  = x + d * dt
+    // For Qwen-Image flow-matching the model predicts velocity directly, so
+    // the step is simply `x += dt * eps` — no division by sigma.
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4.3 scheduler-step test hook — see denoise_loop_test below for the
+// full Euler loop. Does a single in-place `x += dt * eps` via
+// aclnnInplaceAdd(alpha=dt). Supports n_elts > INT32_MAX by flattening to a
+// 1-D tensor; callers pass total element count.
+// ---------------------------------------------------------------------------
+bool ImageDiffusionEngine::scheduler_step_test(void *x_f16_dev,
+                                                 const void *eps_f16_dev,
+                                                 int64_t n_elts, float dt) {
+    if (!ready_) {
+        QIE_LOG("scheduler_step_test: engine not ready");
+        return false;
+    }
+    if (!x_f16_dev || !eps_f16_dev || n_elts <= 0) {
+        QIE_LOG("scheduler_step_test: bad args");
+        return false;
+    }
+    if (!g_cann.aclnnInplaceAdd || !g_cann.aclnnInplaceAddGetWorkspaceSize) {
+        QIE_LOG("scheduler_step_test: aclnnInplaceAdd symbol missing");
+        return false;
+    }
+    int64_t shape[1]   = { n_elts };
+    int64_t strides[1] = { 1 };
+    int64_t storage    = n_elts;
+    aclTensor *t_x = g_cann.aclCreateTensor(shape, 1, ACL_FLOAT16, strides,
+                                             0, ACL_FORMAT_ND, &storage, 1,
+                                             x_f16_dev);
+    aclTensor *t_e = g_cann.aclCreateTensor(shape, 1, ACL_FLOAT16, strides,
+                                             0, ACL_FORMAT_ND, &storage, 1,
+                                             (void *)eps_f16_dev);
+    uint16_t dt_f16 = fp32_to_fp16(dt);
+    aclScalar *alpha = g_cann.aclCreateScalar(&dt_f16, ACL_FLOAT16);
+
+    uint64_t ws_needed = 0;
+    aclOpExecutor *exec = nullptr;
+    aclnnStatus s = g_cann.aclnnInplaceAddGetWorkspaceSize(t_x, t_e, alpha,
+                                                             &ws_needed, &exec);
+    bool ok = (s == 0);
+    if (ok) {
+        ensure_workspace_(ws_needed);
+        void *ws = ws_needed > 0 ? workspace_dev_ : nullptr;
+        s = g_cann.aclnnInplaceAdd(ws, ws_needed, exec, compute_stream_);
+        ok = (s == 0);
+        if (!ok) QIE_LOG("scheduler_step_test: aclnnInplaceAdd launch err=%d",
+                          (int)s);
+    } else {
+        QIE_LOG("scheduler_step_test: workspace err=%d", (int)s);
+    }
+
+    g_cann.aclDestroyScalar(alpha);
+    g_cann.aclDestroyTensor(t_x);
+    g_cann.aclDestroyTensor(t_e);
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4.3 Euler-flow 20-step denoise loop — test hook. Operates on
+// already-resident activation buffers (no patchify / no VAE / no text
+// encoder). For a production denoise() body we would wrap this with
+// patchify(initial_noise) on entry and unpatchify on exit.
+//
+// Per-step algorithm (flow-matching convention):
+//   x_copy       <- x                          (snapshot, D2D memcpy)
+//   txt_c_copy   <- txt_hidden_cond            (snapshot)
+//   eps_cond     <- forward(x_copy, t_emb, txt_c_copy)
+//                  (forward is in-place on img; x_copy is now eps_cond)
+//   x_copy2      <- x                          (snapshot, D2D memcpy)
+//   txt_u_copy   <- txt_hidden_uncond          (snapshot)
+//   eps_uncond   <- forward(x_copy2, t_emb, txt_u_copy)
+//                  (forward is in-place on img; x_copy2 is now eps_uncond)
+//   eps          <- eps_uncond + cfg*(eps_cond - eps_uncond)
+//                  expressed as:
+//                    eps_cond  -= eps_uncond                  (aclnnInplaceAdd, alpha=-1)
+//                    eps_uncond += cfg * eps_cond             (aclnnInplaceAdd, alpha=cfg)
+//                  so eps_uncond now holds the CFG-composed eps.
+//   dt           = sigmas[s+1] - sigmas[s]
+//   x            += dt * eps_uncond            (aclnnInplaceAdd, alpha=dt)
+//
+// When cfg_scale == 1.0 the CFG composition simplifies to `eps = eps_cond`
+// (since eps_cond + 1.0*(eps_cond - eps_cond) = eps_cond). We still run two
+// forward passes in the smoke (simpler code; single-forward path is a 4.4
+// optimisation knob).
+// ---------------------------------------------------------------------------
+bool ImageDiffusionEngine::denoise_loop_test(void *x_f16_dev, int64_t img_seq,
+                                               void *txt_hidden_cond_f16_dev,
+                                               void *txt_hidden_uncond_f16_dev,
+                                               int64_t txt_seq,
+                                               void *t_emb_f16_dev,
+                                               void *pe_f16_dev,
+                                               const float *sigmas,
+                                               int n_steps,
+                                               float cfg_scale,
+                                               double *per_step_ms) {
+    if (!ready_) {
+        QIE_LOG("denoise_loop_test: engine not ready");
+        return false;
+    }
+    if (!x_f16_dev || !txt_hidden_cond_f16_dev ||
+        !txt_hidden_uncond_f16_dev || !t_emb_f16_dev || !sigmas || n_steps < 1) {
+        QIE_LOG("denoise_loop_test: bad args");
+        return false;
+    }
+
+    const int64_t H    = cfg_.hidden_size;
+    const size_t  F16  = sizeof(uint16_t);
+    const size_t  img_bytes = (size_t)img_seq * H * F16;
+    const size_t  txt_bytes = (size_t)txt_seq * H * F16;
+
+    // Temporary D2D staging buffers for:
+    //   * latent snapshot (so the second forward can re-read x)
+    //   * per-pass img/txt working buffers (forward is in-place)
+    //   * eps_cond storage (img buffer from the cond pass)
+    // We need two "img working" buffers (one per CFG pass) and two "txt
+    // working" buffers. All sized [seq, H] F16.
+    void *x_snap_dev      = nullptr;
+    void *img_work_c_dev  = nullptr;  // cond pass working latent → becomes eps_cond
+    void *img_work_u_dev  = nullptr;  // uncond pass working latent → becomes eps_uncond
+    void *txt_work_c_dev  = nullptr;  // cond pass working txt (destroyed in-place)
+    void *txt_work_u_dev  = nullptr;  // uncond pass working txt (destroyed in-place)
+
+    auto alloc_dev = [&](void **p, size_t n) {
+        aclError e = g_cann.aclrtMalloc(p, n, ACL_MEM_MALLOC_HUGE_FIRST);
+        if (e != 0) { QIE_LOG("denoise_loop_test: aclrtMalloc(%zu) err=%d",
+                               n, (int)e); *p = nullptr; return false; }
+        return true;
+    };
+    bool alloc_ok = alloc_dev(&x_snap_dev,     img_bytes) &&
+                    alloc_dev(&img_work_c_dev, img_bytes) &&
+                    alloc_dev(&img_work_u_dev, img_bytes) &&
+                    alloc_dev(&txt_work_c_dev, txt_bytes) &&
+                    alloc_dev(&txt_work_u_dev, txt_bytes);
+    auto free_all = [&]() {
+        if (x_snap_dev)     g_cann.aclrtFree(x_snap_dev);
+        if (img_work_c_dev) g_cann.aclrtFree(img_work_c_dev);
+        if (img_work_u_dev) g_cann.aclrtFree(img_work_u_dev);
+        if (txt_work_c_dev) g_cann.aclrtFree(txt_work_c_dev);
+        if (txt_work_u_dev) g_cann.aclrtFree(txt_work_u_dev);
+    };
+    if (!alloc_ok) { free_all(); return false; }
+
+    const bool run_uncond = (cfg_scale != 1.0f);
+
+    for (int step = 0; step < n_steps; ++step) {
+        auto t_step_0 = std::chrono::steady_clock::now();
+
+        // Snapshot x into x_snap_dev and also into both working buffers for
+        // the two forward passes. forward_all_blocks_test updates img_hidden
+        // in-place, so each pass needs its own clone.
+        aclError me = g_cann.aclrtMemcpy(x_snap_dev, img_bytes,
+                                           x_f16_dev, img_bytes,
+                                           ACL_MEMCPY_DEVICE_TO_DEVICE);
+        if (me != 0) { QIE_LOG("denoise_loop_test: snap x err=%d", (int)me);
+                       free_all(); return false; }
+        me = g_cann.aclrtMemcpy(img_work_c_dev, img_bytes,
+                                 x_snap_dev, img_bytes,
+                                 ACL_MEMCPY_DEVICE_TO_DEVICE);
+        if (me != 0) { free_all(); return false; }
+        me = g_cann.aclrtMemcpy(txt_work_c_dev, txt_bytes,
+                                 txt_hidden_cond_f16_dev, txt_bytes,
+                                 ACL_MEMCPY_DEVICE_TO_DEVICE);
+        if (me != 0) { free_all(); return false; }
+
+        // Pass 1: cond. img_work_c_dev becomes eps_cond after forward.
+        if (!forward_all_blocks_test(img_work_c_dev, img_seq,
+                                      txt_work_c_dev, txt_seq,
+                                      t_emb_f16_dev, pe_f16_dev,
+                                      nullptr, 0)) {
+            QIE_LOG("denoise_loop_test: cond forward failed at step %d", step);
+            free_all(); return false;
+        }
+
+        void *eps_composed_dev = img_work_c_dev;  // default if !run_uncond
+
+        if (run_uncond) {
+            me = g_cann.aclrtMemcpy(img_work_u_dev, img_bytes,
+                                     x_snap_dev, img_bytes,
+                                     ACL_MEMCPY_DEVICE_TO_DEVICE);
+            if (me != 0) { free_all(); return false; }
+            me = g_cann.aclrtMemcpy(txt_work_u_dev, txt_bytes,
+                                     txt_hidden_uncond_f16_dev, txt_bytes,
+                                     ACL_MEMCPY_DEVICE_TO_DEVICE);
+            if (me != 0) { free_all(); return false; }
+
+            // Pass 2: uncond. img_work_u_dev becomes eps_uncond.
+            if (!forward_all_blocks_test(img_work_u_dev, img_seq,
+                                          txt_work_u_dev, txt_seq,
+                                          t_emb_f16_dev, pe_f16_dev,
+                                          nullptr, 0)) {
+                QIE_LOG("denoise_loop_test: uncond forward failed at step %d",
+                        step);
+                free_all(); return false;
+            }
+
+            // CFG: eps = eps_uncond + cfg * (eps_cond - eps_uncond)
+            // Decompose into two in-place add-with-alpha dispatches (no
+            // reliance on aclnnMuls self-aliasing):
+            //   1) eps_cond -= eps_uncond                      (alpha = -1)
+            //      → img_work_c_dev now holds (eps_cond - eps_uncond)
+            //   2) eps_uncond += cfg * (eps_cond - eps_uncond) (alpha = cfg)
+            //      → img_work_u_dev now holds eps = eps_uncond + cfg*(Δ)
+            int64_t nE = (int64_t)img_seq * H;
+            int64_t shape1[1]   = { nE };
+            int64_t strides1[1] = { 1 };
+            int64_t storage1    = nE;
+
+            aclTensor *t_u = g_cann.aclCreateTensor(
+                shape1, 1, ACL_FLOAT16, strides1, 0, ACL_FORMAT_ND,
+                &storage1, 1, img_work_u_dev);
+            aclTensor *t_c = g_cann.aclCreateTensor(
+                shape1, 1, ACL_FLOAT16, strides1, 0, ACL_FORMAT_ND,
+                &storage1, 1, img_work_c_dev);
+
+            // Step 1: img_work_c_dev += (-1) * img_work_u_dev
+            uint16_t neg_one_f16 = fp32_to_fp16(-1.0f);
+            aclScalar *alpha_neg1 = g_cann.aclCreateScalar(&neg_one_f16,
+                                                              ACL_FLOAT16);
+            uint64_t ws1 = 0;
+            aclOpExecutor *ex1 = nullptr;
+            aclnnStatus st = g_cann.aclnnInplaceAddGetWorkspaceSize(t_c, t_u,
+                                                                      alpha_neg1,
+                                                                      &ws1, &ex1);
+            if (st != 0) { QIE_LOG("denoise_loop_test: InplaceAdd(-1) ws err=%d",
+                                    (int)st);
+                           g_cann.aclDestroyScalar(alpha_neg1);
+                           g_cann.aclDestroyTensor(t_u);
+                           g_cann.aclDestroyTensor(t_c);
+                           free_all(); return false; }
+            ensure_workspace_(ws1);
+            st = g_cann.aclnnInplaceAdd(ws1 > 0 ? workspace_dev_ : nullptr, ws1,
+                                          ex1, compute_stream_);
+            g_cann.aclDestroyScalar(alpha_neg1);
+            if (st != 0) { QIE_LOG("denoise_loop_test: InplaceAdd(-1) launch err=%d",
+                                    (int)st);
+                           g_cann.aclDestroyTensor(t_u);
+                           g_cann.aclDestroyTensor(t_c);
+                           free_all(); return false; }
+
+            // Step 2: img_work_u_dev += cfg * img_work_c_dev (which is Δ)
+            uint16_t cfg16 = fp32_to_fp16(cfg_scale);
+            aclScalar *sc_cfg = g_cann.aclCreateScalar(&cfg16, ACL_FLOAT16);
+            uint64_t ws2 = 0;
+            aclOpExecutor *ex2 = nullptr;
+            st = g_cann.aclnnInplaceAddGetWorkspaceSize(t_u, t_c, sc_cfg,
+                                                          &ws2, &ex2);
+            if (st != 0) { QIE_LOG("denoise_loop_test: InplaceAdd(cfg) ws err=%d",
+                                    (int)st);
+                           g_cann.aclDestroyScalar(sc_cfg);
+                           g_cann.aclDestroyTensor(t_u);
+                           g_cann.aclDestroyTensor(t_c);
+                           free_all(); return false; }
+            ensure_workspace_(ws2);
+            st = g_cann.aclnnInplaceAdd(ws2 > 0 ? workspace_dev_ : nullptr,
+                                         ws2, ex2, compute_stream_);
+            g_cann.aclDestroyScalar(sc_cfg);
+            g_cann.aclDestroyTensor(t_u);
+            g_cann.aclDestroyTensor(t_c);
+            if (st != 0) { QIE_LOG("denoise_loop_test: InplaceAdd(cfg) launch err=%d",
+                                    (int)st);
+                           free_all(); return false; }
+
+            eps_composed_dev = img_work_u_dev;
+        }
+
+        // Scheduler step: x += dt * eps. dt is signed — for a decreasing
+        // sigma schedule (typical flow matching) dt < 0.
+        float dt = sigmas[step + 1] - sigmas[step];
+        if (!scheduler_step_test(x_f16_dev, eps_composed_dev,
+                                  (int64_t)img_seq * H, dt)) {
+            QIE_LOG("denoise_loop_test: scheduler_step failed at step %d",
+                    step);
+            free_all(); return false;
+        }
+
+        if (per_step_ms) {
+            aclError se = g_cann.aclrtSynchronizeStream(compute_stream_);
+            if (se != 0) {
+                QIE_LOG("denoise_loop_test: sync after step %d err=%d",
+                        step, (int)se);
+                free_all(); return false;
+            }
+            auto t_step_1 = std::chrono::steady_clock::now();
+            per_step_ms[step] =
+                std::chrono::duration<double, std::milli>(t_step_1 - t_step_0)
+                    .count();
+        }
+    }
+
+    free_all();
+    return true;
 }
 
 // ============================================================================

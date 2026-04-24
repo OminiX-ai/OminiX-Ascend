@@ -408,6 +408,49 @@ public:
                                   double *per_block_ms = nullptr,
                                   int n_blocks = 0);
 
+    // Phase 4.3 test-only hook: scheduler-step primitive. In-place computes
+    // `x_f16_dev += dt * eps_f16_dev` over `n_elts` F16 elements via a single
+    // `aclnnInplaceAdd(alpha=dt)` dispatch. Exposed for the Q2.4.3 Euler
+    // denoise smoke probe to exercise the per-step update in isolation.
+    bool scheduler_step_test(void *x_f16_dev, const void *eps_f16_dev,
+                              int64_t n_elts, float dt);
+
+    // Phase 4.3 test-only hook: full Euler-flow denoise loop over synthetic
+    // activations already resident in img_hidden/txt_hidden device buffers.
+    //
+    // Signature: probe owns four device buffers —
+    //   `x_f16_dev`                 [img_seq, H] F16 — the latent (updated in-place)
+    //   `txt_hidden_cond_f16_dev`   [txt_seq, H] F16 — conditional text stream
+    //   `txt_hidden_uncond_f16_dev` [txt_seq, H] F16 — unconditional text stream
+    //   `t_emb_f16_dev`             [H]         F16 — timestep embedding (same for
+    //                                                 every step in the smoke; a
+    //                                                 real engine would rebuild
+    //                                                 this per step from sigma)
+    //   `pe_f16_dev`                RoPE pe table (as per forward_all_blocks_test)
+    //
+    // Per step the hook:
+    //   1. Snapshots x and both txt_hidden buffers
+    //   2. Runs 60-block DiT on (x_copy, t_emb, txt_hidden_cond_copy) → eps_cond
+    //   3. Restores x from snapshot
+    //   4. Runs 60-block DiT on (x_copy2, t_emb, txt_hidden_uncond_copy) → eps_uncond
+    //   5. Composes eps = eps_uncond + cfg_scale * (eps_cond - eps_uncond)
+    //   6. x_f16_dev += dt * eps       (dt = sigmas[s+1] - sigmas[s])
+    // After the loop returns, `x_f16_dev` holds the final latent.
+    //
+    // `sigmas` is a host-side array of length `n_steps + 1` (inclusive of
+    // the terminal zero boundary). `cfg_scale=1.0` disables CFG (one forward
+    // pass per step instead of two). Optional `per_step_ms` array (length
+    // `n_steps`) gets per-step wall samples (total cond+uncond+scheduler).
+    bool denoise_loop_test(void *x_f16_dev, int64_t img_seq,
+                            void *txt_hidden_cond_f16_dev,
+                            void *txt_hidden_uncond_f16_dev,
+                            int64_t txt_seq,
+                            void *t_emb_f16_dev,
+                            void *pe_f16_dev,
+                            const float *sigmas, int n_steps,
+                            float cfg_scale,
+                            double *per_step_ms = nullptr);
+
     // Test-only hook: mutable access to DiTLayerWeights[il] so a probe can
     // populate synthetic weights without a real GGUF. Returns nullptr if
     // `il` is out of range or the engine has not allocated its layer

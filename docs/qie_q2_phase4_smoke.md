@@ -266,11 +266,160 @@ forward entry point is unblocked on correctness.
 
 ---
 
-## §3. Phase 4.3 — Euler-flow 20-step denoise (pending)
+## §3. Phase 4.3 — Euler-flow 20-step denoise (status **GREEN**)
 
-Not yet started. Port from `tools/ominix_diffusion/src/denoiser.hpp:831-865`.
-Gate: 20-step loop runs without crash, output is non-trivial (not
-zero/NaN/constant), wall-clock measured.
+### §3.1 Gate recap
+
+Scope: port the Euler-flow scheduler + CFG-aware 20-step denoise loop around
+the Phase 4.2 60-block forward. Per-step algorithm (flow-matching
+convention; the model predicts velocity directly so no divide-by-sigma):
+
+```
+for step in [0, n_steps):
+    eps_cond   = forward_all_blocks(x, t_emb, txt_cond)    // in-place on x-copy
+    eps_uncond = forward_all_blocks(x, t_emb, txt_uncond)  // in-place on x-copy
+    eps        = eps_uncond + cfg_scale * (eps_cond - eps_uncond)
+    dt         = sigmas[step+1] - sigmas[step]
+    x         += dt * eps
+```
+
+CFG runs sequentially (cond then uncond) per Phase 4.3 scope — batching is
+Phase 4.4 territory.
+
+Gate: 20 steps run without crash, no NaN/inf in final latent, std > 0.001
+(latent non-trivial / non-constant), total wall-clock reported.
+
+### §3.2 Result
+
+**VERDICT: GREEN** (20 × cond + 20 × uncond + 20 × scheduler = 40 forward
+passes + 20 axpys completed without crash, no NaN, final std = 0.0271).
+
+| Metric | value |
+|---|---|
+| Steps completed / attempted | **20 / 20** |
+| NaN / inf in final latent | **0 / 0** |
+| Final latent std | **0.0271** (> 0.001 gate) |
+| Final latent mean | -0.0001 |
+| Final latent min / max | -0.2179 / 0.1730 |
+| x_init mean / std | 0.0000 / 0.0577 |
+
+The latent distribution shrinks from std=0.0577 → 0.0271 over 20 steps,
+consistent with the flow-matching field pulling the noise toward the
+(arbitrary) data manifold induced by the synthetic weights. The final
+latent is visibly non-trivial and no accumulation blow-up occurred.
+
+### §3.3 Wall-clock (NPU, ac03)
+
+```
+config:  H=3072 heads=24 head_dim=128 ff_dim=12288 layers=60
+seq:     img=64  txt=32  joint=96
+sched:   n_steps=20  cfg_scale=4.00  sigma_max=1.0000  sigma_min=0.0000
+wall:    total=10775.85 ms
+per-step min=474.04 ms  median=475.79 ms  max=1694.09 ms  sum=10775.77 ms
+first 5 steps:  1694.09 482.45 475.79 478.82 474.68 ms
+last  5 steps:   475.06 485.57 475.00 478.79 478.96 ms
+```
+
+Step 0 pays a ~1.2 s op-graph compilation tax (1694 ms vs 478 ms median) —
+same tax observed on Phase 4.2 block 0. Subsequent steps are stable at
+~475 ms median.
+
+#### §3.3.1 Per-step breakdown (expected model)
+
+Each step does two 60-block forward passes + CFG compose + axpy. At
+joint seq=96 Phase 4.2 measured 4.11 ms median per block warm ⇒ 246.6 ms
+per 60-block forward ⇒ 493 ms for the cond+uncond pair. Our measured
+475 ms median aligns with that prediction within 4% (inter-step sync
+overhead absorbs the delta). CFG compose (2× aclnnInplaceAdd on
+img_seq×H = 64×3072 = 196 608 F16 elts) and the axpy (1× aclnnInplaceAdd,
+same shape) are sub-millisecond contributions and not separately
+instrumented for Phase 4.3.
+
+### §3.4 Production-shape projection
+
+At production shape (joint seq=4352 — 4096 img + 256 txt), per-block wall
+scales with O(seq²) for attention and O(seq) for matmuls; Phase 3
+production-shape probe (§ qie_q2_phase3_smoke.md) is the authoritative
+predictor. Using a ballpark 50× per-block multiplier from the Phase 3
+receipt, a full denoise would run ~50 × 10.8 s ≈ **540 s / image**
+(≈ 0.002 fps). This is the baseline the Q4 CFG batching (halves the
+forward-pass count) and aclGraph work are expected to cut. Host-side
+RoPE round-trip (Phase 4.1 RED, carried from §1) contributes an
+additional ~18 s per image at production shape — already counted in the
+per-block budget via the existing `apply_rope_host_` path.
+
+### §3.5 Harness notes
+
+- Same synthetic-weight aliasing pattern as Phase 4.2 (one weight set
+  shared across 60 `layer_w_` slots) — keeps HBM at single-block footprint.
+- Sigma schedule is linear in (1.0 → 0.0] across 21 points — identity flow
+  shift; a production engine would apply the Qwen-Image
+  `time_shift = μ → σ'` transform before this call.
+- Per-pass txt_hidden is snapshotted + restored because the DiT's joint
+  attention updates txt in-place; cond and uncond require distinct input
+  txt states.
+- Per-pass x_latent is also snapshotted + restored: the two CFG passes
+  must run on the same input latent.
+- Between-pass CFG composition expressed as two in-place adds rather than
+  a scale-then-add (avoids relying on aclnnMuls self-aliasing):
+  ```
+  eps_cond  -= eps_uncond                      // alpha=-1 inplace add
+  eps_uncond += cfg_scale * eps_cond           // alpha=cfg inplace add
+  ```
+  Leaves `eps_uncond` holding the composed eps.
+- Scheduler axpy `x += dt * eps` is a single `aclnnInplaceAdd(alpha=dt)`
+  dispatch on a flat 1-D view of the latent tensor.
+- `build_time_emb_` (engine helper) now emits a 256-dim sinusoidal
+  embedding on host and uploads as F16 — exposed for future Phase 4
+  production consumers; the smoke probe uses a random F16 t_emb directly
+  since the synthetic weights don't ground a specific timestep semantic.
+
+### §3.6 Infrastructure landed for §3
+
+Engine-side:
+
+- `ImageDiffusionEngine::denoise_loop_test(x, img_seq, txt_cond, txt_uncond,
+  txt_seq, t_emb, pe, sigmas, n_steps, cfg_scale, per_step_ms=nullptr)` —
+  test-only hook executing the full Euler-flow denoise loop on already-resident
+  activation buffers. Internally dispatches `forward_all_blocks_test` twice per
+  step (cond + uncond), composes CFG eps via two in-place adds, and applies
+  the scheduler `x += dt * eps` via `scheduler_step_test`.
+- `ImageDiffusionEngine::scheduler_step_test(x, eps, n_elts, dt)` — in-place
+  axpy primitive; single `aclnnInplaceAdd(alpha=dt)` dispatch on a 1-D
+  view. Exposed so follow-up probes can exercise the scheduler in isolation.
+- `ImageDiffusionEngine::build_time_emb_(timestep, out_dev)` — fleshed out
+  with host-side sinusoidal 256-dim embedding + H2D upload. Currently unused
+  by `denoise_loop_test` (smoke uses a random t_emb directly), but in place
+  for the Phase 4.5 / production `denoise()` body.
+
+Probe-side:
+
+- `tools/probes/qie_q43_denoise_smoke/` — stand-alone 20-step Euler-denoise
+  probe. Env knobs: `QIE_N_STEPS=<k>` (default 20), `QIE_CFG_SCALE=<f>`
+  (default 4.0), `QIE_SMOKE_SMALL=0` for production seq (img=256, txt=64).
+
+### §3.7 Known caveats carried into Phase 4.4
+
+- Wall is dominated by the block-forward passes; CFG-compose + axpy are
+  sub-millisecond at smoke seq and will remain so at production seq. No
+  Phase 4.4 work needs to target the scheduler — savings must come from
+  the forward path.
+- CFG still runs cond and uncond as separate forward passes. Phase 4.4
+  (Q4-resident batched forward) is expected to compose `[cond; uncond]`
+  on the batch axis and halve the forward count per step — the 4.3
+  scheduler surface is unchanged, only the model call becomes batched.
+- Synthetic weights only — correctness gate is floor-checked (no NaN,
+  non-constant output). Production numerics gate lands with Phase 4.5
+  cat-edit smoke against a real GGUF.
+
+### §3.8 Receipts
+
+- Full smoke log: `docs/_qie_q43_smoke_v1.log` (27 lines, EXITCODE=0).
+- Probe source: `tools/probes/qie_q43_denoise_smoke/test_qie_q43_denoise_smoke.cpp`.
+- Build recipe: `tools/probes/qie_q43_denoise_smoke/build_and_run.sh`.
+- Engine hooks: `image_diffusion_engine.{h,cpp}` — see `denoise_loop_test`
+  (cpp:~2634), `scheduler_step_test` (cpp:~2557), `build_time_emb_`
+  (cpp:~1295).
 
 ---
 
