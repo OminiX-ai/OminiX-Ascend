@@ -135,6 +135,25 @@ bool                       parse_bool(const std::string & value);
 int                        parse_integer(const std::string & value);
 
 /**
+ * @brief Return true when the ggml op on @p dst has been annotated with
+ *        `GGML_PREC_F32` (i.e. the model explicitly asked for F32-precision
+ *        accumulation on this matmul / flash-attention). Also honours the
+ *        environment override `GGML_CANN_FORCE_F32_PREC=1`, which forces
+ *        higher-precision accumulation regardless of the per-op hint.
+ *
+ * The hint is stored by ggml core in:
+ *   - MUL_MAT / MUL_MAT_ID: `op_params[0]`  (see ggml_mul_mat_set_prec)
+ *   - FLASH_ATTN_EXT:       `op_params[3]`  (see ggml_flash_attn_ext_set_prec)
+ * CUDA / Vulkan / SYCL honour it today; CANN historically dropped it, which
+ * let F16 accumulators overflow in 60-block diffusion residual streams.
+ * See `docs/ggml_cann_prec_f32_honoring.md` for the full root-cause write-up.
+ *
+ * @param dst The destination tensor of the op.
+ * @return    `true` if F32-precision accumulation should be used.
+ */
+bool ggml_cann_prec_is_f32(const ggml_tensor * dst);
+
+/**
  * @brief Abstract base class for memory pools used by CANN.
  */
 struct ggml_cann_pool {

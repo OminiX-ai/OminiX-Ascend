@@ -2586,13 +2586,30 @@ static void ggml_cann_mat_mul_fp(ggml_backend_cann_context & ctx, ggml_tensor * 
     }
     acl_tensor_ptr acl_dst = ggml_cann_create_tensor(dst, bcast_dst_ne, bcast_dst_nb, n_dims);
 
+    // cubeMathType semantics (Atlas A2):
+    //   0 = KEEP_DTYPE                 — no promotion
+    //   1 = ALLOW_FP32_DOWN_PRECISION  — F32 inputs demoted to HFLOAT32, F32 accumulator
+    //   2 = USE_FP16                   — F32 inputs demoted to F16, F16 accumulator
+    //   3 = USE_HF32                   — F32 inputs demoted to HFLOAT32
+    //
+    // Historical default for the 2D/3D fast path here was 2 (USE_FP16). Diffusion
+    // models annotate precision-critical matmuls (attention QK^T, `to_out` etc.)
+    // with GGML_PREC_F32 — when that hint is set, or when inputs are already BF16,
+    // USE_FP16 silently overflows the accumulator. Bump the cubeMathType to 1
+    // (ALLOW_FP32_DOWN_PRECISION → F32 accumulator) in those cases. The 4D+ slow
+    // path already uses 1.
+    const bool prec_f32 = ggml_cann_prec_is_f32(dst);
+    const bool inputs_bf16 = (input->type == GGML_TYPE_BF16) || (weight->type == GGML_TYPE_BF16);
+    const int8_t cube_math_type_fast = (prec_f32 || inputs_bf16) ? 1 : 2;
+
     switch (n_dims) {
         case 2:
-            GGML_CANN_CALL_ACLNN_OP(ctx, Mm, acl_input_tensor.get(), acl_weight_tensor.get(), acl_dst.get(), 2);
+            GGML_CANN_CALL_ACLNN_OP(ctx, Mm, acl_input_tensor.get(), acl_weight_tensor.get(), acl_dst.get(),
+                                    cube_math_type_fast);
             break;
         case 3:
             GGML_CANN_CALL_ACLNN_OP(ctx, BatchMatMul, acl_input_tensor.get(), acl_weight_tensor.get(), acl_dst.get(),
-                                    2);
+                                    cube_math_type_fast);
             break;
         default:
             // ALLOW_FP32_DOWN_PRECISION, when input is
@@ -2645,7 +2662,11 @@ static void ggml_cann_mul_mat_quant(ggml_backend_cann_context & ctx, ggml_tensor
     // (K=12288, activation ~131 -> sum > 65504). BF16 has the same exponent
     // range as FP32 (max ~3.4e38), avoiding Inf/NaN.
     // Default: FP16 (faster for LLM). Set GGML_CANN_QUANT_BF16=on for SD models.
-    static bool use_bf16 = parse_bool(get_env_as_lowercase("GGML_CANN_QUANT_BF16").value_or(""));
+    // Per-op override: when the diffusion graph annotates this mul_mat with
+    // GGML_PREC_F32, upgrade to BF16 regardless of the env default. This matches
+    // the precedent in CUDA/Vulkan/SYCL of honouring the per-op precision hint.
+    static bool use_bf16_env = parse_bool(get_env_as_lowercase("GGML_CANN_QUANT_BF16").value_or(""));
+    const bool use_bf16 = use_bf16_env || ggml_cann_prec_is_f32(dst);
     const aclDataType compute_dtype = use_bf16 ? ACL_BF16 : ACL_FLOAT16;
 
     // Convert FP16 scales to compute_dtype if needed
@@ -2820,28 +2841,58 @@ static void ggml_cann_mul_mat_quant_cpu_dequant(ggml_backend_cann_context & ctx,
     std::vector<float> fp32_buf(n_elements);
     traits->to_float(host_quant.data(), fp32_buf.data(), (int64_t) n_elements);
 
-    // FP16 is the lowest-cost compute dtype aclnnMm will accept here (matches mat_mul_fp's
-    // 2D fast path). If the diffusion caller is in bf16 mode we still feed fp16 weights;
-    // aclnn promotes internally.
-    std::vector<ggml_fp16_t> fp16_buf(n_elements);
-    ggml_fp32_to_fp16_row(fp32_buf.data(), fp16_buf.data(), (int64_t) n_elements);
+    // Dispatch precision:
+    //   - Default (LLM path, no hint): host-dequant to F16, aclnnMm with cubeMathType=2
+    //     (USE_FP16 accumulator). Lowest cost, matches LLM quant-path behaviour.
+    //   - GGML_PREC_F32 or GGML_CANN_FORCE_F32_PREC=1: host-dequant to BF16, cast the
+    //     activation to BF16 on device, aclnnMm with cubeMathType=1
+    //     (ALLOW_FP32_DOWN_PRECISION → F32 accumulator on Atlas A2). Matches the
+    //     behaviour of the native Q4_0/Q8_0 path when GGML_CANN_QUANT_BF16=on.
+    //     Needed for 60-block diffusion residual streams where the F16 accumulator
+    //     overflows past step 3.
+    const bool prec_f32 = ggml_cann_prec_is_f32(dst);
+    const aclDataType compute_dtype = prec_f32 ? ACL_BF16 : ACL_FLOAT16;
+    const size_t      compute_elem_size = sizeof(uint16_t);  // both F16 and BF16
 
-    const size_t         fp16_bytes = n_elements * sizeof(ggml_fp16_t);
-    ggml_cann_pool_alloc weight_fp16_alloc(ctx.pool(), fp16_bytes);
+    std::vector<uint16_t> host_weight_compute(n_elements);
+    if (prec_f32) {
+        ggml_fp32_to_bf16_row(fp32_buf.data(), (ggml_bf16_t *) host_weight_compute.data(),
+                              (int64_t) n_elements);
+    } else {
+        ggml_fp32_to_fp16_row(fp32_buf.data(), (ggml_fp16_t *) host_weight_compute.data(),
+                              (int64_t) n_elements);
+    }
+
+    const size_t         weight_bytes = n_elements * compute_elem_size;
+    ggml_cann_pool_alloc weight_compute_alloc(ctx.pool(), weight_bytes);
     // Sync the backend stream before the H2D upload so we don't race a prior matmul that
     // still has the pool buffer live (the pool can recycle the same address across calls).
     // Under capture the helper skips the sync; replay ordering via the captured stream is
     // sufficient to keep the H2D ordered against prior pool consumers.
     ggml_cann_sync_stream_unless_capturing(ctx.stream());
-    ACL_CHECK(aclrtMemcpy(weight_fp16_alloc.get(), fp16_bytes, fp16_buf.data(), fp16_bytes,
+    ACL_CHECK(aclrtMemcpy(weight_compute_alloc.get(), weight_bytes, host_weight_compute.data(), weight_bytes,
                           ACL_MEMCPY_HOST_TO_DEVICE));
 
-    // Weight FP16 buffer on device is native (K, N); aclnnMm expects (N, K) → swap ne/nb[0..1].
-    size_t fp16_nb[2] = { sizeof(ggml_fp16_t), sizeof(ggml_fp16_t) * (size_t) src0->ne[0] };
-    int64_t weight_t_ne[2] = { src0->ne[1], src0->ne[0] };
-    size_t  weight_t_nb[2] = { fp16_nb[1],   fp16_nb[0] };
+    // Weight buffer on device is native (K, N); aclnnMm expects (N, K) → swap ne/nb[0..1].
+    size_t weight_nb_row[2] = { compute_elem_size, compute_elem_size * (size_t) src0->ne[0] };
+    int64_t weight_t_ne[2]  = { src0->ne[1], src0->ne[0] };
+    size_t  weight_t_nb[2]  = { weight_nb_row[1], weight_nb_row[0] };
 
-    // Per-slice matmul loop over src1's outer axes. At N=1 this runs exactly once.
+    // Per-slice matmul loop over src1's outer axes. At N=1 this runs exactly once;
+    // CFG batching yields src1->ne[2] == 2 (cond + uncond concatenated on the outer
+    // axis) and we dispatch one aclnnMm per slice. The dequantised weight is shared
+    // across slices.
+    //
+    // cubeMathType:
+    //   2 (USE_FP16)                 — default, matches mat_mul_fp 2D path
+    //   1 (ALLOW_FP32_DOWN_PRECISION) — F32 accumulator on Atlas A2, used when the
+    //                                   ggml op is tagged with GGML_PREC_F32
+    //                                   (or env GGML_CANN_FORCE_F32_PREC=1). In that
+    //                                   branch the dequantised weight is uploaded as
+    //                                   BF16 (above) and the activation is cast to
+    //                                   BF16 on-device per slice.
+    const int8_t cube_math_type = prec_f32 ? 1 : 2;
+
     for (int64_t i3 = 0; i3 < src1->ne[3]; ++i3) {
         for (int64_t i2 = 0; i2 < src1->ne[2]; ++i2) {
             char * src1_base = (char *) src1->data + i3 * src1->nb[3] + i2 * src1->nb[2];
@@ -2849,12 +2900,40 @@ static void ggml_cann_mul_mat_quant_cpu_dequant(ggml_backend_cann_context & ctx,
 
             int64_t input_ne[2] = { src1->ne[0], src1->ne[1] };
             size_t  input_nb[2] = { src1->nb[0], src1->nb[1] };
+
+            // Under GGML_PREC_F32 we upload the weight as BF16; aclnnMm requires the
+            // two inputs to share a dtype, so cast the slice's activation to BF16 on
+            // device. Default path uses the native F16 input tensor unchanged.
+            ggml_cann_pool_alloc input_cast_alloc(ctx.pool());
+            void *               input_buffer     = src1_base;
+            aclDataType          input_acl_dtype  = ggml_cann_type_mapping(src1->type);
+            size_t               input_elem_size  = ggml_type_size(src1->type);
+            size_t               input_nb_bytes[2] = { input_nb[0], input_nb[1] };
+            if (prec_f32 && input_acl_dtype != compute_dtype) {
+                const size_t slice_elems = (size_t) input_ne[0] * (size_t) input_ne[1];
+                const size_t input_bytes = slice_elems * compute_elem_size;
+                input_buffer             = input_cast_alloc.alloc(input_bytes);
+
+                acl_tensor_ptr acl_src1_orig = ggml_cann_create_tensor(src1_base, input_acl_dtype, input_elem_size,
+                                                                       input_ne, input_nb, 2);
+
+                input_elem_size   = compute_elem_size;
+                input_nb_bytes[0] = compute_elem_size;
+                input_nb_bytes[1] = compute_elem_size * (size_t) input_ne[0];
+                input_acl_dtype   = compute_dtype;
+
+                acl_tensor_ptr acl_src1_cast = ggml_cann_create_tensor(input_buffer, compute_dtype, compute_elem_size,
+                                                                       input_ne, input_nb_bytes, 2);
+                aclnn_cast(ctx, acl_src1_orig.get(), acl_src1_cast.get(), compute_dtype);
+            }
+
             acl_tensor_ptr acl_input =
-                ggml_cann_create_tensor(src1_base, ggml_cann_type_mapping(src1->type), ggml_type_size(src1->type),
-                                        input_ne, input_nb, 2);
+                ggml_cann_create_tensor(input_buffer, input_acl_dtype, input_elem_size,
+                                        input_ne, input_nb_bytes, 2);
 
             acl_tensor_ptr acl_weight =
-                ggml_cann_create_tensor(weight_fp16_alloc.get(), ACL_FLOAT16, sizeof(ggml_fp16_t), weight_t_ne, weight_t_nb, 2);
+                ggml_cann_create_tensor(weight_compute_alloc.get(), compute_dtype, compute_elem_size,
+                                        weight_t_ne, weight_t_nb, 2);
 
             int64_t dst_ne[2] = { dst->ne[0], dst->ne[1] };
             size_t  dst_nb[2] = { dst->nb[0], dst->nb[1] };
@@ -2862,12 +2941,11 @@ static void ggml_cann_mul_mat_quant_cpu_dequant(ggml_backend_cann_context & ctx,
                 ggml_cann_create_tensor(dst_base, ggml_cann_type_mapping(dst->type), ggml_type_size(dst->type),
                                         dst_ne, dst_nb, 2);
 
-            // cubeMathType = 2 (ALLOW_FP32_DOWN_PRECISION): matches mat_mul_fp 2D path.
-            GGML_CANN_CALL_ACLNN_OP(ctx, Mm, acl_input.get(), acl_weight.get(), acl_dst.get(), 2);
+            GGML_CANN_CALL_ACLNN_OP(ctx, Mm, acl_input.get(), acl_weight.get(), acl_dst.get(), cube_math_type);
         }
     }
 
-    // The pool buffer for the dequantised FP16 weight is owned by weight_fp16_alloc and will
+    // The pool buffer for the dequantised weight is owned by weight_compute_alloc and will
     // be returned to the pool at the end of this scope. Sync the backend stream before then
     // to guarantee the async aclnnMm has finished reading from it — otherwise a later pool
     // consumer can overwrite in-flight data. Under aclGraph capture we skip the host sync
@@ -4041,7 +4119,11 @@ static void ggml_cann_mul_mat_id_fp(ggml_backend_cann_context & ctx, ggml_tensor
         size_t         dst_nb[] = { dst->nb[0], dst->nb[1], dst->nb[1] };
         acl_tensor_ptr acl_dst  = ggml_cann_create_tensor(dst, dst_ne, dst_nb, 3, ACL_FORMAT_ND, i * dst->nb[2]);
 
-        GGML_CANN_CALL_ACLNN_OP(ctx, BatchMatMul, active_tensor.get(), select_export_transpose.get(), acl_dst.get(), 2);
+        // cubeMathType: 2 (USE_FP16) by default, 1 (ALLOW_FP32_DOWN_PRECISION / F32 accum)
+        // when GGML_PREC_F32 is requested on this MUL_MAT_ID op.
+        const int8_t mmid_cube_math_type = ggml_cann_prec_is_f32(dst) ? 1 : 2;
+        GGML_CANN_CALL_ACLNN_OP(ctx, BatchMatMul, active_tensor.get(), select_export_transpose.get(), acl_dst.get(),
+                                mmid_cube_math_type);
     }
 }
 
@@ -4440,7 +4522,17 @@ void ggml_cann_flash_attn_ext(ggml_backend_cann_context & ctx, ggml_tensor * dst
         int64_t nextTokens         = 65535;
         char    layout[5]          = { 'B', 'S', 'N', 'D', 0 };
         int64_t sparseMode         = 0;
-        int64_t innerPrecise       = (src0->ne[1] == 1) ? 0 : 2;
+        // innerPrecise (vendor-documented values):
+        //   0 = HIGH_PRECISION  — F32 accumulator inside FIA (Q·K and SV)
+        //   1 = HIGH_PERFORMANCE — F16 accumulator, fastest, risky for 60-block DiT
+        // Historically this was `(ne[1] == 1) ? 0 : 2`; `2` is out-of-spec (vendor
+        // headers document only 0/1) and silently degrades precision on 910B. The
+        // decode path (ne[1]==1, i.e. single-query) still uses 0. For prefill /
+        // diffusion attention we default to 1 (perf) but promote to 0 when the op
+        // is tagged with GGML_PREC_F32 (or env GGML_CANN_FORCE_F32_PREC=1) —
+        // matching the CUDA/Vulkan precedent for stable-diffusion.cpp's kq softmax.
+        const bool fa_prec_f32     = ggml_cann_prec_is_f32(dst);
+        int64_t innerPrecise       = (src0->ne[1] == 1 || fa_prec_f32) ? 0 : 1;
         int64_t blockSize          = 0;
         int64_t antiquantMode      = 0;
         bool    softmaxLseFlag     = false;

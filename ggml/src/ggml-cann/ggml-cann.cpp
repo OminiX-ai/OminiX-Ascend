@@ -134,6 +134,45 @@ int parse_integer(const std::string & value) {
 }
 
 /**
+ * @brief Read the per-op `GGML_PREC_F32` hint for matmul / flash-attention
+ *        operators, with an env override (`GGML_CANN_FORCE_F32_PREC=1`) for
+ *        debugging / measurement. Returns true iff the op (or the env knob)
+ *        requests F32-precision accumulation.
+ *
+ * The hint slot differs by op:
+ *   - MUL_MAT, MUL_MAT_ID → op_params[0]
+ *   - FLASH_ATTN_EXT     → op_params[3]
+ * Other ops don't ship precision hints through op_params; for them the reader
+ * falls back to the env override only.
+ *
+ * The env override is evaluated once on first call and cached, matching the
+ * pattern used by the other CANN tuning knobs (WEIGHT_NZ, QUANT_BF16, …).
+ */
+bool ggml_cann_prec_is_f32(const ggml_tensor * dst) {
+    static const bool force_f32_env =
+        parse_bool(get_env_as_lowercase("GGML_CANN_FORCE_F32_PREC").value_or(""));
+    if (force_f32_env) {
+        return true;
+    }
+    if (dst == nullptr) {
+        return false;
+    }
+    int32_t prec_i32 = 0;
+    switch (dst->op) {
+        case GGML_OP_MUL_MAT:
+        case GGML_OP_MUL_MAT_ID:
+            prec_i32 = dst->op_params[0];
+            break;
+        case GGML_OP_FLASH_ATTN_EXT:
+            prec_i32 = dst->op_params[3];
+            break;
+        default:
+            return false;
+    }
+    return static_cast<enum ggml_prec>(prec_i32) == GGML_PREC_F32;
+}
+
+/**
  * @brief Initialize the CANN device information.
  *
  * This function initializes the CANN device information by obtaining the
