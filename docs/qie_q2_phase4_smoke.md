@@ -423,10 +423,89 @@ Probe-side:
 
 ---
 
-## §4. Phase 4.4 — Q4-resident forward dispatch (pending)
+## §4. Phase 4.4 — Real Q4_0 GGUF + single forward (probe built, awaiting ac03 run)
 
-Not yet started. Replace F16 fallback matmul path with real Q4_0 WQBMMv3
-dispatch. Gate: no NaN, reasonable numerics, same output shape.
+### §4.1 Gate recap
+
+Scope (per AGENT_HANDOFF / PM workplan): wire the real
+`Qwen-Image-Edit-2509-Q4_0.gguf` through `init_from_gguf` and fire a
+**single** `forward_all_blocks_test` against the production weights to
+confirm the Q2.1-landed Q4-resident load path produces a forward pass
+that doesn't NaN when the matmul-weight pointers are (W4-packed,
+per-group-32 F16 scale) pairs or F16-fallback blobs (instead of the
+synthetic F16-only aliases Phases 4.2/4.3 used).
+
+Gate:
+
+- GREEN — `init_from_gguf` returns true, single 60-block forward
+  completes, output has `nan_count == 0 && inf_count == 0 && std > 0.001`.
+- YELLOW — load OK, forward completes without crash but numerics are off
+  (e.g. `std < 0.001`).
+- RED — load fails, OOMs, or forward returns false / crashes.
+
+Non-gating but tracked: peak init HBM must reproduce the Q2.1 projection
+(~17-18 GiB) and stay under the §Q1.10 18 GiB contract gate.
+
+### §4.2 Probe
+
+- Source: `tools/probes/qie_q44_real_gguf_smoke/test_qie_q44_real_gguf_smoke.cpp`
+- Build recipe: `tools/probes/qie_q44_real_gguf_smoke/build_and_run.sh`
+- GGUF: `/home/ma-user/work/qie_weights/Qwen-Image-Edit-2509-Q4_0.gguf`
+  (overridable via `QIE_Q44_GGUF`)
+- Env: `GGML_CANN_QUANT_BF16=on` (baked into script default; Q2.1 recipe)
+- Forward shape: `img_seq=64, txt_seq=32` (matches Phase 4.2/4.3 smoke;
+  production seq=4352 is Phase 4.5 scope).
+- Config `max_img_seq=4096, max_txt_seq=256` — engine scratch sizing
+  matches the Q2.1 ≤18 GiB receipts (the forward's runtime seq is cut
+  separately).
+
+### §4.3 Launch recipe (SIGHUP-proof, HBM lock held)
+
+```
+nohup setsid bash -c 'touch /tmp/ac03_hbm_lock && \
+    cd ~/work/OminiX-Ascend/tools/probes/qie_q44_real_gguf_smoke && \
+    GGML_BUILD=$HOME/work/OminiX-Ascend/build-w1 \
+    GGML_CANN_QUANT_BF16=on \
+    bash build_and_run.sh 2>&1 | tee /tmp/q44_smoke.log; \
+    rm -f /tmp/ac03_hbm_lock; echo EXITCODE=$?' \
+    < /dev/null > /dev/null 2>&1 &
+```
+
+Expected EXITCODE: 0 (GREEN) / 2 (RED) / 3 (YELLOW, no NaN but std gate miss).
+
+### §4.4 Result
+
+_Pending ac03 dispatch. Fill in after `/tmp/q44_smoke.log` lands; see
+`docs/_qie_q44_smoke_v1.log` for the verbatim capture._
+
+Expected receipts per Q2.1 projection (`docs/qie_q21_smoke.md`):
+
+| Field | Q2.1 smoke | Phase 4.4 expected |
+|---|---|---|
+| tensors_uploaded | 1933 | 1933 |
+| q4_tensors | 696 | 696 |
+| q4_weight_bytes | 7.14 GiB | 7.14 GiB |
+| q4_scale_bytes | 0.89 GiB | 0.89 GiB |
+| f16_fallback_tensors | 150 | 150 |
+| f16_weight_bytes | 9.51 GiB | 9.51 GiB |
+| Peak init HBM | 17.74 GiB | ≈ 17-18 GiB |
+
+Forward-wall expectation (from Phase 4.2 at same seq): ~1.4 s for one
+60-block pass with synthetic F16 weights. Real Q4 path should be in the
+same order of magnitude — `dispatch_matmul_` already branches on
+`weight_scale != nullptr` (WQBMMv3) vs null (aclnnMm F16 fallback) so
+neither routing is new work; Phase 4.4 only validates the dispatch runs
+against *real* weight payloads.
+
+### §4.5 Known caveats carried into Phase 4.5
+
+- Single forward only — no Euler loop on real weights (Phase 4.5 scope).
+  Q1 NaN history at >2 steps / 512×512 is the reason; Phase 4.4
+  intentionally stops short of re-exercising that failure mode.
+- No ref-image latent conditioning, no VAE, no text encoder — dummy
+  random activations exercise the DiT forward in isolation.
+- 150 F16-fallback tensors still consume 9.51 GiB; shrinking that is a
+  Q2.2 / Q2.5 concern, not Phase 4.4.
 
 ---
 
