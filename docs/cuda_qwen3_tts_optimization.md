@@ -147,3 +147,254 @@ TensorRT-LLM follow-up before Phase 2:
    wheel.
 3. Re-run import smoke and a minimal Qwen/Qwen2 builder smoke before investing
    in Qwen3-TTS graph conversion.
+
+## Phase 2 - vLLM Pivot
+
+Date: 2026-04-25 America/Los_Angeles
+
+Status: **YELLOW/GREEN**
+
+The TRT-LLM path remains blocked on PyTorch internal ABI mismatches, so Phase 2
+pivoted to vLLM 0.19.1. vLLM can load and serve the Talker GGUF through a
+derived Qwen3 HF config, and CUDA graph mode reaches llama.cpp-class raw decode
+throughput on GB10. Full end-to-end TTS fps is still pending because the
+current local asset bundle has the decoder ONNX and GGUF assets, but no ready
+Python runner or complete ONNX encoder/speaker-encoder path to wire Talker
+tokens into audio.
+
+### Setup Fixes
+
+- `vllm==0.19.1` imported only after adding CUDA 12 runtime libraries inside
+  `.venv_vllm`:
+  `pip install nvidia-cuda-runtime-cu12`
+- Runtime library path used for vLLM:
+  `LD_LIBRARY_PATH=.venv_vllm/.../torch/lib:.venv_vllm/.../nvidia/cuda_runtime/lib:.venv_vllm/.../nvidia/cu13/lib`
+- Torch/Triton helper compilation needed Python development headers. `sudo`
+  was not available non-interactively, so headers were extracted into:
+  `/home/user1/qwen3_tts_cuda/sysroot/python312-dev`
+- Compile path uses:
+  `CPATH=/home/user1/qwen3_tts_cuda/sysroot/python312-dev/usr/include:/home/user1/qwen3_tts_cuda/sysroot/python312-dev/usr/include/python3.12`
+
+### Model Loading Path
+
+Direct GGUF loading failed because the Talker GGUF reports architecture
+`qwen3vl`, which vLLM/Transformers did not accept from GGUF metadata:
+
+```text
+ValueError: GGUF model with architecture qwen3vl is not supported yet.
+```
+
+The official HF config for `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` uses a
+Qwen3-TTS model type rather than a plain vLLM-supported Qwen3 CausalLM config,
+so the run used a derived HF config for the GGUF Talker:
+
+- Config path:
+  `/home/user1/qwen3_tts_cuda/vllm_hf/qwen3_tts_talker_gguf_config/config.json`
+- Shape:
+  `vocab_size=3072`, `hidden_size=2048`, `intermediate_size=6144`,
+  `num_hidden_layers=28`, `num_attention_heads=16`,
+  `num_key_value_heads=8`, `head_dim=128`,
+  `max_position_embeddings=32768`, `rope_theta=1000000.0`
+- Architecture override: `Qwen3ForCausalLM`
+
+vLLM's early speculator probe still tried to parse the GGUF before
+`--hf-config-path` was applied, so the CLI entrypoint is wrapped by:
+
+```text
+/home/user1/qwen3_tts_cuda/scripts/vllm_qwen3_tts_cli.py
+```
+
+This wrapper skips the early speculator probe and then delegates to vLLM's
+normal CLI. The model must be driven with raw Talker token IDs. Text tokenizer
+IDs are invalid for this 3072-token audio-code vocabulary; for example,
+`"Hello"` encodes to token ID `9707`, which is out of range for the Talker
+embedding table.
+
+### Serve Commands
+
+CUDA graph FP16 server:
+
+```bash
+V=/home/user1/qwen3_tts_cuda/.venv_vllm
+SYS=/home/user1/qwen3_tts_cuda/sysroot/python312-dev/usr/include
+. "$V/bin/activate"
+export LD_LIBRARY_PATH="$V/lib/python3.12/site-packages/torch/lib:$V/lib/python3.12/site-packages/nvidia/cuda_runtime/lib:$V/lib/python3.12/site-packages/nvidia/cu13/lib:${LD_LIBRARY_PATH:-}"
+export CPATH="$SYS:$SYS/python3.12:${CPATH:-}"
+export VLLM_NO_USAGE_STATS=1
+
+python /home/user1/qwen3_tts_cuda/scripts/vllm_qwen3_tts_cli.py serve \
+  /home/user1/qwen3_tts_cuda/models/cgisky-qwen3-tts-custom-gguf/gguf_q8_0/qwen3_tts_talker.gguf \
+  --served-model-name qwen3-tts-talker \
+  --host 127.0.0.1 \
+  --port 18000 \
+  --hf-config-path /home/user1/qwen3_tts_cuda/vllm_hf/qwen3_tts_talker_gguf_config \
+  --skip-tokenizer-init \
+  --trust-remote-code \
+  --dtype float16 \
+  --max-model-len 512 \
+  --max-num-seqs 1 \
+  --max-num-batched-tokens 512 \
+  --gpu-memory-utilization 0.50
+```
+
+FP8 KV cache variant adds:
+
+```bash
+--kv-cache-dtype fp8
+```
+
+Eager control adds:
+
+```bash
+--enforce-eager
+```
+
+API smoke request:
+
+```json
+{
+  "model": "qwen3-tts-talker",
+  "prompt": [1],
+  "max_tokens": 16,
+  "temperature": 0,
+  "stop_token_ids": [],
+  "return_token_ids": true
+}
+```
+
+Smoke output token IDs:
+
+```text
+[2157, 2150, 498, 498, 498, 498, 1311, 1489, 1489, 1489, 1489, 1247, 999, 613, 613, 613]
+```
+
+### Talker Microbenchmarks
+
+Benchmark script:
+
+```text
+/home/user1/qwen3_tts_cuda/scripts/vllm_qwen3_tts_api_bench.py
+```
+
+Raw-token benchmark settings:
+
+- Prompt token IDs: `[1]`
+- Decode length: 128 tokens for throughput
+- Streaming probe: 64 tokens
+- `temperature=0`
+- `ignore_eos=True`
+- `stop_token_ids=[]`
+- `return_token_ids=True`
+- `max_num_seqs=1`
+- `max_num_batched_tokens=512`
+
+These are Talker-token API measurements, not complete audio synthesis fps.
+
+| Path | Mean decode | Warm stream TTFT | Notes |
+| --- | ---: | ---: | --- |
+| llama.cpp Q8_0 CUDA baseline | 132.916 tok/s | n/a | Phase 1 smoke, `n_gen=16` |
+| vLLM eager FP16 GGUF | 110.03 tok/s | 49.99 ms | Control path, no CUDA graphs |
+| vLLM CUDA graph FP16 GGUF | 131.78 tok/s | 31.69 ms | 99.1% of llama.cpp baseline |
+| vLLM CUDA graph + FP8 KV | 130.95 tok/s | 11.80 ms | 98.5% of llama.cpp baseline |
+| Ascend shipping reference | 32.2 fps | n/a | Full TTS reference, not token-only |
+| MLX equivalent | not measured | n/a | No equivalent run available |
+
+Best current vLLM Talker result:
+
+```text
+vLLM graph FP16: 131.78 tok/s
+vs llama.cpp baseline: 132.916 tok/s
+vs vLLM eager: +19.8%
+vs Ascend 32.2 fps reference: about 4.1x if compared only as raw Talker token rate
+```
+
+The Ascend comparison is directional only until the codec path is wired and
+measured as real synthesized-audio fps.
+
+### Memory / Compile Receipts
+
+Eager FP16 server log:
+
+```text
+/home/user1/qwen3_tts_cuda/logs/vllm_serve_talker_eager_18000.log
+```
+
+- Model loading: 1.43 GiB, 0.805 s
+- Available KV cache memory: 56.77 GiB
+- GPU KV cache size: 531,488 tokens
+- Engine init: 2.98 s
+
+CUDA graph FP16 server log:
+
+```text
+/home/user1/qwen3_tts_cuda/logs/vllm_serve_talker_graph_18000.log
+```
+
+- Model loading: 1.43 GiB, 0.840 s
+- `torch.compile`: 13.18 s
+- Estimated CUDA graph memory: 0.07 GiB
+- Available KV cache memory: 56.41 GiB
+- GPU KV cache size: 528,144 tokens
+- Engine init: 17.98 s
+
+CUDA graph + FP8 KV server log:
+
+```text
+/home/user1/qwen3_tts_cuda/logs/vllm_serve_talker_graph_kvfp8_18000.log
+```
+
+- Attention backend: FLASHINFER
+- Model loading: 1.43 GiB, 0.849 s
+- `torch.compile`: 4.61 s, with compile-cache reuse
+- Estimated CUDA graph memory: 2.35 GiB
+- Available KV cache memory: 54.78 GiB
+- GPU KV cache size: 1,025,680 tokens
+- Engine init: 23.17 s
+- Saved benchmark JSON:
+  `/home/user1/qwen3_tts_cuda/logs/vllm_talker_graph_kvfp8_api_bench.json`
+
+FP8 KV nearly doubles KV capacity versus FP16 KV at this sequence cap
+(`1,025,680 / 528,144 = 1.94x`) but did not improve single-stream throughput
+for the 128-token decode probe.
+
+### Lever Delta
+
+| Lever | Result |
+| --- | --- |
+| CUDA 12 runtime in vLLM venv | Unblocked vLLM import against `libcudart.so.12` |
+| User-space Python headers | Unblocked Triton/Inductor helper builds |
+| Derived Qwen3 HF config | Unblocked GGUF model load despite `qwen3vl` GGUF architecture tag |
+| Raw prompt token IDs | Avoided out-of-range tokenizer IDs for Talker vocab |
+| CUDA graphs / vLLM compile | 110.03 -> 131.78 tok/s, +19.8% |
+| FP8 KV cache | 528k -> 1.026M KV tokens, no speed gain in single stream |
+| FP8 weights | Not applied; current checkpoint is GGUF Q8_0 and vLLM reports `quantization=gguf` |
+| Single-stream batch tuning | `max_num_seqs=1`, `max_num_batched_tokens=512`, `max_model_len=512` |
+
+### Codec Wiring Status
+
+The intended low-latency path is:
+
+```text
+vLLM token stream -> audio-code token buffer -> codec decoder on GPU -> audio
+```
+
+The vLLM side is ready: `/v1/completions` accepts list-of-int prompts and can
+stream generated token IDs. The codec side was not completed in this Phase 2
+run because the available local bundle contains `qwen3_tts_decoder.onnx` plus
+GGUF assets, but no ready Qwen3-TTS pipeline runner was present, and the model
+card's broader ONNX encoder/speaker-encoder layout was not present in the
+downloaded files. Next work is to fetch the complete official HF asset set or
+implement the bridge from `qwen3_assets.gguf`/predictor output into the ONNX
+decoder input contract.
+
+### Next Measurements
+
+To close Phase 2 as an end-to-end TTS result:
+
+1. Fetch or reconstruct the complete codec path.
+2. Use a canonical prompt and reference speaker audio.
+3. Record total synthesis wall time, first-token latency, first-audio latency,
+   steady-state audio fps, Talker decode tok/s, and peak GPU memory.
+4. Compare complete TTS fps against Ascend 32.2 fps and any available MLX
+   result. Keep the current 131.78 tok/s Talker number as a raw-token ceiling,
+   not as an audio fps claim.
