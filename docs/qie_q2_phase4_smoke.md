@@ -2149,3 +2149,83 @@ native is consistently 10×+ off, walk back through QKV → modulation
 The `qie_step0_pre_blocks_img_res.f32.bin` host dump already shows a
 sane post-img_in residual (max_abs 16) — so img_in itself is fine;
 the leak is somewhere inside the 60-block loop.
+
+### §5.5.7 Step 4g — AdaLN modulation chunk-order swap (candidate 3 confirmed by source audit)
+
+Mission (Q2.4.5.4g): land the AdaLN modulation fix from §5.5.6
+candidate (3). Source audit of `forward_block_` vs the CPU reference
+caught a **shift / scale label swap** in the 6-way chunk of
+`img_mod.1(silu(t_emb))` and `txt_mod.1(silu(t_emb))`.
+
+**CPU reference** (`tools/ominix_diffusion/src/qwen_image.hpp:230-234,
+280-326`) splits the modulation linear output (shape `[B, 6·H]`) into
+six chunks along axis 0 and consumes:
+
+| chunk | role         | consumer                                |
+|-------|--------------|-----------------------------------------|
+| 0     | `shift_msa`  | 3rd arg of `Flux::modulate(x, shift, scale)` (first half) |
+| 1     | `scale_msa`  | 4th arg of `Flux::modulate` (first half)|
+| 2     | `gate_msa`   | gate1 — multiplied into attn residual   |
+| 3     | `shift_mlp`  | `Flux::modulate` shift (second half)    |
+| 4     | `scale_mlp`  | `Flux::modulate` scale (second half)    |
+| 5     | `gate_mlp`   | gate2 — multiplied into mlp residual    |
+
+`Flux::modulate(x, shift, scale)` is `x = x*(1+scale) + shift`
+(`tools/ominix_diffusion/src/flux.hpp:233-248`). The same chunk ordering
+appears in MMDiT (`tools/ominix_diffusion/src/mmdit.hpp:291-296`) — it is
+the canonical Diffusers ordering for AdaLN-Zero modulation heads.
+
+**Pre-fix native engine** (`image_diffusion_engine.cpp:3204-3221`,
+HEAD `7d15f3ce`) labelled `chunk(0)→scale1, chunk(1)→shift1,
+chunk(3)→scale2, chunk(4)→shift2`, then called
+`modulate_(x, scale1, shift1, ...)` (signature
+`modulate_(x, scale, shift, ...)` at `:1909-1981` — same semantics:
+`x = x*(1+scale) + shift`). Net effect: `chunk(0)` was being used as
+`(1+scale)` (i.e. multiplied into `LN(x)`), but `chunk(0)` is in fact
+trained as `shift_msa`. The trained `shift_msa` distribution has
+larger magnitudes than `scale_msa` (the model is initialised so
+`scale_msa ≈ 0` keeps the modulation near-identity at init); using
+`shift_msa` as `(1+scale)` therefore inflates the post-modulate
+activations every block. Compounded across 60 blocks this is the
+source of the systemic 14× magnitude amplification and
+post-block per-token cossim 0.999 collapse.
+
+**Fix (Q2.4.5.4g):** rewrite the chunk labels in `forward_block_`
+(both img and txt sides) to:
+
+```
+chunk[0] → shiftN, chunk[1] → scaleN, chunk[2] → gateN  (first half)
+chunk[3] → shiftN, chunk[4] → scaleN, chunk[5] → gateN  (second half)
+```
+
+`modulate_()` call sites stay byte-identical (same arg order
+`(scaleN, shiftN)`); only the pointer-to-chunk binding changes. Gate
+chunk indices (2 and 5) were already correct.
+
+**Verification probe (env-gated):** `QIE_DEBUG_DUMP_GATES=1` triggers
+twelve `intra_probe` lines on the first block-0 step-0 invocation
+(co-gated with `QIE_DEBUG_INTRA_BLOCK0=1`), printing per-chunk mean_abs
+for img_shift1/scale1/gate1/shift2/scale2/gate2 and the txt analogues.
+Expected ranges on healthy Q4 weights: `scale*` mean_abs ≈ 0.05-0.2
+(values clustered near 0), `shift*` ≈ 0.1-0.5, `gate*` ≈ 0.01-0.1.
+If `scale*` magnitudes look like the previous-known `shift*` range
+(or vice-versa), the chunk binding is still wrong and needs
+re-permutation.
+
+**Smoke gate:** re-run §5.5.5 Step 4 probe + VAE decode. Eye-check
+versus codex CUDA reference at `/tmp/phase1_baseline_1024_20step.png`.
+Expected: post-block per-token cossim drops back below ~0.1 (Step 4f
+measured 0.027 at the **pre**-block stage on healthy noise; native
+post-blocks should land at the same order of magnitude). Final
+out-latent std should fall from 4.86 to O(0.3-1) (reference is 0.36).
+Numerical gate (Step 1 cos_sim=1.0 path) stays GREEN with all env
+vars unset — the only logic change is the chunk-pointer binding,
+which is invariant of the synthetic identity weights used in Step 1.
+
+**Fallback (if §5.5.7 doesn't fully close the gap):** start from
+§5.5.6 candidate (1) (attention softmax saturation) — instrument
+softmax max/min in `aclnnFusedInferAttentionScoreV2` via the
+`QIE_DEBUG_INTRA_BLOCK0=1` log path (look for the `12_*_attn_out`
+intra_probe magnitudes already wired). Or candidate (2) (Q4_0 weight
+scale mishandling) — diff `dispatch_matmul_` output of img_mod.1 at
+block 0 between native and the CPU reference engine.

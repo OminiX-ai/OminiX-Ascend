@@ -3201,24 +3201,67 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
                 (uint8_t *)scratch_mod_dev_ + (size_t)6 * H * sizeof(uint16_t),
                 6 * H, true);
 
-    // Chunk pointers (6 × H each) — scale1, shift1, gate1, scale2, shift2, gate2.
+    // Chunk pointers (6 × H each).
+    // Q2.4.5.4g — chunk order MUST match the CPU reference
+    // (tools/ominix_diffusion/src/qwen_image.hpp::QwenImageTransformerBlock).
+    // The reference splits img_mod_1(silu(t_emb)) into 6 chunks along axis 0
+    // and consumes them as:
+    //   chunk[0] → shift_msa  (first  Flux::modulate "shift")
+    //   chunk[1] → scale_msa  (first  Flux::modulate "scale")
+    //   chunk[2] → gate_msa   (gate1, applied to attn_out)
+    //   chunk[3] → shift_mlp  (second Flux::modulate "shift")
+    //   chunk[4] → scale_mlp  (second Flux::modulate "scale")
+    //   chunk[5] → gate_mlp   (gate2, applied to mlp_out)
+    // The pre-Q2.4.5.4g native code mislabelled chunk[0] as "scale1" and
+    // chunk[1] as "shift1" (likewise 3↔4) which fed the wrong tensors into
+    // modulate_() — the trained network's `shift` was scaling the
+    // post-LN activations through `(1+shift)`, producing systemic
+    // amplification across all 60 blocks (~14× growth measured in §5.5.6
+    // bisect, post-block cossim 0.999 mode collapse). Labels below now
+    // match the reference; modulate_() signature is `(x, scale, shift)`
+    // so call sites pass `scaleN, shiftN` in that order.
     auto mod_chunk = [&](void *base, int which) {
         return (uint8_t *)base + (size_t)which * H * sizeof(uint16_t);
     };
-    void *img_scale1 = mod_chunk(scratch_mod_dev_, 0);
-    void *img_shift1 = mod_chunk(scratch_mod_dev_, 1);
+    void *img_shift1 = mod_chunk(scratch_mod_dev_, 0);
+    void *img_scale1 = mod_chunk(scratch_mod_dev_, 1);
     void *img_gate1  = mod_chunk(scratch_mod_dev_, 2);
-    void *img_scale2 = mod_chunk(scratch_mod_dev_, 3);
-    void *img_shift2 = mod_chunk(scratch_mod_dev_, 4);
+    void *img_shift2 = mod_chunk(scratch_mod_dev_, 3);
+    void *img_scale2 = mod_chunk(scratch_mod_dev_, 4);
     void *img_gate2  = mod_chunk(scratch_mod_dev_, 5);
     void *txt_base   = (uint8_t *)scratch_mod_dev_ +
                        (size_t)6 * H * sizeof(uint16_t);
-    void *txt_scale1 = mod_chunk(txt_base, 0);
-    void *txt_shift1 = mod_chunk(txt_base, 1);
+    void *txt_shift1 = mod_chunk(txt_base, 0);
+    void *txt_scale1 = mod_chunk(txt_base, 1);
     void *txt_gate1  = mod_chunk(txt_base, 2);
-    void *txt_scale2 = mod_chunk(txt_base, 3);
-    void *txt_shift2 = mod_chunk(txt_base, 4);
+    void *txt_shift2 = mod_chunk(txt_base, 3);
+    void *txt_scale2 = mod_chunk(txt_base, 4);
     void *txt_gate2  = mod_chunk(txt_base, 5);
+
+    // Q2.4.5.4g — env-gated gate / scale / shift dump for first-block
+    // verification. Triggers ONCE per process on the very first block-0
+    // step-0 invocation (do_intra). Compares mean_abs of all six chunks
+    // against the expected ranges (gates ~0.01-0.1, scale ~0.05, shift
+    // ~0.1) to confirm the chunk assignment is correct on real Q4 weights.
+    static int s_dump_gates = -1;
+    if (s_dump_gates < 0) {
+        const char *v = std::getenv("QIE_DEBUG_DUMP_GATES");
+        s_dump_gates = (v && *v && *v != '0') ? 1 : 0;
+    }
+    if (s_dump_gates && do_intra) {
+        intra_probe("MOD_chunk0_shift1", img_shift1, H, true);
+        intra_probe("MOD_chunk1_scale1", img_scale1, H, true);
+        intra_probe("MOD_chunk2_gate1",  img_gate1,  H, true);
+        intra_probe("MOD_chunk3_shift2", img_shift2, H, true);
+        intra_probe("MOD_chunk4_scale2", img_scale2, H, true);
+        intra_probe("MOD_chunk5_gate2",  img_gate2,  H, true);
+        intra_probe("MOD_txt_chunk0_shift1", txt_shift1, H, true);
+        intra_probe("MOD_txt_chunk1_scale1", txt_scale1, H, true);
+        intra_probe("MOD_txt_chunk2_gate1",  txt_gate1,  H, true);
+        intra_probe("MOD_txt_chunk3_shift2", txt_shift2, H, true);
+        intra_probe("MOD_txt_chunk4_scale2", txt_scale2, H, true);
+        intra_probe("MOD_txt_chunk5_gate2",  txt_gate2,  H, true);
+    }
 
     // ------------------------------------------------------------------
     // 2. LayerNorm1 on img + txt, then modulate(scale1, shift1).
