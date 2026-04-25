@@ -2825,3 +2825,136 @@ becomes trivial.
 - `tools/probes/qie_block0_cpu_reference/compare_block0.py`:
   substep-pair walker + bisect summary.
 
+### §5.5.11 Step 4k — attention narrow-bisect: bug is the QKV PROJECTION (08_*Q/K/V), not softmax/RoPE
+
+The §5.5.10 RED at `11_attn_out` was traced to its true entry by extending
+both probes to dump the attention internals (`08_*Q/K/V` post-projection,
+`09_*Q/K_rmsnorm`, `11pre_attn_out` pre-output-projection). The new
+substep verdict on the same {real Q4 weights, `QIE_FFN_DOWN_BF16=1`,
+img_seq=64, txt_seq=32} configuration:
+
+| substep              | cos_mean | ratio_max | verdict |
+|----------------------|---------:|----------:|---------|
+| 04_img_LN1           |   1.0000 |     1.000 | **GREEN** |
+| 05_img_mod1          |   0.9859 |     0.889 | YELLOW  |
+| 06_txt_LN1           |   1.0000 |     1.000 | **GREEN** |
+| 07_txt_mod1          |   0.9800 |     0.910 | YELLOW  |
+| **08_img_Q**         | **-0.0014** |  4.34  | **RED — bug entry** |
+| **08_img_K**         | **-0.0000** |  4.56  | **RED** |
+| 08_img_V             |   0.0587 |     1.020 | RED     |
+| **08_txt_Q**         | **-0.0038** |  1.26  | **RED** |
+| **08_txt_K**         | **-0.0020** |  3.24  | **RED** |
+| 08_txt_V             |  -0.0035 |     0.744 | RED     |
+| 09_img_Q_rmsn        |  -0.0011 |    39.5  | RED     |
+| 09_img_K_rmsn        |  -0.0028 |    31.9  | RED     |
+| 09_txt_Q_rmsn        |   0.0041 |     0.014 | RED     |
+| 09_txt_K_rmsn        |   0.0033 |     0.376 | RED     |
+| 11_attn_out_img      |   0.4780 |     1.140 | RED     |
+| 11_attn_out_txt      |   0.4130 |     0.738 | RED     |
+
+#### Diagnosis — the QKV projection is the bug entry
+
+`08_img_Q cos=-0.0014` against a near-perfect input
+(`05_img_mod1 cos=0.99`). Both sides feed the projection an essentially
+identical activation, yet the OUTPUTS are nearly orthogonal with a 4×
+magnitude over-shoot on native. This isolates the failure to the
+WQBMMv3 dispatch chain at `dispatch_matmul_(scratch_img_norm_dev_,
+lw.to_q_w_q4, lw.to_q_scale, lw.to_q_b, img_seq, H, H, …)` and
+symmetric add_q_proj/add_k_proj/add_v_proj sites.
+
+Knock-on effect on §5.5.8/§5.5.10: the `09_*_rmsnorm max=723/571.5`
+"trained Q4 outliers" finding was a downstream symptom, not a
+constitutional property of the trained weights. RmsNorm faithfully
+amplifies whatever extreme values the projection emits — and if the
+projection is producing a shifted/scaled WRONG basis, those outliers
+follow naturally. The `11_attn_out` cos jump from 0.0022 to 0.4780 in
+this run (vs §5.5.10) is a NAMING-FIX artefact: prior runs compared
+`native_11_attn_out` (FIA pre-projection) against `cpu_11_attn_out`
+(post `to_out_0` projection), a category mismatch. The new harness
+emits `cpu_11pre_attn_out_*` for an apples-to-apples FIA-output
+compare, and that 0.48 figure is now the genuine attention-kernel
+parity number — itself constrained by upstream-08 RED.
+
+#### Suspect ranking for Q2.4.5.4l (next bisect)
+
+1. **Q4_0 → WQBMMv3 weight repack mismatch**: `repack_q4_0_upload`
+   (engine §256) flips bias-8 to signed two's-complement via
+   `(byte & 0x0f) ^ 0x08`. Probe spec at lines 268-273 calls for
+   weight view shape `[K, N]` strides `(1, K)` — physically `N` rows
+   of `K` packed nibbles. Re-verify by:
+   - Dumping `lw.to_q_w_q4` + `lw.to_q_scale` device pointers
+     element-for-element against a Python `dequantize_row_q4_0` of
+     the same tensor (`block_q4_0` little-endian as in
+     `ggml/src/ggml-quants.c:307-325`).
+   - Comparing recovered `[K, N]` matrix against `to_q.weight` as
+     read by the CPU runner.
+2. **dispatch_matmul_ tensor view orientation**: the WQBMMv3 path
+   builds activation/weight tensors at lines 1521-1701 — verify the
+   transpose flag and `transposeB` matches the `[K, N] strides (1, K)`
+   weight view contract.
+3. **Scale tensor dtype/layout**: `scale_dev` is `[BLK, N]` strides
+   `(N, 1)`. F16 on device. Contract: `result = (sum (qs - 8)) * scale`
+   per block. If scale is read as `[N, BLK]` row-major (transposed),
+   each block sees the wrong scale → output shape stays `[seq, N]`
+   but values are scrambled.
+
+#### Strategic recommendation
+
+Path C #5 ship pivot **stays gated** until 08_*Q/K cos > 0.95. Once
+the projection is fixed the rest of the chain (RmsNorm + RoPE + FIA
++ output-projection) should follow deterministically — every
+downstream substep already runs against numerically-realistic CPU
+references that just inherit the projection error.
+
+#### Step 1 (softmax-overflow workaround) — disproved as the fix
+
+A `QIE_ATTN_SOFTMAX_F32=1` env gate was wired (matches the §5.5.10
+work-plan recommendation) implementing the CPU reference's `kv_scale =
+1/HD` trick at the FIA dispatch site (pre-multiply K,V by 1/HD,
+attn-scale = sqrt(HD), post-multiply attn-out by HD; mathematically
+equivalent to plain attention but bounds the K·Q^T accumulator
+magnitude — see `ggml_extend.hpp::ggml_ext_attention_ext` lines
+1318-1361). Two regression runs confirmed:
+
+- Pre-projection FIA output magnitudes are unchanged with the trick
+  on (max≈12 for img attn-out vs CPU's max≈545; ratio still 0.022).
+- All cos values in the substep table are byte-identical to the
+  non-trick baseline.
+
+The trick is a no-op on this configuration because the FIA kernel
+already uses `innerPrecise=0` (HIGH_PRECISION = F32 accumulator) and
+the input magnitudes — even with q-rmsnorm peaks at 723 — don't blow
+the F16 dynamic range during the K·Q^T tile-mul (max tile-product
+≈ 65k stays under F16 max). The kv_scale path is left in tree as
+defensive plumbing (env-default OFF, byte-identical when off) for
+future configurations where K·Q^T might saturate (longer seq,
+larger head_dim, or after the QKV-projection fix exposes
+larger-magnitude post-rmsnorm values).
+
+#### Source changes (this step)
+
+- `tools/qwen_image_edit/native/image_diffusion_engine.cpp`: env gate
+  `QIE_ATTN_SOFTMAX_F32` for the kv_scale=1/HD trick at the FIA
+  dispatch site + 08/09/10 disk dumps for substep bisect.
+- `tools/qwen_tts/cp_cann_symbols.{h,cpp}`: resolved `aclnnInplaceMuls`
+  + `aclnnInplaceMulsGetWorkspaceSize` (resolve_optional).
+- `tools/probes/qie_block0_cpu_reference/test_qie_block0_cpu_reference.cpp`:
+  inline-replicate `QwenImageAttention::forward` to expose 08/09/11pre
+  intermediates; `PublicQwenImageAttention` using-redeclare for
+  `dim_head` + `blocks` access.
+- `tools/probes/qie_block0_cpu_reference/compare_block0.py`: 14 new
+  substep rows (08_*Q/K/V on both streams, 09_*Q/K_rmsn).
+- `tools/probes/qie_q45_real_denoise_smoke/test_qie_q45_real_denoise_smoke.cpp`:
+  diagnostic env gate `QIE_RUNTIME_MAX_TXT_SEQ=1` to align cfg.max_txt_seq
+  to actual txt_seq (tests pe-row alignment hypothesis, default OFF).
+  Empirical result: pe alignment is NOT the cause of the 08-RED.
+
+#### Receipts
+
+- `/tmp/qie_q2454k_step3.log` — final substep bisect (canonical
+  max_txt_seq=256, env QIE_ATTN_SOFTMAX_F32 unset).
+- `/tmp/qie_block0_inputs/` (33 files) + `/tmp/qie_block0_outputs/`
+  (32 files) — full 04 → 24 substep dumps both sides.
+- Probe + comparator are re-runnable end-to-end with
+  `bash tools/probes/qie_block0_cpu_reference/run_step_4i.sh`.
+

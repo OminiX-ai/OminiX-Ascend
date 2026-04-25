@@ -211,6 +211,23 @@ int main(int /*argc*/, char ** /*argv*/) {
     if (const char *e = std::getenv("QIE_Q45_IMG_SEQ"))  img_seq = std::atoi(e);
     if (const char *e = std::getenv("QIE_Q45_TXT_SEQ"))  txt_seq = std::atoi(e);
 
+    // Q2.4.5.4k diagnostic knob: align cfg.max_txt_seq to actual txt_seq so
+    // the pre-built RoPE pe table places img positions at row=txt_seq
+    // (matching the CPU reference's gen_qwen_image_pe(context_len=txt_seq)
+    // layout). The native engine builds pe with img rows offset by
+    // max_txt_seq=256 vs CPU's offset by txt_seq=32 — a layout-mismatch
+    // candidate cause for the §5.5.10 attn_out cos=0.002 RED.
+    //
+    // Empirical result (this run): the override does NOT move 11_attn_out
+    // cos — the divergence enters elsewhere (suspected: a deeper layout or
+    // weight-loading discrepancy rather than pe-row alignment). Kept as an
+    // env-gated diagnostic. Opt in via QIE_RUNTIME_MAX_TXT_SEQ=1 to test
+    // pe alignment hypotheses; default OFF preserves Phase 4.4d behaviour.
+    bool runtime_max_txt = false;
+    if (const char *e = std::getenv("QIE_RUNTIME_MAX_TXT_SEQ"))
+        runtime_max_txt = (e[0] != '0');
+    if (runtime_max_txt) cfg.max_txt_seq = (int)txt_seq;
+
     int n_steps = 20;
     if (const char *e = std::getenv("QIE_N_STEPS")) {
         int k = std::atoi(e);

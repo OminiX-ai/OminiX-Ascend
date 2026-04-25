@@ -3435,6 +3435,16 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
     intra_probe("08_txt_Q", scratch_q_dev_, txt_seq * H, true);
     intra_probe("08_txt_K", scratch_k_dev_, txt_seq * H, true);
     intra_probe("08_txt_V", scratch_v_dev_, txt_seq * H, true);
+    // Q2.4.5.4k: disk dumps for QKV-projection substep bisect.
+    dump_tensor_f32("08_img_Q.f32", offset_rows(scratch_q_dev_, txt_seq),
+                     img_seq * H, /*is_f16*/ true);
+    dump_tensor_f32("08_img_K.f32", offset_rows(scratch_k_dev_, txt_seq),
+                     img_seq * H, /*is_f16*/ true);
+    dump_tensor_f32("08_img_V.f32", offset_rows(scratch_v_dev_, txt_seq),
+                     img_seq * H, /*is_f16*/ true);
+    dump_tensor_f32("08_txt_Q.f32", scratch_q_dev_, txt_seq * H, /*is_f16*/ true);
+    dump_tensor_f32("08_txt_K.f32", scratch_k_dev_, txt_seq * H, /*is_f16*/ true);
+    dump_tensor_f32("08_txt_V.f32", scratch_v_dev_, txt_seq * H, /*is_f16*/ true);
 
     // ------------------------------------------------------------------
     // 4. RMSNorm on Q / K (both streams). Since Q/K have shape
@@ -3464,6 +3474,12 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
                 img_seq * H, true);
     intra_probe("09_txt_Q_rmsnorm", scratch_q_dev_, txt_seq * H, true);
     intra_probe("09_txt_K_rmsnorm", scratch_k_dev_, txt_seq * H, true);
+    dump_tensor_f32("09_img_Q_rmsnorm.f32",
+                     offset_rows(scratch_q_dev_, txt_seq), img_seq * H, true);
+    dump_tensor_f32("09_img_K_rmsnorm.f32",
+                     offset_rows(scratch_k_dev_, txt_seq), img_seq * H, true);
+    dump_tensor_f32("09_txt_Q_rmsnorm.f32", scratch_q_dev_, txt_seq * H, true);
+    dump_tensor_f32("09_txt_K_rmsnorm.f32", scratch_k_dev_, txt_seq * H, true);
 
     // ------------------------------------------------------------------
     // 5. RoPE on Q, K. pe index layout (from compute_qwen_rope_pe_host):
@@ -3498,11 +3514,74 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
     // 6. Joint attention via aclnnFusedInferAttentionScoreV2.
     //    Layout BSND = [B=1, seq_total, NH, HD]. Q/K/V scratch are already
     //    laid out as txt || img along seq. V is [seq_total, H] = BSND.
-    // ------------------------------------------------------------------
+    //
+    //    Q2.4.5.4k softmax-overflow workaround (env QIE_ATTN_SOFTMAX_F32):
+    //    when set, mirror the CPU reference's kv_scale=1/head_dim trick
+    //    (tools/ominix_diffusion/src/ggml_extend.hpp::ggml_ext_attention_ext
+    //    lines 1318-1361). Pre-scale K,V in-place by 1/HD; pass attn-scale
+    //    sqrt(HD) (so the softmax math is identical: scale/kv_scale =
+    //    (1/sqrt(HD))/(1/HD) = sqrt(HD), with V then post-scaled by HD to
+    //    cancel the kv_scale on V). This bounds the K·Q^T accumulator
+    //    magnitude at sqrt(HD)·max(|Q|)·max(|K|/HD) instead of
+    //    (1/sqrt(HD))·max(|Q|)·max(|K|), which on the §5.5.8-reported
+    //    q/k rmsnorm magnitudes (img max=723, txt max=571) was overflowing
+    //    F16 inside FIA tile-mul prior to the F32 accumulator add. Default
+    //    OFF: env unset preserves byte-identical Phase 4.4d behaviour
+    //    (numerical gate stays GREEN).
+    static int s_attn_softmax_f32 = -1;
+    if (s_attn_softmax_f32 < 0) {
+        const char *v = std::getenv("QIE_ATTN_SOFTMAX_F32");
+        s_attn_softmax_f32 = (v && *v && v[0] != '0') ? 1 : 0;
+        QIE_LOG("Q2.4.5.4k attention path: QIE_ATTN_SOFTMAX_F32=%d "
+                "(0=raw FIA scale=1/sqrt(HD); 1=kv_scale=1/HD trick + "
+                "FIA scale=sqrt(HD) + out post-mul HD, mirrors CPU ref)",
+                s_attn_softmax_f32);
+    }
     {
         int64_t qkv_shape[4]   = {B, seq_total, NH, HD};
         int64_t qkv_strides[4];
         make_contig_strides(4, qkv_shape, qkv_strides);
+
+        // kv_scale trick: in-place K *= 1/HD and V *= 1/HD, FIA scale -> sqrt(HD).
+        //   softmax(Q·K^T·scale)·V
+        // = softmax(Q·(K/HD)^T·sqrt(HD))·(V/HD)·HD
+        //   ^ identical math, but K/HD bounds the K·Q^T magnitudes.
+        if (s_attn_softmax_f32) {
+            if (!g_cann.aclnnInplaceMuls ||
+                !g_cann.aclnnInplaceMulsGetWorkspaceSize) {
+                QIE_LOG("attn kv_scale: aclnnInplaceMuls symbol missing — "
+                        "rebuild with refreshed cp_cann_symbols.cpp");
+                return false;
+            }
+            const float kv_scale_f = 1.0f / (float)HD;
+            int64_t k_shape[4] = {B, seq_total, NH, HD};
+            int64_t k_strides[4];
+            make_contig_strides(4, k_shape, k_strides);
+            auto inplace_muls = [&](void *dev) -> bool {
+                aclTensor *t = tensor_nd_f16(dev, 4, k_shape, k_strides);
+                aclScalar *sc = make_f16_scalar_local(kv_scale_f);
+                uint64_t mws = 0;
+                aclOpExecutor *mexec = nullptr;
+                aclnnStatus rs = g_cann.aclnnInplaceMulsGetWorkspaceSize(
+                    t, sc, &mws, &mexec);
+                if (rs == 0) {
+                    ensure_workspace_(mws);
+                    rs = g_cann.aclnnInplaceMuls(
+                        mws > 0 ? workspace_dev_ : nullptr, mws, mexec,
+                        compute_stream_);
+                }
+                g_cann.aclDestroyTensor(t);
+                g_cann.aclDestroyScalar(sc);
+                if (rs != 0) {
+                    QIE_LOG("attn kv_scale: InplaceMuls status=%d", (int)rs);
+                    return false;
+                }
+                return true;
+            };
+            if (!inplace_muls(scratch_k_dev_)) return false;
+            if (!inplace_muls(scratch_v_dev_)) return false;
+        }
+
         aclTensor *t_q = tensor_nd_f16(scratch_q_dev_,    4, qkv_shape, qkv_strides);
         aclTensor *t_k = tensor_nd_f16(scratch_k_dev_,    4, qkv_shape, qkv_strides);
         aclTensor *t_v = tensor_nd_f16(scratch_v_dev_,    4, qkv_shape, qkv_strides);
@@ -3510,7 +3589,10 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
         aclTensorList *t_k_list = g_cann.aclCreateTensorList(&t_k, 1);
         aclTensorList *t_v_list = g_cann.aclCreateTensorList(&t_v, 1);
         char layout[5] = {'B','S','N','D',0};
-        double scale = 1.0 / std::sqrt((double)HD);
+        // raw scale = 1/sqrt(HD); kv_scale-trick scale = sqrt(HD)/sqrt(HD)/(1/HD)
+        // = (1/sqrt(HD))/(1/HD) = sqrt(HD).
+        double scale = s_attn_softmax_f32 ? std::sqrt((double)HD)
+                                          : 1.0 / std::sqrt((double)HD);
         uint64_t ws = 0; aclOpExecutor *exec = nullptr;
         aclnnStatus s = g_cann.aclnnFusedInferAttentionScoreV2GetWorkspaceSize(
             t_q, t_k_list, t_v_list,
@@ -3537,6 +3619,32 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
             QIE_LOG("block: FIAv2 status=%d (seq_total=%lld NH=%lld HD=%lld)",
                     (int)s, (long long)seq_total, (long long)NH, (long long)HD);
             return false;
+        }
+
+        // Post-scale attention output by HD to cancel V's kv_scale.
+        if (s_attn_softmax_f32) {
+            int64_t o_shape[4] = {B, seq_total, NH, HD};
+            int64_t o_strides[4];
+            make_contig_strides(4, o_shape, o_strides);
+            aclTensor *t_o2 = tensor_nd_f16(scratch_attn_dev_, 4,
+                                              o_shape, o_strides);
+            aclScalar *sc = make_f16_scalar_local((float)HD);
+            uint64_t mws = 0;
+            aclOpExecutor *mexec = nullptr;
+            aclnnStatus rs = g_cann.aclnnInplaceMulsGetWorkspaceSize(
+                t_o2, sc, &mws, &mexec);
+            if (rs == 0) {
+                ensure_workspace_(mws);
+                rs = g_cann.aclnnInplaceMuls(
+                    mws > 0 ? workspace_dev_ : nullptr, mws, mexec,
+                    compute_stream_);
+            }
+            g_cann.aclDestroyTensor(t_o2);
+            g_cann.aclDestroyScalar(sc);
+            if (rs != 0) {
+                QIE_LOG("attn kv_scale: post-mul HD status=%d", (int)rs);
+                return false;
+            }
         }
     }
     intra_probe("11_attn_out_txt", scratch_attn_dev_, txt_seq * H, true);

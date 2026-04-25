@@ -142,6 +142,13 @@ struct PublicQwenImageTransformerBlock : public Qwen::QwenImageTransformerBlock 
     using GGMLBlock::blocks;
 };
 
+// Q2.4.5.4k: expose JointAttention internals (blocks + dim_head) so the
+// inline-replicate path in compute_block0 can emit per-substep dumps.
+struct PublicQwenImageAttention : public Qwen::QwenImageAttention {
+    using GGMLBlock::blocks;
+    using Qwen::QwenImageAttention::dim_head;
+};
+
 // ---------------------------------------------------------------------------
 // Block-0 CPU runner. Wraps a single QwenImageTransformerBlock and runs a
 // forward graph on the CPU backend in F32. Inputs (img, txt, t_emb, pe) are
@@ -268,13 +275,116 @@ struct Block0CpuRunner : public Qwen::QwenImageRunner {
                                      txt_gate1->ne[0], 1,
                                      txt_gate1->ne[1], txt_gate1->ne[2]);
 
-        // Attention.
-        auto attn_pair = attn->forward(ctx, img_modulated, txt_modulated,
-                                         pe, /*attention_mask*/ nullptr);
-        auto img_attn_output = attn_pair.first;
-        auto txt_attn_output = attn_pair.second;
-        ggml_set_name(img_attn_output, "cpu_11_attn_out_img");
-        ggml_set_name(txt_attn_output, "cpu_11_attn_out_txt");
+        // Attention — inline-replicate Qwen::QwenImageAttention::forward
+        // (qwen_image.hpp:113-191) to expose pre-projection (08/09/10/11pre)
+        // intermediates for the Q2.4.5.4k bisect. Using-redeclares cast.
+        auto &attn_pub = reinterpret_cast<PublicQwenImageAttention&>(*attn);
+        const int dim_head_attn = attn_pub.dim_head;
+
+        auto a_norm_q       = std::dynamic_pointer_cast<UnaryBlock>(attn_pub.blocks["norm_q"]);
+        auto a_norm_k       = std::dynamic_pointer_cast<UnaryBlock>(attn_pub.blocks["norm_k"]);
+        auto a_to_q         = std::dynamic_pointer_cast<Linear>(attn_pub.blocks["to_q"]);
+        auto a_to_k         = std::dynamic_pointer_cast<Linear>(attn_pub.blocks["to_k"]);
+        auto a_to_v         = std::dynamic_pointer_cast<Linear>(attn_pub.blocks["to_v"]);
+        auto a_to_out_0     = std::dynamic_pointer_cast<Linear>(attn_pub.blocks["to_out.0"]);
+        auto a_norm_added_q = std::dynamic_pointer_cast<UnaryBlock>(attn_pub.blocks["norm_added_q"]);
+        auto a_norm_added_k = std::dynamic_pointer_cast<UnaryBlock>(attn_pub.blocks["norm_added_k"]);
+        auto a_add_q_proj   = std::dynamic_pointer_cast<Linear>(attn_pub.blocks["add_q_proj"]);
+        auto a_add_k_proj   = std::dynamic_pointer_cast<Linear>(attn_pub.blocks["add_k_proj"]);
+        auto a_add_v_proj   = std::dynamic_pointer_cast<Linear>(attn_pub.blocks["add_v_proj"]);
+        auto a_to_add_out   = std::dynamic_pointer_cast<Linear>(attn_pub.blocks["to_add_out"]);
+
+        const int64_t Nb         = img_modulated->ne[2];
+        const int64_t n_img_tok  = img_modulated->ne[1];
+        const int64_t n_txt_tok  = txt_modulated->ne[1];
+
+        auto cpu_img_q = a_to_q->forward(ctx, img_modulated);
+        const int64_t cpu_num_heads = cpu_img_q->ne[0] / dim_head_attn;
+        cpu_img_q      = ggml_reshape_4d(ctx->ggml_ctx, cpu_img_q, dim_head_attn, cpu_num_heads, n_img_tok, Nb);
+        auto cpu_img_k = a_to_k->forward(ctx, img_modulated);
+        cpu_img_k      = ggml_reshape_4d(ctx->ggml_ctx, cpu_img_k, dim_head_attn, cpu_num_heads, n_img_tok, Nb);
+        auto cpu_img_v = a_to_v->forward(ctx, img_modulated);
+        cpu_img_v      = ggml_reshape_4d(ctx->ggml_ctx, cpu_img_v, dim_head_attn, cpu_num_heads, n_img_tok, Nb);
+
+        ggml_set_name(cpu_img_q, "cpu_08_img_Q");
+        ggml_set_name(cpu_img_k, "cpu_08_img_K");
+        ggml_set_name(cpu_img_v, "cpu_08_img_V");
+        ggml_set_output(cpu_img_q);
+        ggml_set_output(cpu_img_k);
+        ggml_set_output(cpu_img_v);
+        ggml_build_forward_expand(gf, cpu_img_q);
+        ggml_build_forward_expand(gf, cpu_img_k);
+        ggml_build_forward_expand(gf, cpu_img_v);
+
+        cpu_img_q = a_norm_q->forward(ctx, cpu_img_q);
+        cpu_img_k = a_norm_k->forward(ctx, cpu_img_k);
+
+        ggml_set_name(cpu_img_q, "cpu_09_img_Q_rmsnorm");
+        ggml_set_name(cpu_img_k, "cpu_09_img_K_rmsnorm");
+        ggml_set_output(cpu_img_q);
+        ggml_set_output(cpu_img_k);
+        ggml_build_forward_expand(gf, cpu_img_q);
+        ggml_build_forward_expand(gf, cpu_img_k);
+
+        auto cpu_txt_q = a_add_q_proj->forward(ctx, txt_modulated);
+        cpu_txt_q      = ggml_reshape_4d(ctx->ggml_ctx, cpu_txt_q, dim_head_attn, cpu_num_heads, n_txt_tok, Nb);
+        auto cpu_txt_k = a_add_k_proj->forward(ctx, txt_modulated);
+        cpu_txt_k      = ggml_reshape_4d(ctx->ggml_ctx, cpu_txt_k, dim_head_attn, cpu_num_heads, n_txt_tok, Nb);
+        auto cpu_txt_v = a_add_v_proj->forward(ctx, txt_modulated);
+        cpu_txt_v      = ggml_reshape_4d(ctx->ggml_ctx, cpu_txt_v, dim_head_attn, cpu_num_heads, n_txt_tok, Nb);
+
+        ggml_set_name(cpu_txt_q, "cpu_08_txt_Q");
+        ggml_set_name(cpu_txt_k, "cpu_08_txt_K");
+        ggml_set_name(cpu_txt_v, "cpu_08_txt_V");
+        ggml_set_output(cpu_txt_q);
+        ggml_set_output(cpu_txt_k);
+        ggml_set_output(cpu_txt_v);
+        ggml_build_forward_expand(gf, cpu_txt_q);
+        ggml_build_forward_expand(gf, cpu_txt_k);
+        ggml_build_forward_expand(gf, cpu_txt_v);
+
+        cpu_txt_q = a_norm_added_q->forward(ctx, cpu_txt_q);
+        cpu_txt_k = a_norm_added_k->forward(ctx, cpu_txt_k);
+
+        ggml_set_name(cpu_txt_q, "cpu_09_txt_Q_rmsnorm");
+        ggml_set_name(cpu_txt_k, "cpu_09_txt_K_rmsnorm");
+        ggml_set_output(cpu_txt_q);
+        ggml_set_output(cpu_txt_k);
+        ggml_build_forward_expand(gf, cpu_txt_q);
+        ggml_build_forward_expand(gf, cpu_txt_k);
+
+        auto cpu_q_joint = ggml_concat(ctx->ggml_ctx, cpu_txt_q, cpu_img_q, 2);
+        auto cpu_k_joint = ggml_concat(ctx->ggml_ctx, cpu_txt_k, cpu_img_k, 2);
+        auto cpu_v_joint = ggml_concat(ctx->ggml_ctx, cpu_txt_v, cpu_img_v, 2);
+
+        // Pre-projection FIA-equivalent attention output (mirrors native's
+        // 11_attn_out which is the FIA output BEFORE to_out_0/to_add_out).
+        auto cpu_attn_pre = Rope::attention(ctx, cpu_q_joint, cpu_k_joint,
+                                              cpu_v_joint, pe,
+                                              /*mask*/ nullptr, 1.0f / 128.f);
+        auto cpu_txt_attn_pre = ggml_view_3d(
+            ctx->ggml_ctx, cpu_attn_pre,
+            cpu_attn_pre->ne[0], n_txt_tok, cpu_attn_pre->ne[2],
+            cpu_attn_pre->nb[1], cpu_attn_pre->nb[2], 0);
+        auto cpu_img_attn_pre = ggml_view_3d(
+            ctx->ggml_ctx, cpu_attn_pre,
+            cpu_attn_pre->ne[0], n_img_tok, cpu_attn_pre->ne[2],
+            cpu_attn_pre->nb[1], cpu_attn_pre->nb[2],
+            n_txt_tok * cpu_attn_pre->nb[1]);
+        cpu_img_attn_pre = ggml_cont(ctx->ggml_ctx, cpu_img_attn_pre);
+        cpu_txt_attn_pre = ggml_cont(ctx->ggml_ctx, cpu_txt_attn_pre);
+        ggml_set_name(cpu_img_attn_pre, "cpu_11pre_attn_out_img");
+        ggml_set_name(cpu_txt_attn_pre, "cpu_11pre_attn_out_txt");
+        ggml_set_output(cpu_img_attn_pre);
+        ggml_set_output(cpu_txt_attn_pre);
+        ggml_build_forward_expand(gf, cpu_img_attn_pre);
+        ggml_build_forward_expand(gf, cpu_txt_attn_pre);
+
+        // Final post-projection outputs (mirrors native's 12_to_*).
+        auto img_attn_output = a_to_out_0->forward(ctx, cpu_img_attn_pre);
+        auto txt_attn_output = a_to_add_out->forward(ctx, cpu_txt_attn_pre);
+        ggml_set_name(img_attn_output, "cpu_12_to_out_0");
+        ggml_set_name(txt_attn_output, "cpu_12_to_add_out");
         ggml_set_output(img_attn_output);
         ggml_set_output(txt_attn_output);
         ggml_build_forward_expand(gf, img_attn_output);
@@ -446,12 +556,43 @@ struct Block0CpuRunner : public Qwen::QwenImageRunner {
             // Substep ↔ filename map (matches native engine dumps).
             const int64_t img_n = (int64_t)img_seq * H;
             const int64_t txt_n = (int64_t)txt_seq * H;
+            const int64_t HD = (int64_t)128;
+            const int64_t NH = H / HD;
+            const int64_t img_qkv_n = (int64_t)img_seq * NH * HD;  // == img_n
+            const int64_t txt_qkv_n = (int64_t)txt_seq * NH * HD;  // == txt_n
+            (void)img_qkv_n; (void)txt_qkv_n;
             dump_named("cpu_04_img_LN1",     "cpu_04_img_LN1.f32",     img_n);
             dump_named("cpu_05_img_mod1",    "cpu_05_img_mod1.f32",    img_n);
             dump_named("cpu_06_txt_LN1",     "cpu_06_txt_LN1.f32",     txt_n);
             dump_named("cpu_07_txt_mod1",    "cpu_07_txt_mod1.f32",    txt_n);
-            dump_named("cpu_11_attn_out_img","cpu_11_attn_out_img.f32",img_n);
-            dump_named("cpu_11_attn_out_txt","cpu_11_attn_out_txt.f32",txt_n);
+            // Q2.4.5.4k attention internals — mirrors native intra_probe sites
+            // 08/09/10 (which the existing native dump scaffold already writes
+            // when QIE_DUMP_BLOCK0_DIR is set, but only for 04/05/06/07 + 11+
+            // — extend native side similarly to enable a like-for-like compare
+            // here).
+            dump_named("cpu_08_img_Q",       "cpu_08_img_Q.f32",       img_n);
+            dump_named("cpu_08_img_K",       "cpu_08_img_K.f32",       img_n);
+            dump_named("cpu_08_img_V",       "cpu_08_img_V.f32",       img_n);
+            dump_named("cpu_08_txt_Q",       "cpu_08_txt_Q.f32",       txt_n);
+            dump_named("cpu_08_txt_K",       "cpu_08_txt_K.f32",       txt_n);
+            dump_named("cpu_08_txt_V",       "cpu_08_txt_V.f32",       txt_n);
+            dump_named("cpu_09_img_Q_rmsnorm", "cpu_09_img_Q_rmsnorm.f32", img_n);
+            dump_named("cpu_09_img_K_rmsnorm", "cpu_09_img_K_rmsnorm.f32", img_n);
+            dump_named("cpu_09_txt_Q_rmsnorm", "cpu_09_txt_Q_rmsnorm.f32", txt_n);
+            dump_named("cpu_09_txt_K_rmsnorm", "cpu_09_txt_K_rmsnorm.f32", txt_n);
+            // Pre-projection FIA-equivalent attention output (mirrors native's
+            // 11_attn_out which is FIA out, BEFORE to_out_0/to_add_out).
+            dump_named("cpu_11pre_attn_out_img", "cpu_11pre_attn_out_img.f32", img_n);
+            dump_named("cpu_11pre_attn_out_txt", "cpu_11pre_attn_out_txt.f32", txt_n);
+            // Backward-compat aliases: prior runs compared
+            // native_11_attn_out (pre-proj) against cpu_11_attn_out
+            // (post-proj) — a category mismatch. Re-emit cpu_11_attn_out_*
+            // as the pre-proj tensor so the comparator's 11_attn_out row is
+            // semantically correct against native's 11_attn_out FIA dump.
+            dump_named("cpu_11pre_attn_out_img", "cpu_11_attn_out_img.f32", img_n);
+            dump_named("cpu_11pre_attn_out_txt", "cpu_11_attn_out_txt.f32", txt_n);
+            dump_named("cpu_12_to_out_0",    "cpu_12_to_out_0.f32",    img_n);
+            dump_named("cpu_12_to_add_out",  "cpu_12_to_add_out.f32",  txt_n);
             dump_named("cpu_13_img_resid1",  "cpu_13_img_resid1.f32",  img_n);
             dump_named("cpu_13_txt_resid1",  "cpu_13_txt_resid1.f32",  txt_n);
             dump_named("cpu_14_img_LN2",     "cpu_14_img_LN2.f32",     img_n);

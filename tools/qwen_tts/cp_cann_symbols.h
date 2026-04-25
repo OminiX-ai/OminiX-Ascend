@@ -154,6 +154,20 @@ struct CannSyms {
                                               uint64_t *, aclOpExecutor **);
     aclnnStatus (*aclnnMuls)(void *, uint64_t, aclOpExecutor *, aclrtStream);
 
+    // In-place sibling of aclnnMuls per aclnn_inplace_muls.h:
+    //     selfRef <- selfRef * other     (scalar broadcast)
+    // Single-tensor signature — no separate output buffer / scratch needed.
+    // Used by QIE Q2.4.5.4k joint-attention kv_scale trick to pre-scale K,V
+    // by 1/head_dim in place before FIAv2 (avoids F16 overflow in K·Q^T
+    // accumulator on q/k post-rmsnorm magnitudes >= 700).
+    aclnnStatus (*aclnnInplaceMulsGetWorkspaceSize)(aclTensor *selfRef,
+                                                     const aclScalar *other,
+                                                     uint64_t *workspaceSize,
+                                                     aclOpExecutor **executor);
+    aclnnStatus (*aclnnInplaceMuls)(void *workspace, uint64_t workspaceSize,
+                                     aclOpExecutor *executor,
+                                     aclrtStream stream);
+
     // ---- Mul (elementwise, broadcast-capable) ------------------------------
     // Required by QIE Q2.3 block forward for the modulation `x * (1 + scale)`
     // multiply where `scale` is [B, hidden] and broadcasts over seq. aclnnMul

@@ -149,6 +149,12 @@ bool load_once() {
     ok &= resolve(h_op,   "aclnnMulsGetWorkspaceSize",
                   g_cann.aclnnMulsGetWorkspaceSize);
     ok &= resolve(h_op,   "aclnnMuls",                g_cann.aclnnMuls);
+    // Optional: aclnnInplaceMuls. Used by QIE Q2.4.5.4k softmax-overflow
+    // workaround. Older CANN toolkits may lack the symbol; engine call sites
+    // null-check before dispatch and surface a precise error.
+    resolve_optional(h_op, "aclnnInplaceMulsGetWorkspaceSize",
+                     g_cann.aclnnInplaceMulsGetWorkspaceSize);
+    resolve_optional(h_op, "aclnnInplaceMuls",  g_cann.aclnnInplaceMuls);
     ok &= resolve(h_op,   "aclnnRotaryPositionEmbeddingGetWorkspaceSize",
                   g_cann.aclnnRotaryPositionEmbeddingGetWorkspaceSize);
     ok &= resolve(h_op,   "aclnnRotaryPositionEmbedding",
