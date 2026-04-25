@@ -2592,6 +2592,57 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
     const int64_t FF   = (int64_t)H * cfg_.ff_mult;  // 12288
     const int64_t seq_total = img_seq + txt_seq;
 
+    // Phase 4.5.4b intra-block NaN bisect. Gated by
+    // QIE_DEBUG_INTRA_BLOCK0=1 — scans only the FIRST invocation of
+    // forward_block_ in the process lifetime (i.e., block 0, step 0).
+    static int  s_intra = -1;
+    static int  s_intra_calls = 0;
+    if (s_intra < 0) {
+        const char *v = std::getenv("QIE_DEBUG_INTRA_BLOCK0");
+        s_intra = v ? std::atoi(v) : 0;
+    }
+    const bool do_intra = s_intra && (s_intra_calls == 0);
+    s_intra_calls++;
+
+    auto intra_probe = [&](const char *label, void *dev,
+                             int64_t n_elts, bool is_f16) -> void {
+        if (!do_intra) return;
+        g_cann.aclrtSynchronizeStream(compute_stream_);
+        const size_t bpe = is_f16 ? 2 : 4;
+        std::vector<uint8_t> host((size_t)n_elts * bpe);
+        aclError me = g_cann.aclrtMemcpy(host.data(), host.size(), dev,
+                                           host.size(),
+                                           ACL_MEMCPY_DEVICE_TO_HOST);
+        if (me != 0) return;
+        double sum_abs = 0.0, max_abs = 0.0;
+        int64_t nanc = 0, infc = 0;
+        for (int64_t i = 0; i < n_elts; ++i) {
+            float v;
+            if (is_f16) {
+                __fp16 hh;
+                std::memcpy(&hh, host.data() + (size_t)i * 2, 2);
+                v = (float)hh;
+            } else {
+                std::memcpy(&v, host.data() + (size_t)i * 4, 4);
+            }
+            if (std::isnan(v)) { nanc++; continue; }
+            if (std::isinf(v)) { infc++; continue; }
+            double a = std::fabs((double)v);
+            sum_abs += a;
+            if (a > max_abs) max_abs = a;
+        }
+        int64_t valid = n_elts - nanc - infc;
+        double mean_abs = valid > 0 ? sum_abs / (double)valid : 0.0;
+        QIE_LOG("intra_b0[%s]: n=%lld %s mean_abs=%.4g max_abs=%.4g "
+                "NaN=%lld Inf=%lld",
+                label, (long long)n_elts, is_f16 ? "F16" : "F32",
+                mean_abs, max_abs, (long long)nanc, (long long)infc);
+    };
+
+    intra_probe("00_img_hidden_in", img_hidden, img_seq * H, false);
+    intra_probe("00_txt_hidden_in", txt_hidden, txt_seq * H, false);
+    intra_probe("00_t_emb_in", t_emb, H, true);
+
     // ------------------------------------------------------------------
     // 1. Modulation: mod_params = img_mod.1(silu(t_emb))  (and txt side)
     //    scratch_mod_dev_ holds [12, H] F16 — first 6 img, next 6 txt.
@@ -2616,17 +2667,22 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
         if (s != 0) { QIE_LOG("block: silu(t_emb) status=%d", (int)s);
                        return false; }
     }
+    intra_probe("01_silu_t_emb", scratch_q_dev_, H, true);
 
     // img_mod_params = img_mod.1 Linear → scratch_mod_dev_[0 .. 6H)
     if (!dispatch_matmul_(scratch_q_dev_, lw.img_mod_w_q4, lw.img_mod_scale,
                           lw.img_mod_b, B, H, 6 * H, scratch_mod_dev_))
         return false;
+    intra_probe("02_img_mod_out", scratch_mod_dev_, 6 * H, true);
     // txt_mod_params = txt_mod.1 Linear → scratch_mod_dev_[6H .. 12H)
     if (!dispatch_matmul_(scratch_q_dev_, lw.txt_mod_w_q4, lw.txt_mod_scale,
                           lw.txt_mod_b, B, H, 6 * H,
                           (uint8_t *)scratch_mod_dev_ + (size_t)6 * H *
                                                           sizeof(uint16_t)))
         return false;
+    intra_probe("03_txt_mod_out",
+                (uint8_t *)scratch_mod_dev_ + (size_t)6 * H * sizeof(uint16_t),
+                6 * H, true);
 
     // Chunk pointers (6 × H each) — scale1, shift1, gate1, scale2, shift2, gate2.
     auto mod_chunk = [&](void *base, int which) {
@@ -2658,13 +2714,17 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
     if (!layer_norm_f32_to_f16_(img_hidden, scratch_img_norm_dev_,
                                   B, img_seq, H))
         return false;
+    intra_probe("04_img_LN1", scratch_img_norm_dev_, img_seq * H, true);
     if (!modulate_(scratch_img_norm_dev_, img_scale1, img_shift1,
                    B, img_seq, H)) return false;
+    intra_probe("05_img_mod1", scratch_img_norm_dev_, img_seq * H, true);
     if (!layer_norm_f32_to_f16_(txt_hidden, scratch_txt_norm_dev_,
                                   B, txt_seq, H))
         return false;
+    intra_probe("06_txt_LN1", scratch_txt_norm_dev_, txt_seq * H, true);
     if (!modulate_(scratch_txt_norm_dev_, txt_scale1, txt_shift1,
                    B, txt_seq, H)) return false;
+    intra_probe("07_txt_mod1", scratch_txt_norm_dev_, txt_seq * H, true);
 
     // ------------------------------------------------------------------
     // 3. QKV projections. img → to_q / to_k / to_v, txt → add_q/k/v.
@@ -2696,6 +2756,15 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
     if (!dispatch_matmul_(scratch_img_norm_dev_, lw.to_v_w_q4, lw.to_v_scale,
                           lw.to_v_b, img_seq, H, H,
                           offset_rows(scratch_v_dev_, txt_seq))) return false;
+    intra_probe("08_img_Q", offset_rows(scratch_q_dev_, txt_seq),
+                img_seq * H, true);
+    intra_probe("08_img_K", offset_rows(scratch_k_dev_, txt_seq),
+                img_seq * H, true);
+    intra_probe("08_img_V", offset_rows(scratch_v_dev_, txt_seq),
+                img_seq * H, true);
+    intra_probe("08_txt_Q", scratch_q_dev_, txt_seq * H, true);
+    intra_probe("08_txt_K", scratch_k_dev_, txt_seq * H, true);
+    intra_probe("08_txt_V", scratch_v_dev_, txt_seq * H, true);
 
     // ------------------------------------------------------------------
     // 4. RMSNorm on Q / K (both streams). Since Q/K have shape
@@ -2719,6 +2788,12 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
         if (!rms_norm_head_(scratch_k_dev_, scratch_k_dev_,
                             lw.norm_added_k_w, txt_seq * NH, HD)) return false;
     }
+    intra_probe("09_img_Q_rmsnorm", offset_rows(scratch_q_dev_, txt_seq),
+                img_seq * H, true);
+    intra_probe("09_img_K_rmsnorm", offset_rows(scratch_k_dev_, txt_seq),
+                img_seq * H, true);
+    intra_probe("09_txt_Q_rmsnorm", scratch_q_dev_, txt_seq * H, true);
+    intra_probe("09_txt_K_rmsnorm", scratch_k_dev_, txt_seq * H, true);
 
     // ------------------------------------------------------------------
     // 5. RoPE on Q, K. pe index layout (from compute_qwen_rope_pe_host):
@@ -2742,6 +2817,12 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
         if (!apply_rope_(offset_rows(scratch_k_dev_, txt_seq),
                          pe, img_pe_off, B, img_seq, NH, HD)) return false;
     }
+    intra_probe("10_img_Q_rope", offset_rows(scratch_q_dev_, txt_seq),
+                img_seq * H, true);
+    intra_probe("10_img_K_rope", offset_rows(scratch_k_dev_, txt_seq),
+                img_seq * H, true);
+    intra_probe("10_txt_Q_rope", scratch_q_dev_, txt_seq * H, true);
+    intra_probe("10_txt_K_rope", scratch_k_dev_, txt_seq * H, true);
 
     // ------------------------------------------------------------------
     // 6. Joint attention via aclnnFusedInferAttentionScoreV2.
@@ -2788,6 +2869,9 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
             return false;
         }
     }
+    intra_probe("11_attn_out_txt", scratch_attn_dev_, txt_seq * H, true);
+    intra_probe("11_attn_out_img", offset_rows(scratch_attn_dev_, txt_seq),
+                img_seq * H, true);
 
     // ------------------------------------------------------------------
     // 7. Output projections.
@@ -2803,6 +2887,8 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
     if (!dispatch_matmul_(offset_rows(scratch_attn_dev_, txt_seq),
                           lw.to_out_0_w_q4, lw.to_out_0_scale, lw.to_out_0_b,
                           img_seq, H, H, scratch_img_out_dev_)) return false;
+    intra_probe("12_to_add_out", scratch_txt_out_dev_, txt_seq * H, true);
+    intra_probe("12_to_out_0",   scratch_img_out_dev_, img_seq * H, true);
 
     // ------------------------------------------------------------------
     // 8. Gated residual add: img += attn_out_img * gate1_img (and txt).
@@ -2813,6 +2899,8 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
                                    img_gate1, B, img_seq, H)) return false;
     if (!gated_residual_add_f32_(txt_hidden, scratch_txt_out_dev_,
                                    txt_gate1, B, txt_seq, H)) return false;
+    intra_probe("13_img_resid1", img_hidden, img_seq * H, false);
+    intra_probe("13_txt_resid1", txt_hidden, txt_seq * H, false);
 
     // ------------------------------------------------------------------
     // 9. LayerNorm2 + modulate(scale2, shift2) — Phase 4.4c F32-in path
@@ -2821,13 +2909,17 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
     if (!layer_norm_f32_to_f16_(img_hidden, scratch_img_norm_dev_,
                                   B, img_seq, H))
         return false;
+    intra_probe("14_img_LN2", scratch_img_norm_dev_, img_seq * H, true);
     if (!modulate_(scratch_img_norm_dev_, img_scale2, img_shift2,
                    B, img_seq, H)) return false;
+    intra_probe("15_img_mod2", scratch_img_norm_dev_, img_seq * H, true);
     if (!layer_norm_f32_to_f16_(txt_hidden, scratch_txt_norm_dev_,
                                   B, txt_seq, H))
         return false;
+    intra_probe("16_txt_LN2", scratch_txt_norm_dev_, txt_seq * H, true);
     if (!modulate_(scratch_txt_norm_dev_, txt_scale2, txt_shift2,
                    B, txt_seq, H)) return false;
+    intra_probe("17_txt_mod2", scratch_txt_norm_dev_, txt_seq * H, true);
 
     // ------------------------------------------------------------------
     // 10. FFN per stream: Linear(H→FF) → GELU-tanh → Linear(FF→H).
@@ -2873,19 +2965,25 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
     if (!dispatch_matmul_(scratch_img_norm_dev_, lw.img_ff_up_w_q4,
                           lw.img_ff_up_scale, lw.img_ff_up_b,
                           img_seq, H, FF, scratch_mlp_dev_)) return false;
+    intra_probe("18_img_ff_up", scratch_mlp_dev_, img_seq * FF, true);
     if (!gelu_activate(scratch_mlp_dev_, img_seq)) return false;
+    intra_probe("19_img_gelu", scratch_mlp_dev_, img_seq * FF, true);
     if (!dispatch_matmul_(scratch_mlp_dev_, lw.img_ff_down_w_q4,
                           lw.img_ff_down_scale, lw.img_ff_down_b,
                           img_seq, FF, H, scratch_img_out_dev_)) return false;
+    intra_probe("20_img_ff_down", scratch_img_out_dev_, img_seq * H, true);
 
     // txt FFN.
     if (!dispatch_matmul_(scratch_txt_norm_dev_, lw.txt_ff_up_w_q4,
                           lw.txt_ff_up_scale, lw.txt_ff_up_b,
                           txt_seq, H, FF, scratch_mlp_dev_)) return false;
+    intra_probe("21_txt_ff_up", scratch_mlp_dev_, txt_seq * FF, true);
     if (!gelu_activate(scratch_mlp_dev_, txt_seq)) return false;
+    intra_probe("22_txt_gelu", scratch_mlp_dev_, txt_seq * FF, true);
     if (!dispatch_matmul_(scratch_mlp_dev_, lw.txt_ff_down_w_q4,
                           lw.txt_ff_down_scale, lw.txt_ff_down_b,
                           txt_seq, FF, H, scratch_txt_out_dev_)) return false;
+    intra_probe("23_txt_ff_down", scratch_txt_out_dev_, txt_seq * H, true);
 
     // ------------------------------------------------------------------
     // 11. Gated residual add #2. Phase 4.4c: F32 accumulator (see step 8).
@@ -2894,6 +2992,8 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
                                    img_gate2, B, img_seq, H)) return false;
     if (!gated_residual_add_f32_(txt_hidden, scratch_txt_out_dev_,
                                    txt_gate2, B, txt_seq, H)) return false;
+    intra_probe("24_img_resid2", img_hidden, img_seq * H, false);
+    intra_probe("24_txt_resid2", txt_hidden, txt_seq * H, false);
 
     return true;
 }
@@ -3255,6 +3355,46 @@ bool ImageDiffusionEngine::forward_all_blocks_test(void *img_hidden,
     }
     const int L = (n_blocks <= 0) ? (int)layer_w_.size()
                                     : std::min(n_blocks, (int)layer_w_.size());
+
+    // Phase 4.5.4b NaN bisect: per-block F32 residual scan (img + txt).
+    // Gated by QIE_DEBUG_PER_BLOCK_NAN=1. Scans ONLY on the first call
+    // (guarded by static latch) to bound cost — typical step-0 forward,
+    // not every subsequent denoise step.
+    static int  s_per_block_nan = -1;
+    static bool s_per_block_fired = false;
+    if (s_per_block_nan < 0) {
+        const char *v = std::getenv("QIE_DEBUG_PER_BLOCK_NAN");
+        s_per_block_nan = v ? std::atoi(v) : 0;
+    }
+    const bool do_scan = s_per_block_nan && !s_per_block_fired;
+
+    auto scan_block_residual = [&](const char *stream, void *dev_f32,
+                                     int64_t n_elts, int block) -> void {
+        g_cann.aclrtSynchronizeStream(compute_stream_);
+        std::vector<float> host((size_t)n_elts);
+        aclError me = g_cann.aclrtMemcpy(host.data(),
+                                           host.size() * sizeof(float), dev_f32,
+                                           host.size() * sizeof(float),
+                                           ACL_MEMCPY_DEVICE_TO_HOST);
+        if (me != 0) return;
+        double sum_abs = 0.0, max_abs = 0.0;
+        int64_t nanc = 0, infc = 0;
+        for (int64_t i = 0; i < n_elts; ++i) {
+            float v = host[(size_t)i];
+            if (std::isnan(v)) { nanc++; continue; }
+            if (std::isinf(v)) { infc++; continue; }
+            double a = std::fabs((double)v);
+            sum_abs += a;
+            if (a > max_abs) max_abs = a;
+        }
+        int64_t valid = n_elts - nanc - infc;
+        double mean_abs = valid > 0 ? sum_abs / (double)valid : 0.0;
+        QIE_LOG("per_block_nan[b%02d/%s]: mean_abs=%.4g max_abs=%.4g "
+                "NaN=%lld Inf=%lld",
+                block, stream, mean_abs, max_abs,
+                (long long)nanc, (long long)infc);
+    };
+
     for (int il = 0; il < L; ++il) {
         auto t0 = std::chrono::steady_clock::now();
         if (!forward_block_(layer_w_[il],
@@ -3263,6 +3403,11 @@ bool ImageDiffusionEngine::forward_all_blocks_test(void *img_hidden,
                             t_emb, pe)) {
             QIE_LOG("forward_all_blocks_test: block %d returned error", il);
             return false;
+        }
+        if (do_scan) {
+            const int64_t H = cfg_.hidden_size;
+            scan_block_residual("img", img_hidden, img_seq * H, il);
+            scan_block_residual("txt", txt_hidden, txt_seq * H, il);
         }
         if (per_block_ms) {
             // Only sync when the caller asked for per-block timing: the
@@ -3279,6 +3424,7 @@ bool ImageDiffusionEngine::forward_all_blocks_test(void *img_hidden,
                 std::chrono::duration<double, std::milli>(t1 - t0).count();
         }
     }
+    if (do_scan) s_per_block_fired = true;
     return true;
 }
 
@@ -3992,6 +4138,56 @@ bool ImageDiffusionEngine::denoise_full(const float *initial_latent,
         return s == 0;
     };
 
+    // Phase 4.5.4b NaN bisect: on step 0 only, copy a device buffer back to
+    // host, compute stats (mean-abs, max-abs, NaN count, Inf count), log.
+    // Gated by QIE_DEBUG_NAN_BISECT=1. Keep the D2H cheap (<= 2 MiB at
+    // 256×256 production shape) so we don't perturb per-step wall much.
+    static int s_nan_bisect = -1;
+    if (s_nan_bisect < 0) {
+        const char *v = std::getenv("QIE_DEBUG_NAN_BISECT");
+        s_nan_bisect = v ? std::atoi(v) : 0;
+    }
+    auto probe_stats = [&](const char *label, void *dev,
+                             int64_t n_elts, bool is_f16,
+                             int step) -> void {
+        if (!s_nan_bisect || step != 0) return;
+        // Sync to force the preceding op to commit before D2H.
+        g_cann.aclrtSynchronizeStream(compute_stream_);
+        const size_t bpe = is_f16 ? 2 : 4;
+        std::vector<uint8_t> host((size_t)n_elts * bpe);
+        aclError me = g_cann.aclrtMemcpy(host.data(), host.size(), dev,
+                                           host.size(),
+                                           ACL_MEMCPY_DEVICE_TO_HOST);
+        if (me != 0) {
+            QIE_LOG("probe_stats[%s]: D2H err=%d", label, (int)me);
+            return;
+        }
+        double sum_abs = 0.0, max_abs = 0.0;
+        int64_t nanc = 0, infc = 0;
+        for (int64_t i = 0; i < n_elts; ++i) {
+            float v;
+            if (is_f16) {
+                __fp16 hh;
+                std::memcpy(&hh, host.data() + (size_t)i * 2, 2);
+                v = (float)hh;
+            } else {
+                std::memcpy(&v, host.data() + (size_t)i * 4, 4);
+            }
+            if (std::isnan(v)) { nanc++; continue; }
+            if (std::isinf(v)) { infc++; continue; }
+            double a = std::fabs((double)v);
+            sum_abs += a;
+            if (a > max_abs) max_abs = a;
+        }
+        int64_t valid = n_elts - nanc - infc;
+        double mean_abs = valid > 0 ? sum_abs / (double)valid : 0.0;
+        QIE_LOG("probe_stats[%s]: n=%lld dtype=%s mean_abs=%.4g "
+                "max_abs=%.4g NaN=%lld Inf=%lld",
+                label, (long long)n_elts,
+                is_f16 ? "F16" : "F32", mean_abs, max_abs,
+                (long long)nanc, (long long)infc);
+    };
+
     // ------------------------------------------------------------------
     // Upload text conditioning + run one-shot txt_norm + txt_in for cond
     // and uncond. These don't change across steps — results park in
@@ -4010,22 +4206,30 @@ bool ImageDiffusionEngine::denoise_full(const float *initial_latent,
     }
 
     // txt_norm (RMSNorm) + txt_in (cond).
+    probe_stats("pre_txt_norm.cond", txt_cond_f32_dev,
+                txt_seq * joint_dim, /*f16*/false, 0);
     if (!rms_norm_row_f32_to_f16_(txt_cond_f32_dev, txt_norm_out_c_f16,
                                     global_w_.txt_norm_w,
                                     txt_seq, joint_dim)) {
         QIE_LOG("denoise_full: txt_norm(cond) failed");
         free_owned(); return false;
     }
+    probe_stats("post_txt_norm.cond", txt_norm_out_c_f16,
+                txt_seq * joint_dim, /*f16*/true, 0);
     if (!dispatch_matmul_(txt_norm_out_c_f16, global_w_.txt_in_w_q4,
                            global_w_.txt_in_scale, global_w_.txt_in_b,
                            txt_seq, joint_dim, H, txt_in_out_c_f16)) {
         QIE_LOG("denoise_full: txt_in matmul(cond) failed");
         free_owned(); return false;
     }
+    probe_stats("post_txt_in.cond", txt_in_out_c_f16,
+                txt_seq * H, /*f16*/true, 0);
     if (!cast_f16_to_f32(txt_in_out_c_f16, txt_res_c_f32, txt_seq, H)) {
         QIE_LOG("denoise_full: txt(cond) F16→F32 err");
         free_owned(); return false;
     }
+    probe_stats("txt_res_c_f32", txt_res_c_f32,
+                txt_seq * H, /*f16*/false, 0);
 
     if (run_uncond) {
         if (!rms_norm_row_f32_to_f16_(txt_uncond_f32_dev, txt_norm_out_u_f16,
@@ -4106,6 +4310,8 @@ bool ImageDiffusionEngine::denoise_full(const float *initial_latent,
                                     (int)s); free_owned(); return false; }
         }
         // time_linear1 + SiLU + time_linear2.
+        probe_stats("pre_time_linear1", t_emb_in_f16,
+                    256, /*f16*/true, step);
         if (!dispatch_matmul_(t_emb_in_f16,
                                global_w_.time_linear1_w_q4,
                                global_w_.time_linear1_scale,
@@ -4114,6 +4320,8 @@ bool ImageDiffusionEngine::denoise_full(const float *initial_latent,
             QIE_LOG("denoise_full: time_linear1 failed step=%d", step);
             free_owned(); return false;
         }
+        probe_stats("post_time_linear1", t_emb_mid_f16, H,
+                    /*f16*/true, step);
         {
             int64_t sh[2] = {1, H};
             int64_t st[2] = {H, 1};
@@ -4132,6 +4340,8 @@ bool ImageDiffusionEngine::denoise_full(const float *initial_latent,
             if (s != 0) { QIE_LOG("denoise_full: SiLU(t_emb) err=%d",
                                     (int)s); free_owned(); return false; }
         }
+        probe_stats("post_time_silu", t_emb_mid_f16, H,
+                    /*f16*/true, step);
         if (!dispatch_matmul_(t_emb_mid_f16,
                                global_w_.time_linear2_w_q4,
                                global_w_.time_linear2_scale,
@@ -4140,6 +4350,8 @@ bool ImageDiffusionEngine::denoise_full(const float *initial_latent,
             QIE_LOG("denoise_full: time_linear2 failed step=%d", step);
             free_owned(); return false;
         }
+        probe_stats("post_time_linear2", t_emb_out_f16, H,
+                    /*f16*/true, step);
 
         // --- (2) Host patchify(x) → concat with ref → upload as F16. ---
         {
@@ -4169,6 +4381,8 @@ bool ImageDiffusionEngine::denoise_full(const float *initial_latent,
         }
 
         // --- (3) img_in → F16 [img_seq, H] → Cast F32 into img_res_c_f32. ---
+        probe_stats("pre_img_in", img_in_in_f16, img_seq * IN_CH,
+                    /*f16*/true, step);
         if (!dispatch_matmul_(img_in_in_f16,
                                global_w_.img_in_w_q4, global_w_.img_in_scale,
                                global_w_.img_in_b,
@@ -4176,11 +4390,15 @@ bool ImageDiffusionEngine::denoise_full(const float *initial_latent,
             QIE_LOG("denoise_full: img_in matmul failed step=%d", step);
             free_owned(); return false;
         }
+        probe_stats("post_img_in", scratch_img_norm_dev_, img_seq * H,
+                    /*f16*/true, step);
         if (!cast_f16_to_f32(scratch_img_norm_dev_, img_res_c_f32,
                                img_seq, H)) {
             QIE_LOG("denoise_full: img_in F16→F32 err step=%d", step);
             free_owned(); return false;
         }
+        probe_stats("img_res_c_f32.seed", img_res_c_f32, img_seq * H,
+                    /*f16*/false, step);
         // If CFG on, also copy img_res_c → img_res_u for the uncond pass
         // (both passes consume the same patch-projected latent — only the
         // text conditioning differs).
@@ -4211,6 +4429,10 @@ bool ImageDiffusionEngine::denoise_full(const float *initial_latent,
             QIE_LOG("denoise_full: cond forward failed step=%d", step);
             free_owned(); return false;
         }
+        probe_stats("post_blocks.img_res_c", img_res_c_f32, img_seq * H,
+                    /*f16*/false, step);
+        probe_stats("post_blocks.txt_work_c", txt_work_c_f32, txt_seq * H,
+                    /*f16*/false, step);
 
         // --- (5) norm_out + proj_out on the cond img residual. ---
         //
@@ -4239,6 +4461,8 @@ bool ImageDiffusionEngine::denoise_full(const float *initial_latent,
                                     "step=%d", (int)s, step);
                             free_owned(); return false; }
         }
+        probe_stats("post_adaln_silu", adaln_silu_f16, H,
+                    /*f16*/true, step);
         // norm_out.linear: [1, H] × [H, 2H] → [1, 2H] F16.
         if (!dispatch_matmul_(adaln_silu_f16,
                                global_w_.norm_out_linear_w_q4,
@@ -4248,6 +4472,8 @@ bool ImageDiffusionEngine::denoise_full(const float *initial_latent,
             QIE_LOG("denoise_full: norm_out Linear failed step=%d", step);
             free_owned(); return false;
         }
+        probe_stats("post_norm_out.linear", adaln_emb_f16, 2 * H,
+                    /*f16*/true, step);
         void *adaln_scale = adaln_emb_f16;
         void *adaln_shift = (uint8_t *)adaln_emb_f16 + (size_t)H * F16;
 
@@ -4257,12 +4483,16 @@ bool ImageDiffusionEngine::denoise_full(const float *initial_latent,
             QIE_LOG("denoise_full: norm_out LN(cond) failed step=%d", step);
             free_owned(); return false;
         }
+        probe_stats("post_norm_out.LN", proj_out_in_f16, img_seq * H,
+                    /*f16*/true, step);
         if (!modulate_(proj_out_in_f16, adaln_scale, adaln_shift,
                         /*B*/1, img_seq, H)) {
             QIE_LOG("denoise_full: norm_out modulate(cond) failed step=%d",
                     step);
             free_owned(); return false;
         }
+        probe_stats("post_norm_out.modulate", proj_out_in_f16, img_seq * H,
+                    /*f16*/true, step);
         if (!dispatch_matmul_(proj_out_in_f16,
                                global_w_.proj_out_w_q4,
                                global_w_.proj_out_scale,
@@ -4271,6 +4501,8 @@ bool ImageDiffusionEngine::denoise_full(const float *initial_latent,
             QIE_LOG("denoise_full: proj_out(cond) failed step=%d", step);
             free_owned(); return false;
         }
+        probe_stats("post_proj_out", proj_out_out_f16, img_seq * PATCH_OUT,
+                    /*f16*/true, step);
 
         // --- (6) Optional uncond pass. ---
         // Output of cond proj_out is F16 [img_seq, PATCH_OUT] in

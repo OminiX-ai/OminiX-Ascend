@@ -1412,3 +1412,237 @@ skipped (NaN latent → guaranteed black PNG, same as §5.5).
 - `/tmp/qie_q45_step4_f32acc.log` — full smoke (45 lines)
 - `/tmp/qie_q45_step4_latent.f32.bin` — overwritten, still 16384
   NaN (65536 B), same sentinel pattern
+
+### §5.5.3 Step 4 NaN bisect — leak isolated to FFN-down matmul, NOT the five projections
+
+Run on ac03 against fork HEAD `b36c5f76` with diagnostic instrumentation
+landed in `image_diffusion_engine.cpp` (three new env-gated probe paths,
+all dormant when env unset — Step 1 regression preserved):
+
+- `QIE_DEBUG_NAN_BISECT=1` — probes the five projections inside
+  `denoise_full` (img_in, txt_in/txt_norm, time_linear1/2 + SiLU,
+  norm_out + LN + modulate, proj_out). Step 0 only.
+- `QIE_DEBUG_PER_BLOCK_NAN=1` — F32 residual stream scan after each
+  of the 60 blocks. First call only.
+- `QIE_DEBUG_INTRA_BLOCK0=1` — 24-point scan of every key buffer
+  inside the FIRST `forward_block_` invocation: t_emb, silu, mod params,
+  LN, modulate, QKV (img+txt), RMSNorm, RoPE, attention out, output
+  proj, gated residual #1, LN2, modulate2, FFN up, GELU, FFN down,
+  gated residual #2.
+
+#### Receipt 1 — five-projection probe (gate: `QIE_DEBUG_NAN_BISECT=1`)
+
+All five projection sites are CLEAN at step 0 entry — no NaN, no Inf,
+all magnitudes well below F16 65504:
+
+| Probe | dtype | mean_abs | max_abs | NaN | Inf |
+|---|---|---|---|---|---|
+| pre_txt_norm.cond | F32 | 2.728 | 150.3 | 0 | 0 |
+| post_txt_norm.cond | F16 | 0.469 | 10.95 | 0 | 0 |
+| post_txt_in.cond | F16 | 7.039 | 582 | 0 | 0 |
+| txt_res_c_f32 | F32 | 7.039 | 582 | 0 | 0 |
+| pre_time_linear1 | F16 | 0.636 | 1.000 | 0 | 0 |
+| post_time_linear1 | F16 | 0.231 | 21.44 | 0 | 0 |
+| post_time_silu | F16 | 0.0804 | 21.44 | 0 | 0 |
+| post_time_linear2 | F16 | 0.326 | 111.8 | 0 | 0 |
+| pre_img_in | F16 | 0.186 | 1.683 | 0 | 0 |
+| post_img_in | F16 | 0.325 | 16.12 | 0 | 0 |
+| img_res_c_f32.seed | F32 | 0.325 | 16.12 | 0 | 0 |
+
+**Verdict:** mission's primary hypothesis ("five projections produce
+real-magnitude F16 outputs that saturate before the 60-block loop")
+is **falsified**. The five projections feed the block loop with clean
+inputs.
+
+#### Receipt 2 — per-block residual scan (gate: `QIE_DEBUG_PER_BLOCK_NAN=1`)
+
+NaN emerges immediately at **block 0**:
+
+| Block | img_resid F32 mean_abs | max_abs | Inf | txt_resid F32 mean_abs | max_abs | Inf |
+|---|---|---|---|---|---|---|
+| 00 | 9057 | 6.584e+04 | **267092** | 2.449e+04 | 6.567e+04 | **224334** |
+| 01 | 0 | 0 | 0 | 0 | 0 | 0 (NaN=657408) |
+| 02-59 | 0 | 0 | 0 (NaN=full) | 0 | 0 | 0 (NaN=full) |
+
+Block 0 produces **267092 Inf elements in img_resid + 224334 in
+txt_resid**. From block 1 onwards every element is NaN (Inf-Inf or
+Inf*0 cascades). The 4.4d F32 residual storage is doing its job —
+it's not silently saturating at F16; it correctly stores the F32 Inf
+that came from block 0's internal F16 op chain.
+
+#### Receipt 3 — intra-block-0 24-point scan (gate: `QIE_DEBUG_INTRA_BLOCK0=1`)
+
+Magnitude cascade through forward_block_ on block 0:
+
+| Step | Buffer | dtype | mean_abs | max_abs | NaN | Inf |
+|---|---|---|---|---|---|---|
+| 00 | img_hidden_in | F32 | 0.325 | 16.12 | 0 | 0 |
+| 00 | txt_hidden_in | F32 | 7.039 | 582 | 0 | 0 |
+| 00 | t_emb_in | F16 | 0.326 | 111.8 | 0 | 0 |
+| 01 | silu_t_emb | F16 | 0.148 | 111.8 | 0 | 0 |
+| 02 | img_mod_out | F16 | 8.021 | 269 | 0 | 0 |
+| 03 | txt_mod_out | F16 | 9.482 | 141.8 | 0 | 0 |
+| 04 | img_LN1 | F16 | 0.538 | 11.74 | 0 | 0 |
+| 05 | img_mod1 | F16 | 2.078 | 113.5 | 0 | 0 |
+| 06 | txt_LN1 | F16 | 0.623 | 39.5 | 0 | 0 |
+| 07 | txt_mod1 | F16 | 5.315 | 1057 | 0 | 0 |
+| 08 | img_Q/K/V | F16 | 11.9 / 17.5 / 8.8 | 210 / 432 / 127 | 0 | 0 |
+| 08 | txt_Q/K/V | F16 | 89 / 74 / 37 | 1012 / 859 / 272 | 0 | 0 |
+| 09 | img_QK_rmsnorm | F16 | 1.95 / 1.27 | 723 / 564 | 0 | 0 |
+| 09 | txt_QK_rmsnorm | F16 | 0.63 / 0.76 | 6.8 / 8.2 | 0 | 0 |
+| 10 | img_QK_rope | F16 | 1.96 / 1.27 | 723 / 564 | 0 | 0 |
+| 10 | txt_QK_rope | F16 | 0.64 / 0.77 | 6.6 / 8.1 | 0 | 0 |
+| 11 | attn_out_txt / img | F16 | 14.0 / 18.5 | 175 / 186 | 0 | 0 |
+| 12 | to_add_out / to_out_0 | F16 | 73.7 / 70.8 | 740 / 634 | 0 | 0 |
+| 13 | img/txt resid1 | F32 | 45.5 / 69.7 | 1727 / 3957 | 0 | 0 |
+| 14 | img_LN2 | F16 | 0.447 | 16.36 | 0 | 0 |
+| 15 | img_mod2 | F16 | 29.4 | 634.5 | 0 | 0 |
+| 16 | txt_LN2 | F16 | 0.402 | 20.5 | 0 | 0 |
+| 17 | txt_mod2 | F16 | 34.6 | 159.9 | 0 | 0 |
+| 18 | img_ff_up | F16 | 204.7 | 2434 | 0 | 0 |
+| 19 | img_gelu | F16 | 108 | 2434 | 0 | 0 |
+| **20** | **img_ff_down** | F16 | **4796** | **6.355e+04** | 0 | **0 (just below F16 limit)** |
+| 21 | txt_ff_up | F16 | 257 | 3706 | 0 | 0 |
+| 22 | txt_gelu | F16 | 145 | 3230 | 0 | 0 |
+| **23** | **txt_ff_down** | F16 | **4957** | **5.488e+04** | 0 | **214** ← FIRST Inf |
+| 24 | img_resid2 | F32 | 9057 | 6.584e+04 | 0 | 267092 |
+| 24 | txt_resid2 | F32 | 2.449e+04 | 6.567e+04 | 0 | 224334 |
+
+#### Root cause
+
+**The leak is the FFN down-projection matmul output dtype.** Specifically
+`txt_ff_down` (`scratch_mlp_dev_ × txt_ff_down_w_q4` → `scratch_txt_out_dev_`
+F16) — output magnitudes hit F16 max (65504) and 214 elements clip to
+Inf in the F16 storage. The subsequent `gated_residual_add_f32_` path
+casts F16 Inf → F32 Inf (Cast preserves Inf semantics — there's no clamp).
+The F32 residual storage now contains Inf, and the next block's LayerNorm
+sees mean=Inf, variance=Inf/Inf=NaN → produces NaN throughout.
+
+`img_ff_down` is at 6.355e+04 — **just barely** under F16 max — so img
+escapes block 0 with no Inf, but combined with 267092 img_resid Infs at
+24_img_resid2 we know elements crossed the limit during the gate-add
+path. Looking more carefully, gate2 magnitudes (3rd chunk of img_mod2
+output) combine multiplicatively with ff_down to push into Inf:
+`(ff_down_f16 * gate_f16)` is computed in F16 at `gated_residual_add_f32_`
+step (uses `aclnnMul` on F16 inputs, see line 1820-ish), and that F16
+multiplication overflows long before the F32 cast.
+
+The ff_down output magnitude is driven by:
+- Modulate2 input (LN output ~1σ) × `(1 + scale2)` where `scale2` has
+  max ~635. → mod2 output max ~635.
+- ff_up matmul on H=3072 input, FF=12288 output. Even with weight stdev
+  ~0.02, max(mod2)·sqrt(H)·stdev ≈ 635·55·0.02 ≈ 700; observed 2434
+  (worst-case rows).
+- GELU(2434) ≈ 2434 (saturated linear regime).
+- ff_down matmul on FF=12288 input, H=3072 output. Worst-case rows
+  hit F16 max.
+
+#### Why §4.4d (synthetic real-GGUF smoke) was GREEN
+
+The 4.4d real-GGUF smoke (`tools/probes/qie_q44_real_gguf_smoke`) used
+`fill_random_f32_via_f16(amp=0.1)` for img/txt residuals AND
+`fill_random_f16(t_emb, amp=0.1)`. With t_emb max ≈ 0.1 instead of
+the real 111.8:
+
+- silu(t_emb) max ≈ 0.05 (vs 111.8 real)
+- img_mod / txt_mod outputs max ≈ 5 (vs 269 / 141 real)
+- modulate2 output max ≈ 5 (vs 634 real)
+- ff_up output max ≈ 25 (vs 2434 real)
+- ff_down output max ≈ 100 (vs 65504 real)
+
+The 4.4d test was numerically **two orders of magnitude under** the
+real Step 4 magnitudes everywhere downstream of t_emb. F32 residual
+storage worked fine because there was nothing to store-overflow.
+
+#### Why mission's prescribed F32 widening doesn't help
+
+Mission asked: "extend 4.4d F32 to img_in / txt_in / time_linear /
+norm_out / proj_out projection outputs". Per Receipt 1, those outputs
+are already clean (max ≤ 582). Casting them to F32 immediately after
+the matmul is a no-op for clean values — the matmul **already**
+produced a representable F16, and F16→F32 cast preserves it.
+
+The mission's escape hatch applies:
+> If NaN persists after F32 projections: the issue is elsewhere
+> (modulation gate? FIA softmax?). Document and escalate.
+
+The leak is **inside forward_block_'s FFN down-projection**, which is
+inside the 4.4d-protected block — not at the projection boundary. The
+fix requires widening the **internal** matmul output dtype, NOT the
+projection boundary.
+
+#### Proposed escalation paths
+
+1. **Widen ff_down output dtype**: smallest scope. Replace
+   `dispatch_matmul_(scratch_mlp_dev_, ff_down_w, ..., scratch_*_out_dev_)`
+   with a variant that produces F32 output, then cast F32→F16 only at
+   the entry to gate-mul. **But** this only delays the problem: the
+   F16 Mul inside `gated_residual_add_f32_` still overflows when
+   ff_down*gate exceeds F16 max. Need to also rewrite that path to
+   compute `(F32 ff_down * F16 gate)` cast-in-Mul or `(F32 ff_down *
+   F32 gate)` post-cast Mul. Vendor risk: WQBMMv3 doesn't directly
+   support F32 output on 910b — would require dequantising ff_down
+   weights to F16 and routing through aclnnMm with F32 output tensor
+   (cubeMathType=ALLOW_FP32_DOWN_PRECISION). Dequant adds memory cost
+   — ff_down is the largest matmul (FF×H = 12288×3072 = 37.7M
+   weights × 2 bytes per layer × 60 layers = 4.5 GiB extra HBM if we
+   keep an F16 copy for all layers).
+
+2. **Widen mod2 output dtype**: prevent modulate2 from producing
+   max=635. If mod_b2 is split scale/shift, scale could be capped /
+   regularized at load time — but that would alter trained behavior.
+   Probably NOT a viable surgical fix.
+
+3. **Rescale on entry to ff_up**: clip / scale modulate2 output before
+   FFN. Same concern — alters behavior.
+
+4. **Promote attn-out projection (`to_out_0`, `to_add_out`) to F32**:
+   these saw max=740 / 634 at block 0 — under F16 limit but close. At
+   deeper blocks they may exceed 65504. Same widening cost question.
+
+5. **Block-level magnitude clamp**: insert an F16 max-clip after each
+   matmul output to prevent overflow. Cheap (one aclnnClamp per
+   matmul) but mathematically incorrect — clipping changes activations.
+
+6. **BF16 storage end-to-end**: 910b WQBMMv3 supports BF16 output via
+   `GGML_CANN_QUANT_BF16=on` env. BF16 has F16-equivalent precision
+   but F32-equivalent range (~3.4e38). This is a separate workstream
+   already in flight (see ggml-cann fork Path C #4). For QIE native
+   engine, plumbing BF16 weight/output dtype through `dispatch_matmul_`
+   would solve the FFN overflow at the matmul level. Recommended path.
+
+#### Verdict
+
+**RED — root cause isolated, NOT in scope of mission's prescribed fix.**
+Mission's prescription would not change the outcome (Receipt 1 proves
+projections are clean). Escalating: requires widening the **internal**
+ff_down matmul output dtype (Path 1) or BF16 plumbing into
+dispatch_matmul_ (Path 6). Both are larger changes than the mission's
+"widen 5 projections" scope.
+
+#### What landed in this session
+
+- New diagnostic instrumentation (env-gated, dormant by default):
+  `QIE_DEBUG_NAN_BISECT`, `QIE_DEBUG_PER_BLOCK_NAN`, `QIE_DEBUG_INTRA_BLOCK0`.
+  Together they bisect any future NaN regression to a specific op in
+  ≤ 3 build cycles. Step 1 `denoise_loop_test` synthetic regression is
+  unaffected (env vars off by default; per-block scan is one-shot
+  static-latched on first call).
+- Empirical magnitude profile of block 0 with real weights at
+  σ=1.0 (the high-noise regime), 24 measurement points.
+- Falsification of mission's primary hypothesis.
+- Identification of the actual leak surface (FFN down-projection, not
+  the projections).
+
+#### Logs / artifacts (ac03)
+- `/tmp/qie_q45_step4_bisect.log` — five-projection probe (RED, all
+  projections clean, NaN emerges in 60-block loop)
+- `/tmp/qie_q45_step4_perblock.log` — per-block scan (Inf at b00,
+  NaN propagating from b01)
+- `/tmp/qie_q45_step4_intra.log` — 24-point intra-block-0 scan (Inf
+  emerges at 23_txt_ff_down + 20_img_ff_down)
+
+#### Wall summary
+- Five-projection bisect: init 100.0 s + denoise_full 24.9 s = 124.9 s
+- Per-block scan (n_steps=1): init 103.7 s + denoise_full ~3 s
+- Intra-block scan (n_steps=1): init 103.0 s + denoise_full 2.7 s
