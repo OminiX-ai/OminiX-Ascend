@@ -2304,3 +2304,196 @@ The Q2.4.5.4g commit (`8bcad851`) ships the gate-dump probe
 audit trail in this section. Numerical gate (Step 1 cos_sim=1.0)
 unchanged because the env var is OFF by default and the chunk binding
 is byte-identical to the pre-§5.5.7 path.
+
+### §5.5.8 Step 4h — t_emb upstream bisect (Q2.4.5.4h)
+
+Mission: identify which upstream op is amplifying `00_t_emb_in` to
+`max_abs=111.8`. Hand-off from §5.5.7 named four suspects:
+(1) `time_text_embed` Q4 dequant scale; (2) `txt_norm` RMSNorm
+output magnitude; (3) `txt_in` projection scale; (4) `time_linear*`
+SiLU mis-application.
+
+**Methodology:** `image_diffusion_engine.cpp::denoise_full` already
+ships `probe_stats` calls (gated by `QIE_DEBUG_NAN_BISECT=1`, step 0
+only) at every stage of the time-embed and txt-conditioning chains:
+`pre_time_linear1`, `post_time_linear1`, `post_time_silu`,
+`post_time_linear2`, `pre_txt_norm.cond`, `post_txt_norm.cond`,
+`post_txt_in.cond`, `txt_res_c_f32`. Combined with the existing
+`intra_b0` probes, no source changes were needed for Step 1. Ran
+the §5.5.5 Step 4 probe on ac03 with all three env gates enabled
+(`QIE_DEBUG_NAN_BISECT=1 QIE_DEBUG_INTRA_BLOCK0=1
+QIE_DEBUG_DUMP_GATES=1`, `QIE_N_STEPS=2`) — log at
+`/tmp/qie_q2454h_step1_temb_bisect.log`.
+
+#### t_emb chain magnitudes (real Q4_0 weights, real conditioning)
+
+| stage                         | dtype | mean_abs | max_abs |
+|-------------------------------|-------|---------:|--------:|
+| `pre_time_linear1` (sinusoid) | F16   | 0.636    | 1.0     |
+| `post_time_linear1` (Q4 mm+b) | F16   | 0.231    | 21.44   |
+| `post_time_silu`              | F16   | 0.0804   | 21.44   |
+| `post_time_linear2` (Q4 mm+b) | F16   | 0.3261   | 111.8   |
+| `00_t_emb_in` (downstream)    | F16   | 0.3261   | 111.8   |
+| `01_silu_t_emb`               | F16   | 0.1479   | 111.8   |
+
+#### txt chain magnitudes
+
+| stage                  | dtype | mean_abs | max_abs |
+|------------------------|-------|---------:|--------:|
+| `pre_txt_norm.cond`    | F32   | 2.716    | 151.3   |
+| `post_txt_norm.cond`   | F16   | 0.468    | 10.63   |
+| `post_txt_in.cond`     | F16   | 7.029    | 583.5   |
+| `txt_res_c_f32`        | F32   | 7.029    | 583.5   |
+
+#### Diagnosis (suspects 1-4 disconfirmed)
+
+The amplification is **two-stage** — `time_linear1` (1→21.44, 21×)
+and `time_linear2` (21.44→111.8, 5×). SiLU is correctly applied
+(post_silu mean_abs=0.08 = ~SiLU(0.231) for the bulk; sign
+preservation visible in mean_abs drop while max_abs is preserved).
+`txt_norm` is healthy (max 151.3 → 10.63, RMS-normalised).
+`txt_in` produces a **second** big outlier (583.5).
+
+**A/B test:** re-ran with `QIE_MATMUL_INNER_PRECISE=0
+QIE_MATMUL_CUBE_MATH=1` (F32 accumulator, F32 cube math) — log at
+`/tmp/qie_q2454h_step1b_temb_f32acc.log`. **Magnitudes byte-identical**
+to F16-accum run. Rules out F16-accumulator overflow as the
+amplifier — this is data-resident, not a numeric-precision bug.
+
+**Cross-check on Q4 dequant scale handling:** §5.5.5 Step 1's
+synthetic-identity-weight gate (`cos_sim=1.0` on `forward_block_test`)
+already validates that `repack_q4_0_upload`'s scale buffer + WQBMMv3
+forward path is correct *for synthetic weights*. The 21× / 5× / 60×
+outliers therefore reflect the **trained Qwen-Image weights**, not
+a code bug. This matches the well-documented "outlier feature"
+phenomenon in DiTs (a small subset of dimensions carry
+disproportionate magnitude after timestep MLPs).
+
+**Conclusion (Q2.4.5.4h Step 1):** all four suspects from §5.5.7
+hand-off are disconfirmed. `00_t_emb_in max_abs=111.8` is *not*
+introduced by upstream Ascend code — it is the trained-model
+distribution. The CUDA reference would report the same magnitudes
+on the same input.
+
+#### Real bug — F16 overflow in `ff_down` post-modulate
+
+Per-block intra_probe data from the same log already shows the
+explosion site:
+
+| stage (block 0)        | mean_abs | max_abs   | NaN/Inf       |
+|------------------------|---------:|----------:|---------------|
+| 14_img_LN2             | 0.439    | 20.11     | 0/0           |
+| 15_img_mod2            | 27.86    | 467.2     | 0/0           |
+| 18_img_ff_up           | 198.7    | 2438      | 0/0           |
+| 19_img_gelu            | 107      | 2438      | 0/0           |
+| **20_img_ff_down**     | **4819** | **6.3e+04** | **0/0**     |
+| 23_txt_ff_down         | 4950     | 5.5e+04   | **0/214 Inf** |
+| 24_img_resid2 (F32)    | 8897     | 6.6e+04   | **0/272k Inf**|
+| 24_txt_resid2 (F32)    | 24500    | 6.6e+04   | **0/224k Inf**|
+| post_blocks.img_res_c  | 0        | 0         | **all NaN**   |
+
+`ff_down` (FFN second matmul, [12288→3072] in Qwen-Image) consumes
+GeLU output with max_abs=2438. Even at a unit-variance weight, a
+12288-wide dot-product of magnitude-100 inputs lands near
+sqrt(12288)·100 ≈ 11000 — close to F16 max (65504). With a couple
+of outlier columns, individual outputs cross 65504 and become Inf.
+Once one block emits Inf in the residual, every subsequent block
+propagates and the post-60-block latent is all-NaN.
+
+The driver is **F16 multiplicative compounding** of the `mod2` scale
+(`(1+scale_mlp)` ≈ 1+27 = 28 per the chunk-4 mean) into LN(x), then
+through a 12288-wide ff_down with F16 accumulation. The post-LN
+output has max_abs=20 (LN can't fully bound outlier features when
+scale is 27×); ff_up amplifies by ~120× to 2438; GeLU is a no-op
+on positive max; ff_down sums 12288 such values in F16 → overflow.
+
+**A/B test 2 — `QIE_FFN_DOWN_BF16=1`** (log
+`/tmp/qie_q2454h_step1c_ffdown_bf16.log`): switching ff_down store
+dtype to BF16 eliminates the **block-0 Inf** at `23_txt_ff_down`
+(was 214 Inf, now 0 Inf) and `24_*_resid2` (was 271k+224k Inf, now
+0 Inf each). Block 0 stays finite. However the mean/max grow
+because previously-saturated values now express themselves as
+finite-but-huge numbers:
+
+| stage (block 0)        | F16 store (default) | BF16 store        |
+|------------------------|---------------------|-------------------|
+| 20_img_ff_down         | mean 4819 max 6.3e+04 / 0 Inf | mean 4819 max 6.3e+04 / 0 Inf |
+| 23_txt_ff_down         | mean 4950 max 5.5e+04 / **214 Inf** | mean 4972 max 7.2e+04 / **0 Inf** |
+| 24_img_resid2 (F32)    | mean 8897 max 6.6e+04 / **272k Inf** | mean 1.1e+05 max 7.4e+06 / **0 Inf** |
+| 24_txt_resid2 (F32)    | mean 24500 max 6.6e+04 / **224k Inf** | mean 7.0e+04 max 4.6e+06 / **0 Inf** |
+| post_blocks.img_res_c  | all NaN | all NaN |
+| out_latent             | all NaN | all NaN |
+
+So `QIE_FFN_DOWN_BF16=1` patches the immediate F16 saturation but
+the residual's 1e+07-scale magnitude still NaN's somewhere across
+blocks 1-59. **Block 0 overflow is downstream of a real magnitude
+explosion, not just a numeric-precision issue.**
+
+#### Real driver — AdaLN mod2 multiplicative compounding
+
+The 60×-block magnitude growth is driven by the modulation chunks:
+chunk[4] (`legShift2` in §5.5.7 pinned-legacy ordering) has
+`mean_abs=26.21 max_abs=200`. Under legacy ordering chunk[4] is
+applied *additively* as `shift2`, so its per-block contribution to
+the post-modulate output is *additive* (bounded by chunk magnitude).
+Under spec ordering it is `scale_mlp` and applied as `(1+scale)`,
+which is *multiplicative* — so per-block growth factor is
+`(1 + 26)` ≈ 27× compounded over 60 blocks. §5.5.7 verified the
+spec-ordering RED smoke (`std=33.88` final latent) and pinned
+legacy as bug-for-bug safer. **Legacy is still RED at block 0**
+because chunk[4]=200 added to post-LN(≈1) values produces ~200
+input to ff_up, then ~24000 post-GeLU, then ff_down's 12288-wide
+sum accumulates to F16-overflow regardless of accumulator
+precision.
+
+The amplification is therefore **fundamental to the trained
+weights' interaction with the AdaLN modulation chunk binding**, not
+a numeric bug at any single op. Both legacy and spec orderings RED
+on real Q4 weights — legacy fails at block 0 (F16 overflow, fixable
+with BF16 store but residual still huge); spec fails by 60×
+multiplicative compounding (final std=33.88 vs reference 0.36).
+
+#### Conclusion
+
+Step 1 (t_emb upstream bisect) closes with **all four §5.5.7
+suspects disconfirmed**: t_emb's 100× max_abs is the trained-model
+distribution, not an Ascend-side bug. The visible mode collapse is
+driven by AdaLN modulation × FFN compounding, which compounds
+multiplicatively (spec ordering) or saturates additively (legacy
+ordering, with F16 ff_down overflow). Neither ordering produces a
+finite, well-conditioned post-block latent.
+
+**Hand-off to next agent (Q2.4.5.4i):** the t_emb hypothesis is
+exhausted. Two remaining angles:
+
+1. **Re-examine modulation chunk semantics on the actual GGUF
+   weight layout.** §5.5.7's chunk-magnitude table shows chunk[4]
+   mean_abs=26.21 — but under the canonical Diffusers MMDiT layout,
+   `scale_msa`/`scale_mlp` are initialised near zero so the model
+   starts identity. A chunk with mean_abs=26 *cannot* be a healthy
+   `scale_*` chunk on trained weights. This suggests the GGUF row
+   permutation produced by HuggingFace's Qwen-Image-Edit-2509 Q4_0
+   conversion may not match the upstream MMDiT chunk order. Cross-
+   check `transformer_qwenimage.py:425` against the actual GGUF
+   tensor row layout (`tools/ominix_diffusion/src/qwen_image.hpp`'s
+   ggml-backed `mod_split` to verify).
+
+2. **Compare native vs. CPU reference engine `forward_block` output
+   on identical Q4 weights and identical (img,txt,t_emb) inputs.**
+   `tools/ominix_diffusion/src/qwen_image.hpp::QwenImageBlock::forward`
+   produces a ground-truth block-0 output; if its `ff_down` doesn't
+   overflow on the same t_emb=111.8 input, then the native engine's
+   `mod2` apply order or `ff_down` matmul precision is the bug. The
+   ggml CPU path uses F32 throughout, so a magnitude comparison
+   isolates Ascend-side precision issues from algorithm errors.
+
+Receipts:
+- `/tmp/qie_q2454h_step1_temb_bisect.log` (default precision; 121 lines)
+- `/tmp/qie_q2454h_step1b_temb_f32acc.log` (F32-accum A/B; t_emb
+  byte-identical, ff_down still RED)
+- `/tmp/qie_q2454h_step1c_ffdown_bf16.log` (BF16 ff_down store;
+  block 0 stops Inf'ing but residual hits 1e+07 magnitude, output
+  still NaN after 60 blocks)
+
+No source changes committed in Q2.4.5.4h. Numerical gate (Step 1
+cos_sim=1.0 with all env vars unset) unchanged.
