@@ -2497,3 +2497,161 @@ Receipts:
 
 No source changes committed in Q2.4.5.4h. Numerical gate (Step 1
 cos_sim=1.0 with all env vars unset) unchanged.
+
+### §5.5.9 Step 4i — CPU vs NPU block-0 bisect (Q2.4.5.4i) — YELLOW (partial)
+
+**Mission (per §5.5.8 hand-off angle 2):** discriminate between
+"native algorithm correct, mode collapse is design+precision" and
+"algorithm error somewhere in modulation/attn/ffn ordering" by
+running ONE block-0 forward through the ggml CPU backend (F32
+end-to-end, no Ascend) on the **identical** `(img, txt, t_emb, pe)`
+inputs that the native engine consumed, then element-wise comparing
+the post-resid2 outputs.
+
+**Probe stack** (`tools/probes/qie_block0_cpu_reference/`):
+
+- `test_qie_block0_cpu_reference.cpp` — CPU-only ggml block-0 harness
+  that wraps `Qwen::QwenImageRunner`, dequantises Q4_0 weights to F32
+  via the standard `ModelLoader` path, and runs only
+  `transformer_blocks.0.forward(img, txt, t_emb, pe)`.
+- `compare_block0.py` — element-wise comparator (per-row cosine,
+  magnitude ratio, sign-agreement, top max-abs channel overlap, auto
+  GREEN/YELLOW/RED verdict).
+- `run_step_4i.sh` — orchestrator: native dump → CPU reference →
+  comparison.
+- Engine patch (`image_diffusion_engine.cpp`, env-gated by
+  `QIE_DUMP_BLOCK0_DIR`): writes `00_img.f32`, `00_txt.f32`,
+  `00_t_emb.f32`, `24_img_resid2.f32`, `24_txt_resid2.f32` for
+  block 0 only.
+
+**Run config (small-smoke discriminator):** `img_seq=64 txt_seq=32
+H=3072`, `QIE_FFN_DOWN_BF16=1`, `QIE_N_STEPS=1`, real Q4_0 weights
+(`Qwen-Image-Edit-2509-Q4_0.gguf`), real conditioning. Native dump
+under HBM lock; CPU reference forwarded under 8 threads.
+
+#### Output magnitudes (block-0 post-resid2)
+
+| stream     | engine  | mean_abs | max_abs | NaN | Inf |
+|------------|---------|---------:|--------:|----:|----:|
+| img_resid2 | native  | 6.79     | 768.9   | 0   | 0   |
+| img_resid2 | CPU F32 | 6.80     | 760.5   | 0   | 0   |
+| txt_resid2 | native  | 13.67    | 742.0   | 0   | 0   |
+| txt_resid2 | CPU F32 | 10.72    | 545.5   | 0   | 0   |
+
+Magnitude ratio (native ÷ CPU): `mean_abs` 0.999 (img) / 1.275 (txt);
+`max_abs` 1.011 (img) / 1.36 (txt). **Magnitudes are within 1.4×
+across the board**, NaN/Inf-free on both engines. (Note: small-smoke
+shapes with `QIE_FFN_DOWN_BF16=1` do not exhibit the 1.1e5 / 7.4e6
+magnitudes from §5.5.8, which were measured on production-scale
+shapes — but the §5.5.8 finding "block 0 stays finite under
+`QIE_FFN_DOWN_BF16=1`" is reaffirmed here.)
+
+#### Per-row cosine similarity distribution
+
+| stream     | min   | p10   | p50   | p90   | mean  | max   |
+|------------|------:|------:|------:|------:|------:|------:|
+| img_resid2 | 0.225 | 0.464 | 0.616 | 0.733 | 0.608 | 0.818 |
+| txt_resid2 | 0.394 | 0.533 | 0.625 | 0.705 | 0.610 | 0.722 |
+
+Sign-agreement fraction: 0.769 (img) / 0.693 (txt).
+Relative-error p50 / p90 / p99: 0.74 / 4.46 / 44.7 (img); 1.06 / 6.41
+/ 64.2 (txt).
+
+Top-8 max-abs channel indices overlap between native and CPU:
+img top-2 `[673, 1691]` match exactly (and 5/8 in top-8); txt top-3
+`[3038, 169, 912]` match (different order) and 6/8 in top-8. The
+**dominant outlier channels are the same**, but per-element
+magnitudes drift.
+
+#### Verdict — YELLOW (partial)
+
+Comparator auto-verdict (`compare_block0.py:158`): **YELLOW —
+partial direction agreement (cos_mean=0.607 / 0.610) — examine
+intermediate substeps.** Both streams; exit code 1.
+
+This is **not GREEN** (would require cos_mean > 0.99), but is also
+**not RED** (algorithm-broken would be cos_mean ≤ 0.5 with no
+channel-index overlap). The directional disagreement is
+**uniform across the row distribution** (no bimodal "some rows
+correct, some rows scrambled"), so the bug is not a row permutation
+of the chunk binding. Combined with the matched dominant-channel
+indices, the most-likely class is **substantial numeric drift in
+attention or post-LN that affects per-element values without
+shifting the channel-statistics distribution**. Probable culprits,
+in priority order:
+
+1. **F16 attention accumulation** — softmax over 96 heads × (64+32)
+   tokens × dim_head=64 with F16 store/accum can produce ~1% per-
+   element drift that compounds through the residual to ~40%
+   per-element error while preserving column-mean / channel-rank
+   statistics. Test: switch attention QKV/out to BF16 store via a
+   new `QIE_ATTN_BF16=1` gate, re-run the bisect.
+2. **AdaLN modulation chunk binding** — if chunk[3]/chunk[4]/chunk[5]
+   row binding differs by a *non-permutation* (e.g. an inadvertent
+   transpose that preserves column statistics but scrambles per-
+   element values), this exact YELLOW signature would result.
+   Test: dump `img_mod1`, `img_mod2`, `txt_mod1`, `txt_mod2` chunk
+   tensors side-by-side from native and CPU; element-wise compare.
+3. **F16 RMSNorm in `txt_norm` / `img_norm{1,2}`** — variance
+   computation in F16 with `H=3072` reductions is borderline. Test:
+   force F32 normalisation via existing `ENV` gate or add one.
+
+#### Strategic recommendation
+
+**Do not pivot to Path C #5 yet.** GREEN was the gating signal for
+the pivot; YELLOW(partial) means the native engine has a real
+per-element bug that is *not* explained by F16 ff_down saturation
+alone (which is what §5.5.8 surfaced) and *not* explained by AdaLN
+chunk-row permutation (which would have produced RED). The
+60-block compounding of this ~40% per-block per-element drift is
+**sufficient on its own** to explain the all-NaN final latent
+without invoking the AdaLN multiplicative-compounding hypothesis
+from §5.5.8. We have a tractable Step 4j ahead: extend
+`QIE_DUMP_BLOCK0_DIR` to also emit the post-LN1, post-mod1,
+post-attn-img, post-attn-txt, post-resid1, post-LN2, post-mod2,
+post-ffn-img, post-ffn-txt intermediates (the existing `intra_probe`
+sites at `image_diffusion_engine.cpp:3343-3625` already compute
+these in F32 buffers — extending to disk-write is ~30 LoC), then
+re-run the comparator on each substage to localise the substep that
+first drops below cos>0.99.
+
+**Hand-off to Q2.4.5.4j:** extend dump to intermediates; bisect
+which sub-step (LN1, mod1, attn, resid1, LN2, mod2, ffn, resid2)
+first violates cos>0.99 against the CPU reference. Once isolated,
+the fix is one of: (a) BF16 widening at that op, (b) F32 promotion
+for that op, or (c) algorithmic patch (chunk re-binding /
+transpose).
+
+#### Receipts
+
+- `/tmp/qie_block0_inputs/` — native dump (5 files, total 2.3 MB):
+  `00_img.f32`, `00_txt.f32`, `00_t_emb.f32`, `24_img_resid2.f32`,
+  `24_txt_resid2.f32`.
+- `/tmp/qie_block0_outputs/` — CPU reference (2 files, 1.2 MB):
+  `cpu_24_img_resid2.f32`, `cpu_24_txt_resid2.f32`.
+- `/tmp/qie_q2454i_run.log` — orchestrator log (135+ lines; native
+  dump phase + Step 1 build errors + Step 2 fixes).
+
+#### Probe build fixes applied during the run
+
+Three issues had to be patched before the CPU reference would build:
+
+1. `-DGGML_MAX_NAME=128` added to `build_and_run.sh` (top-level
+   `CMakeLists.txt:6` defines this for the engine build but the
+   probe didn't propagate it).
+2. `Qwen::QWEN_IMAGE_GRAPH_SIZE` namespace-qualified (probe class is
+   at global scope, not inside `namespace Qwen`).
+3. `GGMLBlock::blocks` is `protected`; access via a `using`-
+   redeclaration helper (`PublicQwenImageModel`) reinterpret-cast
+   over the existing `qwen_image` member. Probe-only idiom; no
+   upstream header changes.
+4. `ggml_extend.hpp::get_compute_graph` overrides the LAST graph
+   node's name to `final_result_name`. Probe expanded `img_out`
+   first then `txt_out`, so `txt_out` was renamed; lookup fixed
+   to `ggml_get_tensor(compute_ctx, final_result_name.c_str())`.
+5. `thirdparty/zip.c` added to compile units (model.cpp's
+   PyTorch-checkpoint loader unconditionally pulls in the kubazip
+   API, even though the probe only loads GGUF).
+
+Probe is now self-contained and re-runnable with one command:
+`bash tools/probes/qie_block0_cpu_reference/run_step_4i.sh`.
