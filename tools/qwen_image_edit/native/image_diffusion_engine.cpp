@@ -1528,31 +1528,65 @@ bool ImageDiffusionEngine::dispatch_matmul_(void *x_f16_dev, void *weight_dev,
     aclTensor *t_y = use_bf16 ? tensor_nd_bf16(y_dev, 2, y_shape, y_strides)
                               : tensor_nd_f16 (y_dev, 2, y_shape, y_strides);
 
-    // Q2.4.5.4c BF16 plumbing on aclnnMm fallback path: pre-cast input and
-    // weight F16→BF16 to local scratch buffers. Skipped for the WQBMMv3
-    // path (which is INT4 weight + F16-scale) and for non-BF16 callers.
+    // Q2.4.5.4c/d BF16 plumbing — pre-cast input F16→BF16 to local scratch.
+    // Both matmul paths need this when out_dtype=BF16:
+    //   - aclnnMm fallback: BF16/BF16/BF16 with cubeMathType=1.
+    //   - WQBMMv3 (Q4 path): activation must match scale/output dtype
+    //     (CANN spec — confirmed empirically: WQBMMv3 returns 161002
+    //     "wrong dtype combo" when t_x stays F16 while t_scale and t_y
+    //     are BF16).
+    // Weight pre-cast (F16→BF16) is exclusive to the aclnnMm path; the
+    // WQBMMv3 path keeps the INT4-packed weight verbatim and uses the
+    // already-cast BF16 scale tile.
     void *bf16_x_dev = nullptr;   // pre-cast input scratch (M*K BF16)
-    void *bf16_w_dev = nullptr;   // pre-cast weight scratch (K*N BF16)
-    if (use_bf16 && weight_scale_dev == nullptr) {
+    void *bf16_w_dev = nullptr;   // pre-cast weight scratch (K*N BF16) — aclnnMm only
+    if (use_bf16) {
         const size_t x_bytes = (size_t)M * (size_t)K * 2;
-        const size_t w_bytes = (size_t)K * (size_t)N * 2;
-        // Reuse the BF16 scale slot for input (smaller buffer); allocate
-        // a separate weight cache. We grow scratch_bf16_scale_dev_ for x
-        // and scratch_bf16_bias_dev_ for the larger w (since on aclnnMm
-        // path neither original consumer is active for this call). On
-        // call exit they remain allocated for next-call reuse.
-        if (!ensure_dev_grow_(&scratch_bf16_scale_dev_,
-                               &scratch_bf16_scale_bytes_, x_bytes)) {
-            g_cann.aclDestroyTensor(t_x); g_cann.aclDestroyTensor(t_y);
-            return false;
+        // Reuse scratch_bf16_scale_dev_ for the input cast. For the
+        // aclnnMm path scratch_bf16_scale_dev_ is otherwise unused; for
+        // the WQBMMv3 path it ALSO holds the cast scale tile, but the
+        // scale cast happens AFTER the input cast (input is consumed in
+        // the matmul launch which is sequenced after the scale cast),
+        // and we need the input buffer to remain valid through the
+        // matmul launch. Sequencing: input lives in scratch_bf16_scale_dev_
+        // first; for WQBMMv3 the scale is cast into scratch_bf16_bias_dev_
+        // (tail buffer) instead — we re-route the scale buffer below.
+        // For simplicity we use a dedicated pair of buffers per path.
+        //
+        // The aclnnMm path uses (scratch_bf16_scale_dev_, scratch_bf16_src_f32_dev_)
+        // for (input_x, weight_w) since neither original consumer fires.
+        // The WQBMMv3 path uses (scratch_bf16_src_f32_dev_, scratch_bf16_scale_dev_)
+        // for (input_x, scale) — input goes into the larger src_f32 slot
+        // and scale into the smaller scale slot. Sized for the worst
+        // input (M·K BF16 ≤ FF·H bytes per call) and worst scale tile
+        // (K/32 · N BF16). M·K can exceed the scale-tile size at the
+        // attn-out site (M = max(seq) = 4096, K = H = 3072 → 24 MiB)
+        // vs scale tile (K/32 · N = 96 · H = 288 K elems = 0.6 MiB) so
+        // src_f32 must hold the input. Both buffers grow lazily.
+        if (weight_scale_dev != nullptr) {
+            // WQBMMv3 path layout.
+            if (!ensure_dev_grow_(&scratch_bf16_src_f32_dev_,
+                                   &scratch_bf16_src_f32_bytes_, x_bytes)) {
+                g_cann.aclDestroyTensor(t_x); g_cann.aclDestroyTensor(t_y);
+                return false;
+            }
+            bf16_x_dev = scratch_bf16_src_f32_dev_;
+        } else {
+            // aclnnMm path layout — input + weight both need BF16 scratch.
+            const size_t w_bytes = (size_t)K * (size_t)N * 2;
+            if (!ensure_dev_grow_(&scratch_bf16_scale_dev_,
+                                   &scratch_bf16_scale_bytes_, x_bytes)) {
+                g_cann.aclDestroyTensor(t_x); g_cann.aclDestroyTensor(t_y);
+                return false;
+            }
+            if (!ensure_dev_grow_(&scratch_bf16_src_f32_dev_,
+                                   &scratch_bf16_src_f32_bytes_, w_bytes)) {
+                g_cann.aclDestroyTensor(t_x); g_cann.aclDestroyTensor(t_y);
+                return false;
+            }
+            bf16_x_dev = scratch_bf16_scale_dev_;
+            bf16_w_dev = scratch_bf16_src_f32_dev_;
         }
-        if (!ensure_dev_grow_(&scratch_bf16_src_f32_dev_,
-                               &scratch_bf16_src_f32_bytes_, w_bytes)) {
-            g_cann.aclDestroyTensor(t_x); g_cann.aclDestroyTensor(t_y);
-            return false;
-        }
-        bf16_x_dev = scratch_bf16_scale_dev_;
-        bf16_w_dev = scratch_bf16_src_f32_dev_;
 
         // Cast input F16 → BF16. Flat 1-D view (cast is shape-agnostic).
         {
@@ -1577,8 +1611,8 @@ bool ImageDiffusionEngine::dispatch_matmul_(void *x_f16_dev, void *weight_dev,
                 return false;
             }
         }
-        // Cast weight F16 → BF16. Flat 1-D view.
-        {
+        // Cast weight F16 → BF16 (aclnnMm path only).
+        if (weight_scale_dev == nullptr) {
             int64_t f_shape[1]   = {(int64_t)(K * N)};
             int64_t f_strides[1] = {1};
             aclTensor *t_wf16 = tensor_nd_f16 (weight_dev, 1, f_shape, f_strides);
@@ -1667,12 +1701,26 @@ bool ImageDiffusionEngine::dispatch_matmul_(void *x_f16_dev, void *weight_dev,
             t_scale = tensor_nd_f16(weight_scale_dev, 2, s_shape, s_strides);
         }
 
+        // Q2.4.5.4d: under BF16 output the activation must also be BF16
+        // (WQBMMv3 dtype-strict — F16 input vs BF16 scale/output returns
+        // status=161002 "wrong dtype combo"). Use the pre-cast input
+        // built earlier (`bf16_x_dev` in scratch_bf16_src_f32_dev_).
+        aclTensor *t_x_local_bf16 = nullptr;
+        aclTensor *t_x_eff = t_x;
+        if (use_bf16) {
+            int64_t x_shape_local[2]   = {M, K};
+            int64_t x_strides_local[2] = {K, 1};
+            t_x_local_bf16 = tensor_nd_bf16(bf16_x_dev, 2, x_shape_local,
+                                              x_strides_local);
+            t_x_eff = t_x_local_bf16;
+        }
+
         uint64_t ws_needed = 0;
         aclOpExecutor *exec = nullptr;
         if (g_cann.aclnnWeightQuantBatchMatmulV3GetWorkspaceSize &&
             g_cann.aclnnWeightQuantBatchMatmulV3) {
             s = g_cann.aclnnWeightQuantBatchMatmulV3GetWorkspaceSize(
-                t_x, t_w, t_scale,
+                t_x_eff, t_w, t_scale,
                 /*antiquantOffsetOptional*/ nullptr,
                 /*quantScaleOptional*/      nullptr,
                 /*quantOffsetOptional*/     nullptr,
@@ -1699,6 +1747,7 @@ bool ImageDiffusionEngine::dispatch_matmul_(void *x_f16_dev, void *weight_dev,
         }
         g_cann.aclDestroyTensor(t_w);
         g_cann.aclDestroyTensor(t_scale);
+        if (t_x_local_bf16) g_cann.aclDestroyTensor(t_x_local_bf16);
         if (s != 0) {
             g_cann.aclDestroyTensor(t_x);
             g_cann.aclDestroyTensor(t_y);
@@ -3016,20 +3065,41 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
     // QIE_FFN_DOWN_BF16=1 → emit BF16 from the ff_down WQBMMv3 dispatch and
     // route the gated-residual #2 add through gated_residual_add_f32_bf16src_
     // (cast BF16 src → F32 before the gate-mul, escaping F16 65504 saturation).
-    // QIE_ALL_BF16=1 (Step 7 widening) currently aliases to QIE_FFN_DOWN_BF16
-    // pending the broader audit (additional matmul outputs + their consumers
-    // need to be promoted in lockstep).
+    //
+    // Q2.4.5.4d Step 7 widening (this commit):
+    // QIE_ALL_BF16=1 → in addition to ff_down, also emit BF16 from the
+    // attention-output projections (`to_add_out` for txt and `to_out_0` for
+    // img — block residual #1 contributors) and route gated-residual #1
+    // through the same BF16-src variant. §5.5.4 receipt 2 surfaced a leak
+    // at block 1 IMG once block 0 ff_down was BF16-clean: with the F32
+    // residual stream now safely holding 7.2M magnitudes, block 1's
+    // post-LN/post-modulate inputs are still bounded but the per-channel
+    // matmul outputs for attn-out + ff-down can both saturate at F16 max
+    // once the residual contribution accumulates. Both contributors must
+    // be BF16 to keep the residual additive chain overflow-free. Other
+    // matmul callsites (Q/K/V projections, FFN-up, modulation linear,
+    // norm_out / proj_out / time_linear / img_in / txt_in) are NOT
+    // promoted under QIE_ALL_BF16 because their downstream consumers
+    // (RMSNorm + RoPE + FIA, GELU, modulate, Cast/SiLU, CFG-compose) are
+    // F16-strict and the magnitudes there are bounded by the upstream
+    // LN/SiLU normalization (max ≤ ~3700 observed at block 0, far below
+    // F16's 65504). The leak surface is solely the residual contributors.
     static int s_ffn_down_bf16 = -1;
+    static int s_all_bf16      = -1;
     if (s_ffn_down_bf16 < 0) {
         const char *v_specific = std::getenv("QIE_FFN_DOWN_BF16");
         const char *v_all      = std::getenv("QIE_ALL_BF16");
         int specific = v_specific ? std::atoi(v_specific) : 0;
         int all      = v_all      ? std::atoi(v_all)      : 0;
+        s_all_bf16      = all;
         s_ffn_down_bf16 = specific || all;
-        QIE_LOG("forward_block_: QIE_FFN_DOWN_BF16=%d (BF16 ff_down output + "
-                "BF16-src gated-residual #2)", s_ffn_down_bf16);
+        QIE_LOG("forward_block_: QIE_FFN_DOWN_BF16=%d QIE_ALL_BF16=%d "
+                "(ff_down BF16 + bf16src #2 always under either; "
+                "attn-out BF16 + bf16src #1 only under ALL)",
+                s_ffn_down_bf16, s_all_bf16);
     }
     const bool ffn_down_bf16 = s_ffn_down_bf16 != 0;
+    const bool attn_out_bf16 = s_all_bf16 != 0;
 
     // Q2.4.5.4c: probe is dtype-aware via a 3-state enum-like overload set.
     // The legacy bool overload (`is_f16`) is preserved verbatim; a new int
@@ -3328,24 +3398,45 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
     //    scratch_txt_out_dev_ so the subsequent gated residual is a pure
     //    add on top of the original img_hidden / txt_hidden buffers.
     // ------------------------------------------------------------------
+    // Q2.4.5.4d Step 7 widening: under QIE_ALL_BF16 the attn-output
+    // projections emit BF16 (matches the ff_down treatment in §5.5.4) so
+    // the residual #1 contributor is overflow-immune. Same scaffold —
+    // dispatch_matmul_ pre-casts inputs/weights and emits BF16 with F32
+    // accumulator (cubeMathType=1). When OFF, F16 path is preserved
+    // byte-identical.
     if (!dispatch_matmul_(scratch_attn_dev_, lw.to_add_out_w_q4,
                           lw.to_add_out_scale, lw.to_add_out_b,
-                          txt_seq, H, H, scratch_txt_out_dev_)) return false;
+                          txt_seq, H, H, scratch_txt_out_dev_,
+                          attn_out_bf16 ? ACL_BF16 : ACL_FLOAT16)) return false;
     if (!dispatch_matmul_(offset_rows(scratch_attn_dev_, txt_seq),
                           lw.to_out_0_w_q4, lw.to_out_0_scale, lw.to_out_0_b,
-                          img_seq, H, H, scratch_img_out_dev_)) return false;
-    intra_probe("12_to_add_out", scratch_txt_out_dev_, txt_seq * H, true);
-    intra_probe("12_to_out_0",   scratch_img_out_dev_, img_seq * H, true);
+                          img_seq, H, H, scratch_img_out_dev_,
+                          attn_out_bf16 ? ACL_BF16 : ACL_FLOAT16)) return false;
+    intra_probe_dt("12_to_add_out", scratch_txt_out_dev_, txt_seq * H,
+                    attn_out_bf16 ? PROBE_BF16 : PROBE_F16);
+    intra_probe_dt("12_to_out_0",   scratch_img_out_dev_, img_seq * H,
+                    attn_out_bf16 ? PROBE_BF16 : PROBE_F16);
 
     // ------------------------------------------------------------------
     // 8. Gated residual add: img += attn_out_img * gate1_img (and txt).
     //    Phase 4.4c: residual is F32; gated_residual_add_f32_ casts the
     //    (src_f16 * gate_f16) product up to F32 before the accumulator add.
+    //    Q2.4.5.4d: under QIE_ALL_BF16 the matmul source is BF16, so route
+    //    through the BF16-src variant (cast BF16→F32 before gate-mul).
     // ------------------------------------------------------------------
-    if (!gated_residual_add_f32_(img_hidden, scratch_img_out_dev_,
-                                   img_gate1, B, img_seq, H)) return false;
-    if (!gated_residual_add_f32_(txt_hidden, scratch_txt_out_dev_,
-                                   txt_gate1, B, txt_seq, H)) return false;
+    if (attn_out_bf16) {
+        if (!gated_residual_add_f32_bf16src_(img_hidden, scratch_img_out_dev_,
+                                              img_gate1, B, img_seq, H))
+            return false;
+        if (!gated_residual_add_f32_bf16src_(txt_hidden, scratch_txt_out_dev_,
+                                              txt_gate1, B, txt_seq, H))
+            return false;
+    } else {
+        if (!gated_residual_add_f32_(img_hidden, scratch_img_out_dev_,
+                                       img_gate1, B, img_seq, H)) return false;
+        if (!gated_residual_add_f32_(txt_hidden, scratch_txt_out_dev_,
+                                       txt_gate1, B, txt_seq, H)) return false;
+    }
     intra_probe("13_img_resid1", img_hidden, img_seq * H, false);
     intra_probe("13_txt_resid1", txt_hidden, txt_seq * H, false);
 
@@ -3415,9 +3506,10 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
     intra_probe("18_img_ff_up", scratch_mlp_dev_, img_seq * FF, true);
     if (!gelu_activate(scratch_mlp_dev_, img_seq)) return false;
     intra_probe("19_img_gelu", scratch_mlp_dev_, img_seq * FF, true);
-    // Q2.4.5.4c: ff_down output dtype gated by QIE_FFN_DOWN_BF16. F16 by
-    // default (Step 1 synthetic regression invariant); BF16 escapes the
-    // ~65504 saturation observed in §5.5.3 bisect on real Q4 weights.
+    // Q2.4.5.4c: ff_down output dtype gated by QIE_FFN_DOWN_BF16 (or its
+    // superset QIE_ALL_BF16). F16 by default (Step 1 synthetic regression
+    // invariant); BF16 escapes the ~65504 saturation observed in §5.5.3
+    // bisect on real Q4 weights.
     if (!dispatch_matmul_(scratch_mlp_dev_, lw.img_ff_down_w_q4,
                           lw.img_ff_down_scale, lw.img_ff_down_b,
                           img_seq, FF, H, scratch_img_out_dev_,

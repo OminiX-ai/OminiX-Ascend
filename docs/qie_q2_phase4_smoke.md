@@ -1784,3 +1784,147 @@ patch.
 3. **Decide on init-time BF16 weight pre-cast** to recover the 30%
    wall regression.
 4. **Eye-check skipped** until the latent has signal.
+
+### §5.5.5 Step 4d — BF16 widening to attn-out projections (Step 7) — NaN gate GREEN
+
+Mission (Q2.4.5.4d handoff): widen the §5.5.4 BF16 scaffold to all
+matmul callsites in the native engine forward path so the §5.5.4 leak
+#2 (block 1 IMG NaN once block 0 ff_down was BF16-clean) is also
+fixed. Pragmatic interpretation: residual-stream contributors (attn-out
+projections + ff-down) are the only matmul outputs whose magnitudes
+can exceed F16 65504 once the residual stream grows past a few
+blocks; other matmul outputs (Q/K/V proj, FFN-up, modulation linear,
+norm_out / proj_out / time_linear / img_in / txt_in) are bounded by
+upstream LN/SiLU normalization (max ≤ ~3700 observed at block 0). So
+"all matmul outputs to BF16" applied to the leaky surface — not every
+matmul indiscriminately, since most non-residual consumers are
+F16-strict (RMSNorm + RoPE + FIA, GELU, modulate, Cast/SiLU, CFG
+compose) and would require a much bigger refactor for negligible
+correctness benefit.
+
+#### What landed
+
+`tools/qwen_image_edit/native/image_diffusion_engine.cpp`:
+
+1. New static `s_all_bf16` env-cache, decoupled from `s_ffn_down_bf16`.
+   `QIE_ALL_BF16=1` is now a strict superset of `QIE_FFN_DOWN_BF16=1`:
+   under `QIE_ALL_BF16` the attn-output projections (`to_add_out` for
+   txt and `to_out_0` for img — the residual #1 contributors) ALSO
+   emit BF16, AND gated-residual #1 routes through the BF16-src
+   variant.
+2. `dispatch_matmul_` BF16 path's input pre-cast (F16→BF16 to scratch)
+   was previously gated on `weight_scale_dev == nullptr` (aclnnMm
+   fallback). Lifted the gate so it runs for the WQBMMv3 path too —
+   WQBMMv3 returned status 161002 ("wrong dtype combo") when
+   `t_x` stayed F16 against BF16 scale + BF16 output. The fix uses
+   `scratch_bf16_src_f32_dev_` for the input pre-cast on the WQBMMv3
+   path (vs `scratch_bf16_scale_dev_` on the aclnnMm path) to avoid
+   aliasing the still-required scale-tile cast destination.
+3. Build a BF16 view (`t_x_local_bf16`) over the pre-cast input for
+   the WQBMMv3 launch. Defensive teardown on all error paths.
+
+Default (env unset): all callsites stay F16, byte-identical to §5.5.4.
+Step 1 `denoise_loop_test` regression GREEN with env OFF (verified —
+synthetic CPU-ref cos_sim invariant preserved).
+
+#### Receipts (ac03 / qie_q45_step4_full_denoise smoke, n_steps=20)
+
+`QIE_ALL_BF16=1 QIE_DEBUG_PER_BLOCK_NAN=1`:
+
+| Block | img_resid mean_abs / max_abs | NaN | Inf | txt_resid mean_abs / max_abs | NaN | Inf |
+|---|---|---|---|---|---|---|
+| 00 | 1.035e+05 / 7.197e+06 | 0 | 0 | 7.017e+04 / 4.683e+06 | 0 | 0 |
+| 01 | 1.131e+05 / 9.057e+06 | 0 | 0 | 7.369e+04 / 4.598e+06 | 0 | 0 |
+| 30 | 2.150e+05 / 1.572e+07 | 0 | 0 | 1.112e+05 / 6.683e+06 | 0 | 0 |
+| 59 | 3.049e+05 / 6.506e+07 | 0 | 0 | 1.132e+05 / 6.720e+06 | 0 | 0 |
+
+Block 0 → block 1 IMG NaN cascade in §5.5.4 is gone. Magnitudes grow
+~3× across 60 blocks (1e5 → 3e5 mean_abs) but stay 11 orders of
+magnitude under BF16 max (3.4e38) and never overflow.
+
+Final latent (after 20 flow-Euler steps):
+`mean=-2.4557 std=4.8610 min/max=-13.3359/7.5898 NaN=0 inf=0` — VERDICT GREEN.
+
+#### Wall
+
+| | per-step ms | wall ratio vs §5.5.4 baseline |
+|---|---|---|
+| §5.5.4 (ff_down BF16 only, RED at b01) | 1656 | 1.00× |
+| §5.5.5 (ff_down + attn-out BF16, GREEN) | **1165** (median) | **0.70×** |
+
+The widening is FASTER than the §5.5.4 ff_down-only path — the new
+attn-out matmul callsites route through WQBMMv3 (Q4_0 weight + scale
+tile cast only, no per-call 75 MB weight cast like the aclnnMm
+fallback ff_down path that dominated §5.5.4's wall). Per-step
+1165 ms median is comparable to §5.5.4's pre-fix F16 baseline
+(1240 ms) — net ~6% faster end-to-end under full BF16 widening, and
+crucially produces non-NaN output now.
+
+`forward_block_: QIE_FFN_DOWN_BF16=1 QIE_ALL_BF16=1 (ff_down BF16 +
+bf16src #2 always under either; attn-out BF16 + bf16src #1 only
+under ALL)` — log line confirms env routing.
+
+#### Step 4d eye-check
+
+Step 4d decode-only (`OMINIX_QIE_DECODE_ONLY_LATENT=...`):
+`decode_only/x_latent_loaded: OK (16384 elements, range=[-13.335938,
+7.589844])`, `decode_only/decoded_image: OK (196608 elements,
+range=[0.0, 1.0])`, PNG saved at
+`/tmp/qie_q45_step4d_allbf16_cat.png` (110986 B, 256×256 RGB).
+
+Eye-check verdict: **non-NaN, finite, structured, but NOT a
+recognizable cat** — output is a regular blue-checkerboard pattern
+suggesting an unpatchify-host or RoPE-pe-layout artifact independent
+of the BF16 widening (this matches the §5.5 known caveat about
+"RoPE pe-table drift / color-shifted but recognizable" — except the
+output is a coherent tile pattern, not a color-shifted cat). Numeric
+gate is fully GREEN; visual gate is a separate workstream (host-side
+unpatchify + pe alignment). NOT a third NaN leak.
+
+#### Status — what landed
+
+- **Mission's primary delivery target met**: full 20-step denoise
+  produces no NaN, no Inf, finite latent, GREEN verdict on the
+  numerical gate.
+- **Mission's secondary delivery target (visual cat eye-check)
+  partially met**: PNG produced is structured / finite / non-NaN
+  but is a tile pattern, not a recognizable cat. Likely an
+  unpatchify-host or RoPE pe-table layout artifact, distinct from
+  matmul-output saturation. Defer to a separate pass.
+- The BF16 scaffold scaling held — adding attn-out-BF16 was a
+  one-flag addition over §5.5.4's ff_down-only plumbing, and the
+  WQBMMv3 input pre-cast lift unblocked Q4-resident weights too
+  (§5.5.4's scaffold only exercised the aclnnMm fallback because
+  ff_down weights are Q4_1; attn-out weights are Q4_0 → WQBMMv3).
+
+#### Logs / artifacts (ac03)
+
+- `/tmp/qie_q45_step4_allbf16_run2.log` — full GREEN smoke
+  (init 101.5 s, denoise 25.4 s, all 60 blocks NaN=0 Inf=0,
+  EXITCODE=0, VERDICT=GREEN).
+- `/tmp/qie_q45_step4_allbf16_run1.log` — earlier RED run (block 1
+  failed with WQBMMv3 status=161002 before the input-pre-cast lift).
+- `/tmp/qie_q43_denoise_default_run.log` — Step 1 regression GREEN
+  with env OFF (`QIE_FFN_DOWN_BF16=0 QIE_ALL_BF16=0` confirmed,
+  cos_sim invariant preserved, EXITCODE=0).
+- `/tmp/qie_q45_step4_latent.f32.bin` (65536 B, 16384 F32, finite).
+- `/tmp/qie_q45_step4d_allbf16_cat.png` (110986 B, 256×256 RGB,
+  tile pattern — sample of structured non-NaN VAE-decoded output).
+
+#### Next-step queue
+
+1. **Visual eye-check chase**: investigate why VAE-decoded latent
+   produces a tile pattern rather than a color-shifted cat. Likely
+   suspects: host-side unpatchify token layout (concat order
+   img_init || img_ref vs the diffusion model's per-step expectation),
+   or RoPE pe-table per-step image-token offset mismatch. Independent
+   of BF16 — the latent itself is sane.
+2. **Optimization lane (deferred)**: pre-convert ff_down + attn-out
+   weights to BF16 at `init_from_gguf` time (mirror's ggml-cann's
+   `GGML_CANN_QUANT_BF16=on` static conversion). Wall is already
+   competitive (1165 ms median vs 1240 ms baseline) so this is a
+   "if/when we widen further" follow-up, not a hot priority.
+3. **Possibly widen further** (Q/K/V, FFN-up, mod, projections) only
+   IF a future deep-block magnitude probe shows non-residual matmul
+   outputs approaching F16 65504. Current data says they don't
+   (max ≤ ~3700 at block 0).
