@@ -4,6 +4,38 @@
 **Repo target**: new repo `ominix-cuda` (forked from OminiX-Ascend, CANN code stripped, CUDA backend wired).
 **Mandate**: build a Python-free, vLLM-free, PyTorch-free C++ inference stack on NVIDIA Blackwell (GB10) leveraging llama.cpp + ggml-cuda backend + cuBLAS/cuDNN/CUTLASS direct dispatch.
 
+## Status as of 2026-04-26
+
+Phase 5 dispatch landed; ship summary at `/Users/yuechen/home/ominix-cuda/SHIP_SUMMARY.md`.
+Repo HEAD: `07fb6b6d` (Phase 3.4d Euler-step fix; first authentic CUDA-native QIE-Edit parity vs Ascend, cossim 1.0000 at n=1, 1024^2).
+
+Headline production deliverable: **first authentic CUDA-native Qwen-Image-Edit-2509 cat PNG** generated on GB10 #2 (`zgx-5b44`) via `ominix-diffusion-cli` (Phase 1 sd.cpp path on ggml-cuda) — 1024^2 / 20-step Euler / "make the cat smile" / 1229 s wall (20.5 min). Output: `/tmp/qie_cuda_prod_1024_n20.png` (1.24 MB, recognizable smiling cat). No Python in process tree. The native `ImageDiffusionCudaEngine` (Phase 3.x) is correctness-GREEN with byte-parity vs Ascend; native end-to-end ship is gated on Phase 3.6 (cuDNN FMHA, deferred).
+
+| Phase | Scope | Status | Receipt |
+|---|---|---|---|
+| Phase 0 | Repo bootstrap, CANN strip, ggml-cuda backend | DONE | commit `1aaa75d2` |
+| Phase 1 | sd.cpp baseline + CFG batching + RoPE pre-compute | DONE (eye-PASS, wall 308.82 s above 140 s target) | commit `ad5ef19c`, `docs/cuda_phase1_baseline.md` |
+| Phase 2.1 | TalkerCudaEngine scaffold + GGUF parse | DONE | `d60452a7`, `6f0daf16` |
+| Phase 2.2 | 28-layer forward_decode, Q8_0 dequant fix | DONE | `ffa9d313`, `7a2f92c4`, `8851a888` |
+| Phase 2.3 | KV cache + autoregressive loop | DONE (53.85 TPS Talker, 18.57 ms steady) | `a027e999` |
+| Phase 2.4 | CodePredictor (Qwen3 5L, schema-shared) | DONE (944 TPS w/graphs in hot loop) | `a2c655a0` |
+| Phase 2.5 | CUDA Graphs at per-pos capture | PARTIAL (Predictor 1.99x, Talker 1.12x compute-bound) | `f92503b8` |
+| Phase 2.6 | FP8 / INT8 quant via cuBLAS | DEFERRED (perf-only; required to clear 80 fps gate) | — |
+| Phase 3.1 | ImageDiffusionCudaEngine scaffold + GGUF parse (Q4_0/Q8_0) | DONE | `fc629955` |
+| Phase 3.2 | DiT 1-block forward at 1024^2, NaN-free | DONE (~960 ms/block) | `9d9ded58` |
+| Phase 3.3a | Multi-axis NEOX RoPE + mod_vec/t_emb internalization | DONE | `afddaf24` |
+| Phase 3.3b | F32 widening through residual chain + 60-block forward + norm_out/proj_out/unpatchify | DONE (latent std 0.238 sane) | `09c5cdae` |
+| Phase 3.3c | Host-orchestrated 20-step Euler-flow loop, max_img_seq 4096->8192 | DONE | `09c5cdae` |
+| Phase 3.4 | Euler-step semantics fix (proj_out treated as denoised prediction, not velocity) | DONE — bit-parity vs Ascend at n=1, production cat at n=20 | `07fb6b6d` |
+| Production cat PNG | 1024^2 / 20-step via `ominix-diffusion-cli` | DONE (NOT via native engine) | `/tmp/qie_cuda_prod_1024_n20.png` |
+| Phase 3.6 | cuDNN FMHA (would compress 60 s/step -> 6-12 s/step) | DEFERRED | — |
+| Phase 4 | Native CUDA ASR | NOT STARTED | — |
+| SpeechTokenizerDecoder vocoder (TTS audio E2E) | C++ port required for end-to-end audio | NOT STARTED | — |
+| Phase 5 | Docs + ship | DONE (this dispatch) | `SHIP_SUMMARY.md` + this contract update |
+
+Acceptance roll-up: Phase 0 PASS, Phase 1 partial (eye-PASS, wall over target), Phase 2 deferred to 2.6, Phase 3 parity-GREEN with production cat in hand (perf-deferred to 3.6), Phase 4 queued, Phase 5 PASS.
+
+
 ## 1. Why this exists
 
 The codex CUDA Phase 0-2 work delivered honest evidence:
