@@ -6,10 +6,13 @@
 
 ## Status as of 2026-04-26
 
-Phase 5 dispatch landed; ship summary at `/Users/yuechen/home/ominix-cuda/SHIP_SUMMARY.md`.
+Phase 5 dispatch landed; ship summary at `/Users/yuechen/home/ominix-cuda/SHIP_SUMMARY.md`. Phase 4 ASR landed same day, post-Phase-5, via Mac-local build chain (commits `f50488e6` → `0596f1e5` → `abec38ba` → `a8858f86`).
 Repo HEAD: `07fb6b6d` (Phase 3.4d Euler-step fix; first authentic CUDA-native QIE-Edit parity vs Ascend, cossim 1.0000 at n=1, 1024^2).
+Phase 4 HEAD (Mac local): `a8858f86` (Phase 4.5 audio encoder cossim 1.000000 vs HF Python across all 11 stages; first authentic CUDA-native ASR transcript on hand).
 
-Headline production deliverable: **first authentic CUDA-native Qwen-Image-Edit-2509 cat PNG** generated on GB10 #2 (`zgx-5b44`) via `ominix-diffusion-cli` (Phase 1 sd.cpp path on ggml-cuda) — 1024^2 / 20-step Euler / "make the cat smile" / 1229 s wall (20.5 min). Output: `/tmp/qie_cuda_prod_1024_n20.png` (1.24 MB, recognizable smiling cat). No Python in process tree. The native `ImageDiffusionCudaEngine` (Phase 3.x) is correctness-GREEN with byte-parity vs Ascend; native end-to-end ship is gated on Phase 3.6 (cuDNN FMHA, deferred).
+Headline production deliverables:
+- **First authentic CUDA-native Qwen-Image-Edit-2509 cat PNG** generated on GB10 #2 (`zgx-5b44`) via `ominix-diffusion-cli` (Phase 1 sd.cpp path on ggml-cuda) — 1024^2 / 20-step Euler / "make the cat smile" / 1229 s wall (20.5 min). Output: `/tmp/qie_cuda_prod_1024_n20.png` (1.24 MB, recognizable smiling cat). No Python in process tree. The native `ImageDiffusionCudaEngine` (Phase 3.x) is correctness-GREEN with byte-parity vs Ascend; native end-to-end ship is gated on Phase 3.6 (cuDNN FMHA, deferred).
+- **First authentic CUDA-native Qwen3-ASR transcript** (Phase 4.5 receipt, Mac local). Ellen audiobook 9.36 s WAV → "language English. It might serve you better to be a little less comfortable, but wherever you're listening to this book, please remember to turn off your cell phone and that the taking of flash photographs is strictly forbidden." (43 tok, 226 bytes). Wall 3483 ms (0.37 RTF). Audio encoder cossim 1.000000 vs HF Python at all 11 probed stages. AsrCudaEngine reuses TalkerCudaEngine (Phase 2.x) verbatim for the 28L Qwen3 text decoder — no API changes.
 
 | Phase | Scope | Status | Receipt |
 |---|---|---|---|
@@ -29,11 +32,27 @@ Headline production deliverable: **first authentic CUDA-native Qwen-Image-Edit-2
 | Phase 3.4 | Euler-step semantics fix (proj_out treated as denoised prediction, not velocity) | DONE — bit-parity vs Ascend at n=1, production cat at n=20 | `07fb6b6d` |
 | Production cat PNG | 1024^2 / 20-step via `ominix-diffusion-cli` | DONE (NOT via native engine) | `/tmp/qie_cuda_prod_1024_n20.png` |
 | Phase 3.6 | cuDNN FMHA (would compress 60 s/step -> 6-12 s/step) | DEFERRED | — |
-| Phase 4 | Native CUDA ASR | NOT STARTED | — |
+| Phase 4.1 | AsrCudaEngine + AudioEncoderCudaEngine scaffold + GGUF parse + mel spec port (314 LoC C++ from Ascend) | DONE ✓ | `f50488e6` |
+| Phase 4.2 | Audio encoder forward (3× Conv2d via im2col + cuBLAS GemmEx, 24L F32 transformer, output MLP 1024→2048); new kernels `launch_layernorm_affine_f32`, `launch_gelu_erf_f32`, `launch_im2col_f32` | DONE ✓ (encode 178.6 ms / 32 kHz / 9.36 s, NaN-free) | `0596f1e5` |
+| Phase 4.3 + 4.4 | Split prefill + E2E transcribe driver (440 LoC `test_qwen_asr_cuda_e2e.cpp`); reuses `TalkerCudaEngine::forward_decode(emb, pos)` for token + embed injection — no API changes | DONE ✓ (3483 ms wall on Ellen 9.36 s WAV = 0.37 RTF) | `abec38ba` |
+| Phase 4.5 | Audio encoder cossim parity vs HF Python — `nchw_to_frame_slab` inner-dim ordering fix (`c = ch / H; h = ch % H`) | DONE ✓ (cossim 1.000000 across all 11 probed stages; first authentic CUDA-native ASR transcript) | `a8858f86` |
+| Phase 4.6 | CPU mel parity vs HF Python (currently 0.80 cossim — window/log-scale divergence) | ⚠ IN FLIGHT (non-blocking; bypassed via `OMINIX_ASR_USE_MEL_BIN`) | — |
+| Phase 4 RTF target | RTF ≤ 0.10, CER=0 Tier-1 13-clip | PARTIAL (first transcript at 0.37 RTF; gated on Phase 2.6 FP8/INT8 + Phase 3.6 cuDNN FMHA — 28L Qwen3 body shared with Talker) | — |
 | SpeechTokenizerDecoder vocoder (TTS audio E2E) | C++ port required for end-to-end audio | NOT STARTED | — |
 | Phase 5 | Docs + ship | DONE (this dispatch) | `SHIP_SUMMARY.md` + this contract update |
 
-Acceptance roll-up: Phase 0 PASS, Phase 1 partial (eye-PASS, wall over target), Phase 2 deferred to 2.6, Phase 3 parity-GREEN with production cat in hand (perf-deferred to 3.6), Phase 4 queued, Phase 5 PASS.
+Acceptance roll-up: Phase 0 PASS, Phase 1 partial (eye-PASS, wall over target), Phase 2 deferred to 2.6, Phase 3 parity-GREEN with production cat in hand (perf-deferred to 3.6), Phase 4 PARTIAL (first authentic CUDA-native transcript landed; 4.1–4.5 ✓; 4.6 mel parity in flight; RTF target gated on 2.6/3.6), Phase 5 PASS.
+
+### Phase 4 ASR perf table (Mac local, post-4.5 fix)
+
+| Stage | ms | Notes |
+|---|---:|---|
+| mel | 9.7 | CPU port from Ascend; 4.6 parity in flight |
+| audio encode | 180.2 | F32 naive attn; 24L transformer + 3× Conv2d (im2col + cuBLAS) |
+| prefill | 2591 | 137 positions (9 prefix tok + 122 audio embeds + 6 suffix tok); 28L Qwen3 (TalkerCudaEngine) |
+| gen | 682 | 3 tok × 227 ms with cuBLAS warm-up |
+| BPE decode | 20.2 | host |
+| **total** | **3483** | **RTF 0.37** on Ellen 9.36 s WAV → 43 tok / 226 bytes |
 
 
 ## 1. Why this exists
@@ -229,7 +248,7 @@ If reality is 2× worse than these targets, that's still SOTA on CUDA for these 
 - [ ] Phase 1 Gate: 1024×1024/20-step cat at <140s with CFG batching, eye-PASS
 - [ ] Phase 2 Gate: TTS ≥80 fps end-to-end, no Python in process tree
 - [ ] Phase 3 Gate: QIE-Edit ≤50s/1024×1024/20-step, eye-PASS
-- [ ] Phase 4 Gate: ASR RTF ≤ 0.10, CER=0 Tier-1
+- [~] Phase 4 Gate: ASR RTF ≤ 0.10, CER=0 Tier-1 — first authentic CUDA-native transcript landed (43 tok, 0.37 RTF on Ellen 9.36 s WAV); audio encoder cossim 1.000000 vs HF Python at 11 stages; 4.6 mel parity in flight; RTF gated on Phase 2.6 + Phase 3.6 perf levers
 - [ ] Phase 5: docs published, repo at `ymote/ominix-cuda` ready for review
 
 Total: ~3-4 weeks agent-wall to all gates.
